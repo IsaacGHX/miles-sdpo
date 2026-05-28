@@ -94,3 +94,7 @@ def load_hf_config(
         for key, value in overrides.items():
             setattr(config, key, value)
     return config
+
+
+def is_dsa(hf_config) -> bool:
+    return getattr(hf_config, "model_type", None) in ("deepseek_v32", "glm_moe_dsa")
