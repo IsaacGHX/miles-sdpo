@@ -9,12 +9,12 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 from miles.ray.rollout.addr_allocator import (
+    PortCursors,
     allocate_rollout_engine_addr_and_ports_external,
     allocate_rollout_engine_addr_and_ports_normal,
 )
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.utils import dumper_utils
-
 
 logger = logging.getLogger(__name__)
 
@@ -51,17 +51,15 @@ class ServerGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
-    def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
+    def start_engines(self, port_cursors: PortCursors) -> list:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
         of Ray ObjectRefs and *port_cursors* maps node index -> next free port.
         """
-        if port_cursors is None:
-            port_cursors = {}
         if self.args.debug_train_only or self.worker_type == "placeholder":
             self.num_new_engines = 0
-            return [], port_cursors
+            return []
 
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
@@ -126,15 +124,15 @@ class ServerGroup:
         self.num_new_engines = len(rollout_engines)
 
         if self.num_new_engines == 0:
-            return [], port_cursors
+            return []
 
         if self.args.rollout_external:
             addr_and_ports = allocate_rollout_engine_addr_and_ports_external(
                 args=self.args, rollout_engines=rollout_engines
             )
         else:
-            base_port = max(port_cursors.values()) if port_cursors else 15000
-            addr_and_ports, port_cursors = allocate_rollout_engine_addr_and_ports_normal(
+            base_port = port_cursors.next_base_port()
+            addr_and_ports, next_port_cursors = allocate_rollout_engine_addr_and_ports_normal(
                 args=self.args,
                 rollout_engines=rollout_engines,
                 worker_type=self.worker_type,
@@ -142,6 +140,7 @@ class ServerGroup:
                 rank_offset=self.rank_offset,
                 base_port=base_port,
             )
+            port_cursors.assign(next_port_cursors)
 
         init_handles = [
             engine.init.remote(
@@ -151,7 +150,7 @@ class ServerGroup:
             )
             for rank, engine in rollout_engines
         ]
-        return init_handles, port_cursors
+        return init_handles
 
     def stop_engines(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")

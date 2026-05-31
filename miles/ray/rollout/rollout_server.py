@@ -6,6 +6,7 @@ import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
+from miles.ray.rollout.addr_allocator import PortCursors
 from miles.ray.rollout.router_manager import start_router
 from miles.ray.rollout.server_group import ServerGroup
 
@@ -38,7 +39,7 @@ def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
 
         server_groups: list[ServerGroup] = []
         all_init_handles: list = []
-        port_cursors: dict[int, int] = {}
+        port_cursors = PortCursors.empty()
 
         for group_cfg in model_cfg.server_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine
@@ -70,7 +71,7 @@ def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
                 router_ip=router_ip,
                 router_port=router_port,
             )
-            handles, port_cursors = group.start_engines(port_cursors)
+            handles = group.start_engines(port_cursors)
             all_init_handles.extend(handles)
             server_groups.append(group)
 
@@ -194,9 +195,9 @@ class RolloutServer:
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in self.server_groups]
 
         all_handles = []
-        port_cursors: dict[int, int] = {}
+        port_cursors = PortCursors.empty()
         for g in self.server_groups:
-            handles, port_cursors = g.start_engines(port_cursors)
+            handles = g.start_engines(port_cursors)
             all_handles.extend(handles)
         if all_handles:
             await asyncio.gather(*all_handles)

@@ -1,8 +1,24 @@
 import logging
+from dataclasses import dataclass
 
 import ray
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PortCursors:
+    _values: dict[int, int]
+
+    @staticmethod
+    def empty() -> "PortCursors":
+        return PortCursors(_values={})
+
+    def assign(self, other: "PortCursors"):
+        self._values = other._values.copy()
+
+    def next_base_port(self) -> int:
+        return max(self._values.values()) if self._values else 15000
 
 
 def allocate_rollout_engine_addr_and_ports_normal(
@@ -92,7 +108,7 @@ def allocate_rollout_engine_addr_and_ports_normal(
             assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
         logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
 
-    return addr_and_ports, node_port_cursor
+    return addr_and_ports, PortCursors(_values=node_port_cursor)
 
 
 def allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):
