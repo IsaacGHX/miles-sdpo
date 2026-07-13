@@ -64,7 +64,7 @@ enroot start --rw \
     --mount "$ASSETS/hf_cache":/root/hf_cache \
     --mount "$CACHES":/root/caches \
     --env PREP_ONLY="${PREP_ONLY:-0}" \
-    --env SDPO_MODEL="${SDPO_MODEL:-olmo3}" \
+    --env SDPO_MODEL="${SDPO_MODEL:-olmo3-sci}" \
     --env HF_HOME=/root/hf_cache \
     --env TRITON_CACHE_DIR=/root/caches/triton \
     --env TORCHINDUCTOR_CACHE_DIR=/root/caches/inductor \
@@ -77,8 +77,8 @@ enroot start --rw \
     bash -euxc '
         cd /root/miles
 
-        # Pick model by $SDPO_MODEL (qwen3 | olmo3): local dir name, HF repo id,
-        # megatron model-arg script, and the SDPO run script.
+        # Pick model by $SDPO_MODEL (qwen3 | olmo3 | olmo3-sci): local dir name, HF
+        # repo id, megatron model-arg script, and the SDPO run script.
         case "${SDPO_MODEL}" in
             olmo3)
                 MODEL_DIR=Olmo-3-7B-Instruct
@@ -86,6 +86,14 @@ enroot start --rw \
                 MODEL_SH=scripts/models/olmo3-7B.sh
                 RUN_SH=examples/SDPO/run-olmo3-7B-sdpo.sh
                 DATA_KIND=dapo
+                ;;
+            olmo3-sci)
+                # Olmo3 on the SciKnowEval (MCQ) task instead of DAPO math.
+                MODEL_DIR=Olmo-3-7B-Instruct
+                HF_REPO=allenai/Olmo-3-7B-Instruct
+                MODEL_SH=scripts/models/olmo3-7B.sh
+                RUN_SH=examples/SDPO/run-olmo3-7B-sdpo-sci.sh
+                DATA_KIND=sci
                 ;;
             *)
                 MODEL_DIR=Qwen3-8B
