@@ -53,12 +53,32 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def _launch_server_with_custom_models(server_args: ServerArgs) -> None:
+    """Subprocess entrypoint: register miles' custom SGLang model archs (arches
+    the shipped registry lacks), then hand off to the real launch_server. Runs in
+    the spawned child so the registration lands in that process before model load."""
+    try:
+        from sglang.srt.models.registry import ModelRegistry
+        from sglang.srt.models.olmo2 import Olmo2ForCausalLM
+
+        # Olmo3 (allenai/Olmo-3-7B-Instruct) is architecturally Olmo2 + features
+        # (sliding-window attention, yarn rope) that sglang's olmo2 impl already
+        # supports; sglang just doesn't register the Olmo3ForCausalLM arch name.
+        ModelRegistry.models.setdefault("Olmo3ForCausalLM", Olmo2ForCausalLM)
+    except Exception as e:  # never block startup for models that don't need this
+        import logging
+
+        logging.getLogger(__name__).warning(f"custom sglang model registration skipped: {e!r}")
+
     from sglang.srt.entrypoints.http_server import launch_server
 
+    launch_server(server_args)
+
+
+def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_with_custom_models, args=(server_args,))
     p.start()
 
     if server_args.node_rank != 0:
