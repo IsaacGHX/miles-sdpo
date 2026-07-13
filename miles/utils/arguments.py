@@ -1894,6 +1894,24 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
             parser.add_argument(
+                "--dump-train-data",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether --dump-details also dumps per-rank train_data/*.pt (heavy per-token "
+                    "training tensors). --no-dump-train-data skips it (keeps rollout_data + sdpo dumps)."
+                ),
+            )
+            parser.add_argument(
+                "--dump-policy-loss-debug",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether --dump-details also dumps policy_loss_debug/*.pt (per-call loss debug "
+                    "tensors). --no-dump-policy-loss-debug skips it."
+                ),
+            )
+            parser.add_argument(
                 "--dumper-enable",
                 action="store_true",
                 default=False,
@@ -2714,7 +2732,8 @@ def miles_validate_args(args):
 
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
-        args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+        if getattr(args, "dump_train_data", True):
+            args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
 
     if args.load_debug_rollout_data is not None:
         logger.info(
