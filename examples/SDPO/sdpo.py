@@ -264,8 +264,12 @@ async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
 
 
 # --------------------------------------------------------------------------- #
-# Skill prompts  (used by the self-generated skill)
+# Trace condensation / SkillOpt  (distill the correct peer trace into a SKILL)
 # --------------------------------------------------------------------------- #
+# When --sdpo-trace-condense is set, the correct-peer solution is first distilled
+# into a short transferable SKILL (<=3 procedural bullets, no answer) by an LLM,
+# and that skill — not the full trace — becomes the teacher prefix. Mirrors
+# lasgroup/SDPO trace_condense (verl/trainer/ppo/trace_condense.py).
 
 _SKILL_SYSTEM_PROMPT = (
     "You distill a worked solution into a SKILL: the minimal set of transferable, "
@@ -302,6 +306,19 @@ _SKILL_SYSTEM_PROMPT_INCORRECT = (
     "- Never reveal or hint at the ground-truth answer.\n"
     "- Output ONLY the bullets (prefixed with '- '), nothing else."
 )
+
+_CONDENSE_SEM: "asyncio.Semaphore | None" = None
+_CONDENSE_SEM_LIMIT: int | None = None
+
+
+def _condense_semaphore(args: Namespace) -> asyncio.Semaphore:
+    global _CONDENSE_SEM, _CONDENSE_SEM_LIMIT
+    limit = int(getattr(args, "sdpo_condense_max_concurrency", 32))
+    if _CONDENSE_SEM is None or _CONDENSE_SEM_LIMIT != limit:
+        _CONDENSE_SEM = asyncio.Semaphore(limit)
+        _CONDENSE_SEM_LIMIT = limit
+    return _CONDENSE_SEM
+
 
 # Answer-format scaffolding that datasets inject into the problem text (e.g. DAPO:
 # "... The last line of your response should be of the form Answer: \boxed{$Answer}
@@ -346,6 +363,59 @@ def _skill_user_prompt_incorrect(problem: str, attempt: str, ground_truth: str) 
         "Diagnose the error and distill a pitfall-prevention skill "
         "(<=3 terse procedural bullets)."
     )
+
+
+async def _condense_trace_to_skill(args: Namespace, problem: str, solution: str) -> str:
+    """Distill one worked solution into a short skill via the OpenAI-compatible LLM.
+    Returns the skill string, or the original full solution on any failure."""
+    base_url = getattr(args, "sdpo_condense_base_url", "https://api.openai.com/v1").rstrip("/")
+    model = getattr(args, "sdpo_condense_model", "gpt-5.4-mini")
+    api_key = os.environ.get(getattr(args, "sdpo_condense_api_key_env", "OPENAI_API_KEY"), "") or "EMPTY"
+    max_tokens = int(getattr(args, "sdpo_condense_max_tokens", 2048))
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SKILL_SYSTEM_PROMPT},
+            {"role": "user", "content": _skill_user_prompt(problem, solution)},
+        ],
+    }
+    if model.startswith(("gpt-5", "o1", "o3", "o4")):
+        payload["max_completion_tokens"] = max_tokens
+    else:
+        payload["max_completion_tokens"] = max_tokens
+        payload["temperature"] = 0.0
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        out = await post(f"{base_url}/chat/completions", payload, max_retries=3, headers=headers)
+        skill = (out["choices"][0]["message"].get("content") or "").strip()
+        return skill if skill else solution  # fall back to the full trace on empty
+    except Exception as e:
+        logger.warning(f"trace condense failed ({e!r}); falling back to full trace.")
+        return solution
+
+
+async def _condense_solutions(args: Namespace, pairs: list[tuple[str, str]]) -> list[str]:
+    """Condense a batch of (problem, solution) pairs into skills, concurrently and
+    with a process-wide cap. Deduplicates identical (problem, solution) pairs so a
+    trace shared by several traces in the group is condensed once."""
+    sem = _condense_semaphore(args)
+    # dedup
+    uniq: dict[tuple[str, str], int] = {}
+    for p in pairs:
+        uniq.setdefault(p, len(uniq))
+    keys = list(uniq.keys())
+
+    async def _one(problem: str, solution: str) -> str:
+        async with sem:
+            return await _condense_trace_to_skill(args, problem, solution)
+
+    skills = await asyncio.gather(*(_one(pr, sol) for pr, sol in keys))
+    skill_of = {k: s for k, s in zip(keys, skills)}
+    return [skill_of[p] for p in pairs]
 
 
 # --------------------------------------------------------------------------- #
@@ -782,16 +852,20 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         tok = _tokenizer(args)
         gen_suffix = _gen_prompt_suffix(tok)
         remove_thinking = getattr(args, "sdpo_remove_thinking_from_demonstration", False)
+        condense = getattr(args, "sdpo_trace_condense", False)
         self_skill = getattr(args, "sdpo_self_skill", False)
         skill_kd = self_skill and getattr(args, "sdpo_skill_kd", False)
         skill_kd_mode = getattr(args, "sdpo_skill_kd_mode", "self-success")
         skill_source = getattr(args, "sdpo_skill_source", "correct")
+        # --sdpo-self-skill (on-policy, trainable) and --sdpo-trace-condense (external
+        # LLM) both produce a skill prefix; running both is ambiguous.
+        assert not (self_skill and condense), "use only one of --sdpo-self-skill / --sdpo-trace-condense"
 
         response_prefix = getattr(args, "sdpo_response_prefix", "trace")
 
         # Pass 1: pick each trace's correct peer (self-excluded). prefix_text is the
-        # peer's solution (the full response). Traces with no eligible peer get no
-        # prefix. peer_by_idx
+        # peer's solution — either the full response, or (with --sdpo-trace-condense)
+        # its distilled skill. Traces with no eligible peer get no prefix. peer_by_idx
         # remembers the chosen peer so --sdpo-response-prefix skill can later swap in
         # that peer's self-generated skill.
         prefix_text_by_idx: dict[int, str] = {}
@@ -888,6 +962,31 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                         )
                     else:  # problem-only: no hint -> teacher context == student context
                         md["sdpo_skill_teacher_prompt_tokens"] = list(gen_prompt_ids)
+
+        # Optional: distill each chosen peer trace into a transferable SKILL and use
+        # that as the prefix instead of the full trace (SkillOpt / trace_condense).
+        if condense and prefix_text_by_idx:
+            idxs = list(prefix_text_by_idx.keys())
+
+            def _problem_of(j: int) -> str:
+                md = group[j].metadata if isinstance(group[j].metadata, dict) else {}
+                q = md.get("question")
+                if q:
+                    return str(q)
+                p = group[j].prompt
+                return p if isinstance(p, str) else str(p)
+
+            pairs = [(_problem_of(i), _strip_response_eos(prefix_text_by_idx[i])) for i in idxs]
+            skills = await _condense_solutions(args, pairs)
+            for i, skill in zip(idxs, skills):
+                full_trace = prefix_text_by_idx[i]
+                prefix_text_by_idx[i] = skill
+                # Record the distilled skill (and the trace it replaced) so the
+                # training-side dump can log it. condensed=False means the LLM
+                # failed and we fell back to the full trace.
+                if isinstance(group[i].metadata, dict):
+                    group[i].metadata["sdpo_skill"] = skill
+                    group[i].metadata["sdpo_skill_condensed"] = skill != full_trace
 
         # --sdpo-response-prefix skill: swap the response teacher prefix from the
         # peer's full trace to that peer's self-generated skill (fall back to the

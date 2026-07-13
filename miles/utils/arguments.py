@@ -1415,6 +1415,49 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Default False (safe for non-thinking models like Qwen2.5)."
                 ),
             )
+            # ---- Trace condensation / SkillOpt (examples/SDPO/sdpo.py) ----------
+            parser.add_argument(
+                "--sdpo-trace-condense",
+                action="store_true",
+                default=False,
+                help=(
+                    "Before splicing the correct-peer solution into the teacher prompt, distill it "
+                    "into a short transferable SKILL (<=3 procedural bullets, no answer) via an "
+                    "OpenAI-compatible LLM, and use that skill as the teacher prefix instead of the "
+                    "full trace (SkillOpt-style, matches lasgroup/SDPO trace_condense). Falls back "
+                    "to the full trace on any condensation failure."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-condense-base-url",
+                type=str,
+                default="https://api.openai.com/v1",
+                help="OpenAI-compatible base URL for the skill condenser (default: OpenAI API).",
+            )
+            parser.add_argument(
+                "--sdpo-condense-model",
+                type=str,
+                default="gpt-5.4-mini",
+                help="Model id used to distill traces into skills.",
+            )
+            parser.add_argument(
+                "--sdpo-condense-api-key-env",
+                type=str,
+                default="OPENAI_API_KEY",
+                help="Env var holding the condenser API key.",
+            )
+            parser.add_argument(
+                "--sdpo-condense-max-tokens",
+                type=int,
+                default=2048,
+                help="max_completion_tokens for the skill condenser call (gpt-5* spend tokens on reasoning).",
+            )
+            parser.add_argument(
+                "--sdpo-condense-max-concurrency",
+                type=int,
+                default=32,
+                help="Max concurrent skill-condenser requests (bounds gateway load).",
+            )
             # ---- Self-generated skill + skill-SDPO (examples/SDPO/sdpo.py) ------
             # See DESIGN_self_skill.md.
             parser.add_argument(
