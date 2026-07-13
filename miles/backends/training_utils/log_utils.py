@@ -124,6 +124,23 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "dynamic_global_batch_size",
                 "weight_versions",
                 "metadata",
+                # SDPO KD teacher target: per-token [R, k] tensors (ids are Long,
+                # not meaningful as a scalar mean) — not a loggable rollout metric.
+                "sdpo_teacher_topk_logprobs",
+                "sdpo_teacher_topk_ids",
+                # SDPO teacher prompt: a list of TOKEN IDs per sample. Averaging them
+                # yields the mean vocab id (~50k for a 150k vocab), which is meaningless
+                # — it is NOT a token count. Skip it. (The useful signal, teacher-prompt
+                # LENGTH, is logged separately below.)
+                "sdpo_teacher_prompt_tokens",
+                # SDPO distilled skill: a per-sample string (trace-condense), not numeric.
+                "sdpo_skill",
+                # SDPO skill-KD: per-sample token-id / logprob lists (self-skill), not
+                # loggable scalars.
+                "sdpo_skill_tokens",
+                "sdpo_skill_prompt_tokens",
+                "sdpo_skill_teacher_prompt_tokens",
+                "sdpo_skill_rollout_logprobs",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -171,6 +188,14 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             else:
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
+
+        # SDPO: the meaningful signal is the teacher-prompt LENGTH (student prompt +
+        # correct-peer solution spliced into the user turn), not the mean token id.
+        # Log the mean teacher-prompt length in tokens (0 for samples with no prefix).
+        if "sdpo_teacher_prompt_tokens" in rollout_data:
+            tps = rollout_data["sdpo_teacher_prompt_tokens"]
+            if tps:
+                log_dict["sdpo_teacher_prompt_len"] = sum(len(p) for p in tps) / len(tps)
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
         if args.ci_test and not args.ci_disable_logprobs_checker and reduced_log_dict is not None:
@@ -324,8 +349,12 @@ def log_passrate(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -
     parallel_state = get_parallel_state()
     if parallel_state.tp.rank == 0 and parallel_state.is_pp_last_stage:
         log_dict = {}
+        # Under SDPO pure-distill the task reward (raw_reward) is zeroed, so pass@k
+        # from raw_reward would be a meaningless 0. Prefer the true per-trace
+        # correctness (sdpo_correct) when it was threaded through.
+        pass_key = "sdpo_correct" if "sdpo_correct" in rollout_data else "raw_reward"
         for key, val in rollout_data.items():
-            if key != "raw_reward":
+            if key != pass_key:
                 continue
 
             log_dict |= compute_pass_rate(
@@ -443,8 +472,13 @@ def log_train_step(
     accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
     role_tag = "" if role == "actor" else f"{role}-"
 
+    # Keys already carrying their own panel prefix (e.g. "skill/kl") stay top-level;
+    # everything else goes under train/.
+    def _train_key(key: str) -> str:
+        return key if "/" in key else f"train/{role_tag}{key}"
+
     log_dict_out = {
-        f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
+        _train_key(key): val.mean().item() if isinstance(val, torch.Tensor) else val
         for key, val in loss_dict.items()
     }
     log_dict_out[f"train/{role_tag}grad_norm"] = float(grad_norm)
@@ -452,6 +486,13 @@ def log_train_step(
     if extra_metrics:
         for key, val in extra_metrics.items():
             log_dict_out[f"train/{role_tag}{key}"] = val
+
+    # Dedicated "loss/" panel: only the core loss terms (pg_loss, sdpo_kd_loss,
+    # entropy_loss) for a clean at-a-glance view, separate from the busy train/*.
+    for lk in ("pg_loss", "sdpo_kd_loss", "sdpo_skill_kd_loss", "entropy_loss"):
+        if lk in loss_dict:
+            v = loss_dict[lk]
+            log_dict_out[f"loss/{role_tag}{lk}"] = v.mean().item() if isinstance(v, torch.Tensor) else v
 
     log_dict_out["train/step"] = accumulated_step_id
 

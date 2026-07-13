@@ -26,22 +26,46 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
             return
 
     log_dict = extra_metrics or {}
+    all_rewards: list[float] = []  # pooled across all eval datasets for eval/all
+    per_dataset_acc: list[float] = []  # per-dataset acc for the equal-weight eval/mean
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        all_rewards.extend(rewards)
+        dataset_acc = sum(rewards) / len(rewards)
+        per_dataset_acc.append(dataset_acc)
+        log_dict[f"eval/{key}"] = dataset_acc
+        # val-aux: per-domain accuracy (avg@N) lives with the auxiliary metrics.
+        log_dict[f"val-aux/{key}_acc"] = dataset_acc
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            # response_len, truncated, repetition, etc. -> val-aux
+            log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"val-aux/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
-            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+            log_dict[f"val-aux/{key}_truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
-            log_dict |= dict_add_prefix(
-                compute_pass_rate(
-                    flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
-                ),
-                f"eval/{key}-",
-            )
+            pr = compute_pass_rate(flat_rewards=rewards, group_size=args.n_samples_per_eval_prompt)
+            # per-domain pass@1 -> val-core (the headline); pass@2/4/... -> val-aux
+            if "pass@1" in pr:
+                log_dict[f"val-core/{key}_pass@1"] = pr["pass@1"]
+            log_dict |= dict_add_prefix({k: v for k, v in pr.items() if k != "pass@1"}, f"val-aux/{key}_")
+            # keep the legacy eval/ keys too for backward compatibility
+            log_dict |= dict_add_prefix(pr, f"eval/{key}-")
+
+    # Two overall val scores across all domains:
+    #   eval/all  = sample-pooled mean (domains with more samples weigh more)
+    #   eval/mean = equal-weight mean of per-domain accuracies (each domain 1/N)
+    if len(data) > 1 and all_rewards:
+        log_dict["eval/all"] = sum(all_rewards) / len(all_rewards)
+        log_dict["eval/mean"] = sum(per_dataset_acc) / len(per_dataset_acc)
+        log_dict["val-aux/all_acc"] = log_dict["eval/all"]
+        log_dict["val-aux/mean_acc"] = log_dict["eval/mean"]
+        if args.log_passrate:
+            pr_all = compute_pass_rate(flat_rewards=all_rewards, group_size=args.n_samples_per_eval_prompt)
+            # merged pass@1 -> val-core (the single headline val score you want)
+            if "pass@1" in pr_all:
+                log_dict["val-core/all_pass@1"] = pr_all["pass@1"]
+            log_dict |= dict_add_prefix({k: v for k, v in pr_all.items() if k != "pass@1"}, "val-aux/all_")
+            log_dict |= dict_add_prefix(pr_all, "eval/all-")
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
@@ -61,9 +85,19 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
     if args.load_debug_rollout_data:
         return
 
+    sample_metrics = _compute_metrics_from_samples(args, samples)
     log_dict = {**(rollout_extra_metrics or {})}
-    log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), "rollout/")
+    # skill/* already carry their own panel prefix -> keep them top-level (NOT under
+    # rollout/); everything else goes under rollout/.
+    log_dict |= dict_add_prefix({k: v for k, v in sample_metrics.items() if not k.startswith("skill/")}, "rollout/")
+    for k, v in sample_metrics.items():
+        if k.startswith("skill/"):
+            log_dict[k] = v
     log_dict |= dict_add_prefix(_compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
+    # Dedicated "response_len/" panel: all length-related metrics in one place.
+    for k, v in sample_metrics.items():
+        if k.startswith("response_len/") or k == "truncated_ratio":
+            log_dict[f"response_len/{k[len('response_len/'):] if k.startswith('response_len/') else k}"] = v
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
@@ -87,6 +121,44 @@ def _compute_metrics_from_samples(args, samples):
         log_dict |= dict_add_prefix(compute_statistics(oldest_versions), "weight_version/")
         mixed = sum(1 for s in samples if len(set(s.weight_versions)) > 1)
         log_dict["weight_version/mixed_version_ratio"] = mixed / len(samples)
+
+    # SDPO diagnostics (examples/SDPO/sdpo.py): per-sample mean log-prob of the
+    # sampled token under student vs teacher, and their diff (sampled-token
+    # reverse KL). No-op for non-SDPO runs where these keys are absent.
+    for mkey, out_key in (
+        ("sdpo_student_logp_mean", "sdpo/student_logp"),
+        ("sdpo_teacher_logp_mean", "sdpo/teacher_logp"),
+        ("sdpo_logp_diff_mean", "sdpo/logp_diff"),
+        # True task success rate (survives the zeroed reward under pure distill)
+        # and response perplexity of the sampled rollout.
+        ("sdpo_correct", "sdpo/success_rate"),
+        ("sdpo_ppl", "sdpo/ppl"),
+    ):
+        vals = [s.metadata[mkey] for s in samples if isinstance(s.metadata, dict) and mkey in s.metadata]
+        if vals:
+            log_dict[out_key] = float(np.mean(vals))
+
+    # SDPO self-skill (rollout-side): dedicated skill/ panel — skill length
+    # min/max/mean and skill perplexity. Present only when --sdpo-self-skill is on
+    # and at least one skill was generated this rollout.
+    skill_lens = [s.metadata["sdpo_skill_len"] for s in samples if isinstance(s.metadata, dict) and "sdpo_skill_len" in s.metadata]
+    if skill_lens:
+        log_dict["skill/length_mean"] = float(np.mean(skill_lens))
+        log_dict["skill/length_min"] = float(np.min(skill_lens))
+        log_dict["skill/length_max"] = float(np.max(skill_lens))
+        log_dict["skill/count"] = float(len(skill_lens))
+    skill_ppls = [s.metadata["sdpo_skill_ppl"] for s in samples if isinstance(s.metadata, dict) and "sdpo_skill_ppl" in s.metadata]
+    if skill_ppls:
+        log_dict["skill/ppl"] = float(np.mean(skill_ppls))
+    # --sdpo-response-prefix skill: fraction of response teacher prefixes that
+    # actually used the peer's skill (vs falling back to the peer's full trace).
+    rp_skill = [
+        s.metadata["sdpo_response_prefix_is_skill"]
+        for s in samples
+        if isinstance(s.metadata, dict) and "sdpo_response_prefix_is_skill" in s.metadata
+    ]
+    if rp_skill:
+        log_dict["skill/response_prefix_is_skill_frac"] = float(np.mean(rp_skill))
 
     tito_vals = [s.metadata.get("tito_session_mismatch") for s in samples]
     tito_vals = [v for v in tito_vals if v is not None]
