@@ -258,9 +258,137 @@ def _is_correct(sample: Sample, args: Namespace | None = None) -> bool:
     return bool(grade_answer_verl(extracted or sample.response, label))
 
 
+# --------------------------------------------------------------------------- #
+# LLM-as-judge grading  (defeats the MCQ letter-guessing reward hack)
+# --------------------------------------------------------------------------- #
+
+_JUDGE_SYSTEM = (
+    "You are a strict grader for science exam answers. You are given the QUESTION, "
+    "the REFERENCE ANSWER (ground truth), the model's FULL RESPONSE, and the model's "
+    "EXTRACTED ANSWER. Decide whether the model's answer is scientifically correct "
+    "and equivalent to the reference answer.\n\n"
+    "Rules:\n"
+    "- Judge correctness of the ANSWER's meaning, not its wording/format. Accept "
+    "mathematically or chemically equivalent forms (e.g. same SMILES/quantity/name).\n"
+    "- The extracted answer must actually answer the question. A blank, missing, or "
+    "placeholder answer is INCORRECT even if the full response rambles near the topic.\n"
+    "- Do NOT give credit for a guess with no supporting reasoning if it does not match "
+    "the reference answer.\n"
+    "Reply with EXACTLY one word on the final line: CORRECT or INCORRECT."
+)
+
+
+def _build_judge_prompt(args: Namespace, sample: Sample) -> tuple[str, str]:
+    """Return (system, user) messages for the judge. Includes BOTH the full response
+    and the extracted answer, per the requirement to give the judge both."""
+    meta = sample.metadata if isinstance(sample.metadata, dict) else {}
+    question = meta.get("question") or (sample.prompt if isinstance(sample.prompt, str) else "")
+    reference = (sample.label or "").strip()
+    extracted = _extract_answer(args, sample)
+    full = sample.response or ""
+    # Cap the full response so the judge prompt stays bounded on very long traces.
+    if len(full) > 8000:
+        full = full[:4000] + "\n...[truncated]...\n" + full[-3000:]
+    user = (
+        f"QUESTION:\n{question}\n\n"
+        f"REFERENCE ANSWER:\n{reference}\n\n"
+        f"MODEL FULL RESPONSE:\n{full}\n\n"
+        f"MODEL EXTRACTED ANSWER:\n{extracted if extracted is not None else '(none — no <answer> tag found)'}\n\n"
+        "Is the model's answer correct? Reply CORRECT or INCORRECT."
+    )
+    return _JUDGE_SYSTEM, user
+
+
+# GLOBAL judge concurrency limiter. Each rollout spawns one generate_and_rm_group
+# task PER GROUP (rollout_batch_size groups) and they all run concurrently, so a
+# per-call semaphore would only bound the ~n_samples_per_prompt traces within one
+# group — the real cap must be process-wide. This single semaphore is shared by
+# every group's judge calls, so --sdpo-judge-max-concurrency bounds TOTAL in-flight
+# judge requests to the gateway (else 32 groups x 8 traces = 256 at once).
+_JUDGE_SEM: "asyncio.Semaphore | None" = None
+_JUDGE_SEM_LIMIT: int | None = None
+
+
+def _judge_semaphore(args: Namespace) -> asyncio.Semaphore:
+    global _JUDGE_SEM, _JUDGE_SEM_LIMIT
+    limit = int(getattr(args, "sdpo_judge_max_concurrency", 32))
+    # Recreate if the limit changed (or first use). Safe: single event loop.
+    if _JUDGE_SEM is None or _JUDGE_SEM_LIMIT != limit:
+        _JUDGE_SEM = asyncio.Semaphore(limit)
+        _JUDGE_SEM_LIMIT = limit
+    return _JUDGE_SEM
+
+
+def _parse_judge_verdict(text: str) -> bool:
+    """Parse the judge's reply into a bool. Looks for the last CORRECT/INCORRECT."""
+    if not text:
+        return False
+    up = text.upper()
+    # INCORRECT contains CORRECT, so search for whole-word tokens and take the last.
+    hits = re.findall(r"\b(INCORRECT|CORRECT)\b", up)
+    if not hits:
+        return False
+    return hits[-1] == "CORRECT"
+
+
+async def _llm_judge_correct(args: Namespace, sample: Sample) -> bool:
+    """Grade one trace via the OpenAI-compatible LLM judge (SFR gateway).
+
+    Falls back to deterministic _is_correct on any judge failure so a flaky
+    gateway never stalls or crashes training.
+    """
+    system, user = _build_judge_prompt(args, sample)
+    base_url = getattr(args, "sdpo_judge_base_url", "https://api.openai.com/v1").rstrip("/")
+    model = getattr(args, "sdpo_judge_model", "gpt-5.4-mini")
+    api_key = os.environ.get(getattr(args, "sdpo_judge_api_key_env", "OPENAI_API_KEY"), "") or "EMPTY"
+    max_tokens = int(getattr(args, "sdpo_judge_max_tokens", 2048))
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    # gpt-5*/o-series are reasoning models: use max_completion_tokens, ignore temperature.
+    if model.startswith(("gpt-5", "o1", "o3", "o4")):
+        payload["max_completion_tokens"] = max_tokens
+    else:
+        payload["max_completion_tokens"] = max_tokens
+        payload["temperature"] = 0.0
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        # Low retry count: the judge is best-effort, fall back fast on failure.
+        out = await post(f"{base_url}/chat/completions", payload, max_retries=3, headers=headers)
+        content = out["choices"][0]["message"].get("content") or ""
+        return _parse_judge_verdict(content)
+    except Exception as e:
+        logger.warning(f"LLM judge failed ({e!r}); falling back to deterministic grading.")
+        return _is_correct(sample, args)
+
+
 async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
-    """Correctness for every trace in a group (deterministic matching)."""
-    return [_is_correct(s, args) for s in group]
+    """Correctness for every trace in a group. Uses the LLM judge (bounded
+    concurrency) when --sdpo-judge is set, else deterministic matching."""
+    if not getattr(args, "sdpo_judge", False):
+        return [_is_correct(s, args) for s in group]
+
+    # Process-wide cap (shared across all concurrently-running groups), so the
+    # judge calls are concurrent — both within a group (gather) and across groups
+    # (each group is its own asyncio task) — without overloading the gateway.
+    sem = _judge_semaphore(args)
+
+    async def _one(s: Sample) -> bool:
+        # Skip the judge for empty responses (cheap, obviously wrong).
+        if not (s.response or "").strip():
+            return False
+        async with sem:
+            return await _llm_judge_correct(args, s)
+
+    return list(await asyncio.gather(*(_one(s) for s in group)))
 
 
 # --------------------------------------------------------------------------- #
@@ -1061,9 +1189,16 @@ async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> fl
     """Per-sample eval RM for SDPO (--eval-custom-rm-path).
 
     Eval measures pass@1 and never uses the distillation signal, so it just needs
-    the task reward. Uses the same deterministic grading as the group RM.
+    the task reward. Uses the same grading as the group RM: the LLM judge when
+    --sdpo-judge is set (open-ended answers), else deterministic matching.
     """
-    if getattr(args, "sdpo_grader", "mcq") == "dapo":
+    if getattr(args, "sdpo_judge", False) and (sample.response or "").strip():
+        # Eval fans out one sdpo_eval_reward coroutine per sample via asyncio.gather
+        # upstream, so honor the SAME global concurrency cap to avoid flooding the
+        # gateway during large evals.
+        async with _judge_semaphore(args):
+            ok = await _llm_judge_correct(args, sample)
+    elif getattr(args, "sdpo_grader", "mcq") == "dapo":
         # Math eval (AIME-2025 = integers, Minerva Math = LaTeX). Use the general
         # math grader, which handles both, rather than the integer-only DAPO grader
         # used for training-trace correctness (Minerva answers are not integers).

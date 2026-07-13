@@ -1415,6 +1415,73 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Default False (safe for non-thinking models like Qwen2.5)."
                 ),
             )
+            # ---- LLM-as-judge grading (examples/SDPO/sdpo.py) --------------------
+            parser.add_argument(
+                "--sdpo-judge",
+                action="store_true",
+                default=False,
+                help=(
+                    "Grade trace correctness with an LLM judge over an OpenAI-compatible chat "
+                    "API instead of exact letter/math matching. The judge sees the question, the "
+                    "reference answer, the model's FULL response, and its extracted <answer> "
+                    "content, and returns correct/incorrect. This defeats the MCQ letter-guessing "
+                    "reward hack (a bare, un-reasoned answer that happens to match is not credited)."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-judge-base-url",
+                type=str,
+                default="https://api.openai.com/v1",
+                help="OpenAI-compatible base URL for the LLM judge (default: OpenAI API).",
+            )
+            parser.add_argument(
+                "--sdpo-judge-model",
+                type=str,
+                default="gpt-5.4-mini",
+                help="Judge model id served by --sdpo-judge-base-url (e.g. gpt-5.4-mini).",
+            )
+            parser.add_argument(
+                "--sdpo-judge-api-key-env",
+                type=str,
+                default="OPENAI_API_KEY",
+                help="Env var holding the judge API key (may be unset/EMPTY for a keyless proxy).",
+            )
+            parser.add_argument(
+                "--sdpo-judge-max-concurrency",
+                type=int,
+                default=32,
+                help="Max concurrent judge requests (bounds load on the gateway).",
+            )
+            parser.add_argument(
+                "--sdpo-judge-max-tokens",
+                type=int,
+                default=2048,
+                help=(
+                    "max_completion_tokens for the judge call. gpt-5* are reasoning models that "
+                    "spend tokens on internal reasoning before the verdict, so keep this generous."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-answer-tag",
+                type=str,
+                default="answer",
+                help=(
+                    "XML tag the model wraps its final answer in (<answer>...</answer>). The judge "
+                    "extracts this as the model's answer; an empty/missing tag counts as incorrect."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-grader",
+                type=str,
+                choices=["mcq", "dapo"],
+                default="mcq",
+                help=(
+                    "How the SDPO group RM grades trace correctness (to pick correct-peer "
+                    "prefixes). 'mcq' (default): <answer>-letter match / math-verl grading for the "
+                    "SciKnowEval MCQ dataset. 'dapo': DAPO math grader (integer boxed answers) for "
+                    "the zhuzilin/dapo-math-17k dataset."
+                ),
+            )
             # ---- Trace condensation / SkillOpt (examples/SDPO/sdpo.py) ----------
             parser.add_argument(
                 "--sdpo-trace-condense",
