@@ -13,8 +13,25 @@ engine (the current policy) with a **skill-generation prompt**:
     skill_gen_prompt(problem, solution) = chat_template([
         {system: SKILL_SYSTEM_PROMPT},
         {user: "PROBLEM:\n{problem}\n\nWORKED SOLUTION:\n{solution}\n\n
-                Distill the transferable skill (<=3 terse procedural bullets)."},
+                Write the solution roadmap (6-10 numbered steps, instance-grounded,
+                stop one step before the final answer)."},
     ], add_generation_prompt=True)
+
+**Skill format — instance-grounded roadmap, NOT a generic ≤3-bullet abstraction.**
+The skill's whole job as a teacher prefix is to let the teacher (policy conditioned
+on the skill) *confidently reach the correct answer*, so its per-token distribution
+over the response is a clean, low-entropy target for KD. A maximally-abstract
+"3 generic procedural bullets, no instance values" skill fails at this on MCQ:
+the teacher, seeing only vague procedure, is about as unsure as the prefix-free
+student, so the KD signal (teacher − student) is weak and val acc lags the full
+trace. Measured on real dumps: the full-trace prefix contained the answer in
+~100% of samples (median ~2–4k chars), the old 3-bullet skill in ~1–13% (median
+~220 chars). We therefore make the skill a concrete **solution roadmap**: 6–10
+steps that DO name this problem's key quantities, governing relation, decisive
+comparisons and key intermediate results — but stop one step before stating the
+final letter/number, so it is not a raw answer leak. See `_SKILL_SYSTEM_PROMPT`
+in `sdpo.py`. (`--sdpo-skill-max-new-tokens` is bumped 512→1024 accordingly, since
+the roadmap is ~3–5× longer than the old bullets and 512 truncated its tail.)
 
 - The generated `skill_text` (+ its tokens + rollout logprobs) is captured, exactly
   like a normal rollout response.

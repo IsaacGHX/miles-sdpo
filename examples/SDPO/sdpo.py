@@ -89,6 +89,12 @@ _sdpo_calls = 0
 # response stays at the tail and per-position alignment is preserved.
 SOLUTION_TEMPLATE = "\n\nCorrect solution:\n\n{successful_previous_attempt}"
 PREFIX_INSTRUCTION = "\n\nCorrectly solve the original question.\n\n"
+# Optional pitfalls block (group-aggregated warnings distilled from the group's
+# INCORRECT traces). Inserted BEFORE the instruction, AFTER the correct-solution /
+# skill prefix, so the teacher sees "here's the approach, and here are the mistakes
+# to avoid". Kept as a clearly-labelled separate section so it is never confused
+# with the correct solution.
+PITFALLS_TEMPLATE = "\n\nCommon mistakes to avoid (seen in failed attempts):\n\n{pitfalls}"
 
 
 def _strip_thinking_blocks(text: str) -> str:
@@ -98,9 +104,12 @@ def _strip_thinking_blocks(text: str) -> str:
     return stripped.strip()
 
 
-def _render_prefix(peer_response: str, remove_thinking: bool = False) -> str:
+def _render_prefix(peer_response: str, remove_thinking: bool = False, pitfalls: str = "") -> str:
     content = _strip_thinking_blocks(peer_response) if remove_thinking else peer_response
-    return SOLUTION_TEMPLATE.format(successful_previous_attempt=content) + PREFIX_INSTRUCTION
+    section = SOLUTION_TEMPLATE.format(successful_previous_attempt=content)
+    if pitfalls and pitfalls.strip():
+        section += PITFALLS_TEMPLATE.format(pitfalls=pitfalls.strip())
+    return section + PREFIX_INSTRUCTION
 
 
 def _gen_prompt_suffix(tok) -> str:
@@ -142,7 +151,7 @@ def _strip_response_eos(text: str) -> str:
     return out
 
 
-def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_response: str, remove_thinking: bool = False) -> str:
+def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_response: str, remove_thinking: bool = False, pitfalls: str = "") -> str:
     """Insert the correct-peer solution + instruction into the USER turn of the
     student's (already chat-templated) prompt, before the assistant generation
     marker. Returns the full teacher prompt string (system + user+solution +
@@ -152,7 +161,7 @@ def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_respons
     full generated turn, and leaving that marker in mid-user-turn would close the
     user turn early and corrupt the teacher prompt (the model would then see the
     solution as a separate malformed turn instead of context)."""
-    solution_section = _render_prefix(_strip_response_eos(peer_response), remove_thinking=remove_thinking)
+    solution_section = _render_prefix(_strip_response_eos(peer_response), remove_thinking=remove_thinking, pitfalls=pitfalls)
     if gen_suffix and gen_suffix in student_prompt:
         idx = student_prompt.rfind(gen_suffix)
         return student_prompt[:idx] + solution_section + student_prompt[idx:]
@@ -400,39 +409,45 @@ async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
 # lasgroup/SDPO trace_condense (verl/trainer/ppo/trace_condense.py).
 
 _SKILL_SYSTEM_PROMPT = (
-    "You distill a worked solution into a SKILL: the minimal set of transferable, "
-    "procedural know-how needed to solve problems of this kind. A skill is NOT the "
-    "answer and NOT a step-by-step derivation of this instance. It is generic "
-    "procedure: what to recognize in the problem, which concepts/techniques/"
-    "theorems/conventions to apply and in what order, common pitfalls to avoid, and "
-    "any output-format requirement.\n\n"
+    "You distill a worked solution into a SKILL: a concrete solution ROADMAP that a "
+    "capable solver could follow to reach the correct answer to THIS problem on their "
+    "own. It is grounded in this specific problem — name the key quantities, the "
+    "governing relation/theorem to apply, the decisive facts or comparisons that "
+    "discriminate the right choice from the wrong ones, and the key intermediate "
+    "results along the way — but it stops one step short of the final answer.\n\n"
     "Hard constraints:\n"
-    "- Be EXTREMELY compressed: at most 3 bullets, each a short imperative phrase.\n"
-    "- Procedural and reusable, never instance-specific. No numbers, names, or "
-    "intermediate/final values from this particular problem.\n"
-    "- Never reveal or hint at the final answer.\n"
-    "- Output ONLY the bullets (prefixed with '- '), nothing else."
+    "- Be a clear numbered roadmap: 6-10 short steps, each an imperative instruction.\n"
+    "- Instance-grounded: DO reference this problem's specific quantities, setup, and "
+    "the critical intermediate values/comparisons needed to get the answer right.\n"
+    "- Do NOT state the final answer itself (no final letter/number/name, no "
+    "'the answer is ...'). Stop at the last step BEFORE committing to the answer, so "
+    "the reader must still perform the final selection/computation themselves.\n"
+    "- Output ONLY the numbered steps, nothing else."
 )
 
-# Incorrect-trace variant: the attempt is WRONG. Instead of distilling know-how
-# FROM the (flawed) trace, distill a recovery/pitfall-prevention skill: locate the
-# error class and turn it into generic procedure that would have prevented it. The
-# ground-truth answer is provided so the model knows the attempt failed and can
-# reason about where — but, like the correct-trace skill, the output must stay
-# generic and must NOT reveal the answer (the skill is reused as a teacher prefix /
-# KD target across the problem type).
+# Incorrect-trace variant: the attempt is WRONG. A model that failed this problem
+# CANNOT be trusted to rewrite a correct solution — asking it to "reach the right
+# answer" just yields a hallucinated roadmap that would poison the KD target. So we
+# do NOT distill know-how / a solution roadmap here. Instead we distill the ERROR
+# PATTERN: identify the specific mistake(s) the attempt made and turn each into a
+# concrete "avoid this" warning bullet. The ground-truth answer is provided ONLY so
+# the model can localize where the attempt went wrong; the output is pitfalls, never
+# a solution and never the answer.
 _SKILL_SYSTEM_PROMPT_INCORRECT = (
     "You are given a FAILED attempt at a problem and the ground-truth answer. The "
-    "attempt is WRONG. Diagnose the error and distill a SKILL: transferable, "
-    "procedural know-how that would PREVENT this class of mistake on problems of "
-    "this kind. Frame it as what to check / recognize / do differently, not a "
-    "narration of this instance's slip.\n\n"
+    "attempt is WRONG. Do NOT try to solve the problem or write a correct solution — "
+    "you only have a failed attempt to learn from. Instead, identify the SPECIFIC "
+    "mistakes the attempt made and turn each into a concrete PITFALL WARNING: a "
+    "'do not do X / watch out for Y' note grounded in this problem's setup, so a "
+    "solver would avoid that same error on this kind of problem.\n\n"
     "Hard constraints:\n"
-    "- Be EXTREMELY compressed: at most 3 bullets, each a short imperative phrase.\n"
-    "- Procedural and reusable, never instance-specific. No numbers, names, or "
-    "intermediate/final values from this particular problem.\n"
-    "- Never reveal or hint at the ground-truth answer.\n"
-    "- Output ONLY the bullets (prefixed with '- '), nothing else."
+    "- Output 2-5 numbered pitfall bullets, each an imperative 'Avoid ...' / "
+    "'Do not ...' / 'Watch out that ...' warning naming the concrete mistake.\n"
+    "- Diagnose from the attempt; reference this problem's specific quantities/setup "
+    "where it sharpens the warning. Do NOT provide the correct steps or method.\n"
+    "- Never state the final/ground-truth answer (no letter/number/name, no "
+    "'the answer is ...') and never give a worked solution.\n"
+    "- Output ONLY the numbered pitfall warnings, nothing else."
 )
 
 _CONDENSE_SEM: "asyncio.Semaphore | None" = None
@@ -475,21 +490,22 @@ def _skill_user_prompt(problem: str, solution: str) -> str:
     return (
         f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
         f"WORKED SOLUTION (reference, do not echo):\n{solution}\n\n"
-        "Distill the transferable skill (<=3 terse procedural bullets)."
+        "Write the solution roadmap (6-10 numbered steps, instance-grounded, "
+        "stop one step before the final answer)."
     )
 
 
 def _skill_user_prompt_incorrect(problem: str, attempt: str, ground_truth: str) -> str:
     """User prompt for the incorrect-trace skill: the attempt is wrong; give the
-    ground-truth answer so the model can locate the error class and distill a
-    pitfall-prevention skill (still generic, still no answer in the output)."""
+    ground-truth answer ONLY so the model can localize the mistake, then emit
+    pitfall warnings (never a solution, never the answer)."""
     gt = (ground_truth or "").strip()
     return (
         f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
         f"FAILED ATTEMPT (wrong, do not echo):\n{attempt}\n\n"
-        f"GROUND-TRUTH ANSWER (for your diagnosis only, do NOT put it in the skill):\n{gt}\n\n"
-        "Diagnose the error and distill a pitfall-prevention skill "
-        "(<=3 terse procedural bullets)."
+        f"GROUND-TRUTH ANSWER (for locating the mistake only, do NOT put it in the output):\n{gt}\n\n"
+        "Identify the specific mistakes and write the pitfall warnings (2-5 numbered "
+        "'Avoid ...'/'Do not ...' bullets; no solution, no answer)."
     )
 
 
@@ -1132,6 +1148,27 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 if peer_skill:
                     prefix_text_by_idx[i] = peer_skill
 
+        # Group-aggregated pitfalls: when self-skill covers INCORRECT traces
+        # (--sdpo-skill-source incorrect|all), each failed trace produced a pitfall
+        # skill (mistakes to avoid, NOT a solution). Concatenate ALL of the group's
+        # failed-trace pitfalls into one block and append it to EVERY prefix, so the
+        # teacher sees the correct approach plus the full set of mistakes this group
+        # made on this problem. A model that failed cannot be trusted to rewrite the
+        # solution (that would hallucinate a bad KD target), but it CAN flag concrete
+        # errors — so incorrect traces contribute warnings, never solutions.
+        group_pitfalls = ""
+        if self_skill and skill_source in ("incorrect", "all"):
+            pit_texts = []
+            for i in range(len(group)):
+                self_ok = bool(correctness[i]) if i < len(correctness) else False
+                if self_ok:
+                    continue
+                md = group[i].metadata if isinstance(group[i].metadata, dict) else {}
+                sk = md.get("sdpo_skill")
+                if sk and sk.strip():
+                    pit_texts.append(sk.strip())
+            group_pitfalls = "\n\n".join(pit_texts)
+
         # Pass 2: build the teacher prompt (peer solution/skill spliced into the USER
         # turn, before the assistant marker) and tokenize.
         for i, sample in enumerate(group):
@@ -1139,7 +1176,8 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 continue
             student_prompt = sample.prompt if isinstance(sample.prompt, str) else ""
             teacher_prompt_str = _build_teacher_prompt_str(
-                student_prompt, gen_suffix, prefix_text_by_idx[i], remove_thinking=remove_thinking
+                student_prompt, gen_suffix, prefix_text_by_idx[i], remove_thinking=remove_thinking,
+                pitfalls=group_pitfalls,
             )
             teacher_prompt_ids = tok.encode(teacher_prompt_str, add_special_tokens=False)
             # Training side builds teacher seq = teacher_prompt_ids + response_ids,
