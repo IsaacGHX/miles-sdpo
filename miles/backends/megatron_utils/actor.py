@@ -1,6 +1,8 @@
 import logging
+import math
 import random
 import socket
+from pathlib import Path
 from argparse import Namespace
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -29,7 +31,12 @@ from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
 from ..training_utils.data import DataIterator, get_data_iterator, get_rollout_data, sync_actor_critic_data
 from ..training_utils.log_utils import log_cpu_memory, log_perf_data, log_rollout_data
-from ..training_utils.loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+from ..training_utils.loss import (
+    compute_advantages_and_returns,
+    get_log_probs_and_entropy,
+    get_topk_logprobs,
+    get_values,
+)
 from ..training_utils.parallel import get_parallel_state
 from ..training_utils.replay_data import fill_replay_data, register_replay_list_sequential
 from .checkpoint import load_checkpoint
@@ -49,6 +56,58 @@ if TYPE_CHECKING:
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _sdpo_topk_distribution_divergence(
+    s_lp: torch.Tensor,  # [R, k] student top-k log-probs
+    s_ids: torch.Tensor,  # [R, k] student top-k token ids
+    t_lp: torch.Tensor,  # [R, kt] teacher top-k log-probs
+    t_ids: torch.Tensor,  # [R, kt] teacher top-k token ids
+    mode: str,
+) -> torch.Tensor:
+    """Per-token distribution-level divergence over the student's top-k tokens
+    plus one aggregated tail bucket, matching the original SGLang SDPO recipe.
+
+    student prob p_s = exp(student top-k log-probs), tail_s = 1 - sum(p_s).
+    teacher prob p_t at those SAME ids: looked up from the teacher's own top-k;
+    ids the teacher didn't rank get ~0 (folded into tail_t = 1 - sum(found)).
+    All CPU float64 tensors (small, [R, k]); returns [R] float32.
+    """
+    eps = 1e-12
+    s_lp = s_lp.double()
+    p_s = torch.exp(s_lp)  # [R, k]
+    R, k = p_s.shape
+    if R == 0:
+        return torch.zeros((0,), dtype=torch.float32)
+
+    # Build teacher prob at the student ids via a per-row lookup: for each student
+    # id, find it in the teacher's top-k ids; missing -> prob 0.
+    t_lp = t_lp.double()
+    p_t = torch.zeros((R, k), dtype=torch.float64)
+    for r in range(R):
+        tmap = {int(tid): float(tlp) for tid, tlp in zip(t_ids[r].tolist(), t_lp[r].tolist())}
+        for c in range(k):
+            sid = int(s_ids[r, c])
+            if sid in tmap:
+                p_t[r, c] = math.exp(tmap[sid])
+
+    tail_s = (1.0 - p_s.sum(dim=1)).clamp_min(0.0).unsqueeze(1)
+    tail_t = (1.0 - p_t.sum(dim=1)).clamp_min(0.0).unsqueeze(1)
+    P = torch.cat([p_s, tail_s], dim=1)  # [R, k+1]
+    Q = torch.cat([p_t, tail_t], dim=1)
+
+    if mode == "reverse_kl":
+        div = (P * torch.log((P + eps) / (Q + eps))).sum(dim=1)
+    elif mode == "forward_kl":
+        div = (Q * torch.log((Q + eps) / (P + eps))).sum(dim=1)
+    elif mode == "jeffrey":
+        div = (P * torch.log((P + eps) / (Q + eps))).sum(dim=1) + (Q * torch.log((Q + eps) / (P + eps))).sum(dim=1)
+    else:  # jsd
+        M = 0.5 * (P + Q)
+        div = 0.5 * (P * torch.log((P + eps) / (M + eps))).sum(dim=1) + 0.5 * (
+            Q * torch.log((Q + eps) / (M + eps))
+        ).sum(dim=1)
+    return div.to(torch.float32)
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -169,6 +228,24 @@ class MegatronTrainRayActor(TrainRayActor):
             if args.update_weights_interval == 1:
                 self.weights_backuper.backup("rollout_actor")
 
+        # SDPO EMA teacher: initialize a "sdpo_teacher" weight snapshot = current
+        # (initial) actor weights. Each train step it is EMA-blended toward the
+        # student (see _update_sdpo_ema_teacher), and the SDPO teacher forward runs
+        # against this slow copy instead of the live policy. _enable_weight_backup
+        # is True whenever sdpo_ema_teacher is set (see the property), so this works
+        # even with KL off (no ref model).
+        if getattr(self.args, "sdpo_ema_teacher", False) and getattr(self.args, "sdpo_kd_loss", False):
+            assert self._enable_weight_backup, (
+                "--sdpo-ema-teacher needs the weight backuper active (it should be, via the "
+                "_enable_weight_backup property)."
+            )
+            assert self.args.enable_weights_backuper, (
+                "--sdpo-ema-teacher needs the multi-tag weight backuper; do not pass "
+                "--disable-weights-backuper (the single-tag backuper cannot hold a "
+                "separate EMA-teacher snapshot)."
+            )
+            self.weights_backuper.backup("sdpo_teacher")
+
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
@@ -243,7 +320,15 @@ class MegatronTrainRayActor(TrainRayActor):
     @property
     def _enable_weight_backup(self) -> bool:
         """Weight backup is only needed for CPU-side model switching or colocated tensor weight sync."""
-        return self.with_ref or self.with_opd_teacher or self.args.keep_old_actor or self.args.colocate
+        return (
+            self.with_ref
+            or self.with_opd_teacher
+            or self.args.keep_old_actor
+            or self.args.colocate
+            # SDPO EMA teacher keeps a separate weight snapshot that must be swapped
+            # in for the teacher forward, so it needs the backuper even without a ref.
+            or (getattr(self.args, "sdpo_ema_teacher", False) and getattr(self.args, "sdpo_kd_loss", False))
+        )
 
     def _switch_model(self, target_tag: str) -> None:
         if not self._enable_weight_backup:
@@ -324,6 +409,9 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        # Remember the pre-skill-append sample count; skill-KD appends extra samples
+        # later (in _compute_sdpo_teacher_log_probs) and we must rebuild the iterator.
+        _orig_num_samples = len(rollout_data["tokens"])
 
         for m in all_replay_managers:
             if self._use_rollout_replay(m):
@@ -382,6 +470,38 @@ class MegatronTrainRayActor(TrainRayActor):
                         if self._use_rollout_replay(m):
                             m.clear_all_forward()
 
+                # SDPO megatron self-teacher: forward the policy over
+                # prompt+prefix+response to get teacher log-probs on the response
+                # span (aligned with the student's, since the response stays at
+                # the tail). With --sdpo-ema-teacher, switch to the slow EMA weight
+                # snapshot for this forward (matches lasgroup/SDPO), then switch
+                # back to the live actor; otherwise use the live actor weights.
+                if "sdpo_teacher_prompt_tokens" in rollout_data:
+                    use_ema = getattr(self.args, "sdpo_ema_teacher", False) and (
+                        "sdpo_teacher" in self.weights_backuper.backup_tags
+                    )
+                    if use_ema:
+                        # DIAG: verify the EMA teacher weights actually differ from the
+                        # live student before switching (else EMA is a no-op = live teacher).
+                        if self._is_main_rank:
+                            try:
+                                import torch as _t
+
+                                live = next(iter(self.weights_backuper.get("actor").values()))
+                                ema = next(iter(self.weights_backuper.get("sdpo_teacher").values()))
+                                diff = (live.float() - ema.float()).abs().mean().item()
+                                logger.info(
+                                    f"[SDPO-EMA-DIAG] rollout {getattr(self, '_last_rollout_id', '?')}: "
+                                    f"mean|actor-ema_teacher|={diff:.3e} (0 => EMA is a no-op / same as live)"
+                                )
+                            except Exception as e:
+                                logger.warning(f"[SDPO-EMA-DIAG] failed: {e!r}")
+                        self._set_replay_stage("fallthrough")
+                        self._switch_model("sdpo_teacher")
+                    self._compute_sdpo_teacher_log_probs(rollout_data)
+                    if use_ema:
+                        self._switch_model("actor")
+
                 if self.args.use_critic:
                     sync_actor_critic_data(
                         self.args,
@@ -399,6 +519,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.rollout_data_postprocess(self.args)
 
             log_rollout_data(rollout_id, self.args, rollout_data)
+
+            # Skill-KD (option A) appended skill samples to rollout_data inside
+            # _compute_sdpo_teacher_log_probs, AFTER the data_iterator above was
+            # built. Rebuild the iterator so the training forward actually covers
+            # the appended skill samples (otherwise skill KD is silently 0).
+            if rollout_data.get("sdpo_is_skill") and len(rollout_data["tokens"]) != _orig_num_samples:
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
             # Train
             self._set_replay_stage("replay_backward")
@@ -426,6 +553,36 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             torch.cuda.synchronize()
 
+        # SDPO EMA teacher update: blend the teacher snapshot toward the freshly
+        # trained student (teacher = (1-rate)*teacher + rate*student). The live
+        # model still holds the student weights here, so this reads the source
+        # directly. Done after the actor backup so ordering is unambiguous.
+        if (
+            getattr(self.args, "sdpo_ema_teacher", False)
+            and "sdpo_teacher" in self.weights_backuper.backup_tags
+        ):
+            # DIAG: measure how much the EMA teacher moves this step (should be small
+            # but non-zero; 0 => update is a no-op).
+            _ema_before = None
+            if self._is_main_rank:
+                try:
+                    _ema_before = next(iter(self.weights_backuper.get("sdpo_teacher").values())).clone()
+                except Exception:
+                    _ema_before = None
+            self.weights_backuper.ema_update_from_source(
+                "sdpo_teacher", float(getattr(self.args, "sdpo_ema_teacher_rate", 0.05))
+            )
+            if self._is_main_rank and _ema_before is not None:
+                try:
+                    _ema_after = next(iter(self.weights_backuper.get("sdpo_teacher").values()))
+                    moved = (_ema_after.float() - _ema_before.float()).abs().mean().item()
+                    logger.info(
+                        f"[SDPO-EMA-DIAG] rollout {rollout_id}: EMA teacher moved "
+                        f"mean|Δ|={moved:.3e} this step (0 => update no-op)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[SDPO-EMA-DIAG] update check failed: {e!r}")
+
         # Update ref model if needed
         if (
             self.args.ref_update_interval is not None
@@ -438,6 +595,437 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args, extra_metrics=self.weight_updater.pop_metrics())
+
+    def _compute_sdpo_teacher_log_probs(self, rollout_data: RolloutBatch) -> None:
+        """SDPO self-teacher via the current policy (Megatron forward).
+
+        For each sample, build the teacher sequence prompt+prefix+response by
+        inserting the correct-peer prefix tokens between the prompt and the
+        response. The response stays at the tail, so the response-span log-probs
+        this forward returns are token-aligned with the student's (which were
+        computed over prompt+response). Samples with an empty prefix get teacher
+        log-probs equal to the student's (zero KL). Results are written to
+        rollout_data["teacher_log_probs"], consumed by opd.py exactly like the
+        Megatron-OPD path.
+
+        This replaces SGLang HTTP full-sequence-logprob scoring (which forces
+        eager prefill) with a single batched, CUDA-graph'd forward — the same
+        approach as veRL's RefWorker, ~50x faster.
+        """
+        response_lengths = rollout_data["response_lengths"]
+        student_log_probs = rollout_data.get("log_probs")
+
+        # Build the prefix-augmented teacher rollout_data (prompt+prefix+response).
+        teacher_rollout_data, has_prefix = self._build_sdpo_teacher_rollout_data(rollout_data)
+        teacher_iter, teacher_nmb = get_data_iterator(self.args, self.model, teacher_rollout_data)
+
+        distribution_mode = getattr(self.args, "sdpo_logprob_mode", "topk") == "topk"
+
+        if not distribution_mode:
+            # Sampled-token reverse KL: teacher log-prob of the sampled tokens.
+            out = self.compute_log_prob(teacher_iter, teacher_nmb, store_prefix="")
+            teacher_lp = out["log_probs"]
+            if student_log_probs is not None:
+                teacher_lp = [teacher_lp[i] if has_prefix[i] else student_log_probs[i] for i in range(len(teacher_lp))]
+            rollout_data["teacher_log_probs"] = teacher_lp
+            del teacher_rollout_data, teacher_iter, out
+            torch.cuda.empty_cache()
+            return
+
+        topk = int(getattr(self.args, "opd_log_prob_top_k", 128) or 128)
+
+        if getattr(self.args, "sdpo_kd_loss", False):
+            # KD-loss mode (preferred): only compute the TEACHER top-k distribution
+            # (with prefix) as a DETACHED target. The student distribution is
+            # computed later, grad-enabled, inside policy_loss_function from the
+            # training forward's logits, and the divergence is the loss (not an
+            # advantage). So here we do a single teacher top-k forward and stash
+            # per-token [k] logprobs+ids; policy_loss_function reads them.
+            t_out = self.compute_topk_logprobs(teacher_iter, teacher_nmb, topk=topk)
+            del teacher_rollout_data, teacher_iter
+            torch.cuda.empty_cache()
+            t_lp, t_ids = t_out["sdpo_topk_logprobs"], t_out["sdpo_topk_ids"]
+            # Empty target for no-prefix samples -> KD loss 0 for them.
+            for i in range(len(t_lp)):
+                if not has_prefix[i]:
+                    t_lp[i] = t_lp[i][:0]
+                    t_ids[i] = t_ids[i][:0]
+            rollout_data["sdpo_teacher_topk_logprobs"] = t_lp
+            rollout_data["sdpo_teacher_topk_ids"] = t_ids
+            del t_out
+            torch.cuda.empty_cache()
+            self._dump_sdpo_prompts(rollout_data, has_prefix)
+            # Skill-KD (option A): append the self-generated skill sequences to the
+            # training batch as extra samples, tagged sdpo_is_skill=True, with their
+            # own teacher top-k. The single training forward then produces skill
+            # logits too, and policy_loss_function applies the skill KD (own coef).
+            if getattr(self.args, "sdpo_skill_kd", False):
+                self._append_sdpo_skill_samples(rollout_data, topk)
+            return
+
+        # Legacy advantage-hook distribution path: divergence over the student's
+        # top-k tokens, written to opd_reverse_kl and subtracted from advantages
+        # by opd.py. Kept for backward compat / ablation. (Weak gradient signal —
+        # prefer --sdpo-kd-loss.)
+        divergence_mode = getattr(self.args, "sdpo_divergence", "jsd")
+        student_iter, student_nmb = get_data_iterator(self.args, self.model, dict(rollout_data))
+        s_out = self.compute_topk_logprobs(student_iter, student_nmb, topk=topk)
+        t_out = self.compute_topk_logprobs(teacher_iter, teacher_nmb, topk=topk)
+        del teacher_rollout_data, teacher_iter, student_iter
+        torch.cuda.empty_cache()
+
+        s_lp, s_ids = s_out["sdpo_topk_logprobs"], s_out["sdpo_topk_ids"]
+        t_lp, t_ids = t_out["sdpo_topk_logprobs"], t_out["sdpo_topk_ids"]
+        reverse_kls = []
+        for i in range(len(s_lp)):
+            n = int(response_lengths[i])
+            if n == 0 or not has_prefix[i]:
+                reverse_kls.append(torch.zeros((n,), dtype=torch.float32))
+                continue
+            reverse_kls.append(
+                _sdpo_topk_distribution_divergence(s_lp[i], s_ids[i], t_lp[i], t_ids[i], divergence_mode)
+            )
+        rollout_data["opd_reverse_kl"] = reverse_kls
+        del s_out, t_out
+        torch.cuda.empty_cache()
+
+    def _dump_sdpo_prompts(self, rollout_data: RolloutBatch, has_prefix: list[bool]) -> None:
+        """Dump the SDPO student (prompt+response) and teacher (prompt+prefix+
+        response) full sequences — decoded text + token ids — for post-hoc
+        inspection. Only on the main rank, only when --dump-details is set."""
+        dump_dir = getattr(self.args, "dump_details", None)
+        if dump_dir is None or not self._is_main_rank:
+            return
+        try:
+            tok = self.tokenizer
+            tokens_list = rollout_data["tokens"]
+            resp_lens = rollout_data["response_lengths"]
+            teacher_prompt_list = rollout_data["sdpo_teacher_prompt_tokens"]
+            # trace-condense: the distilled skill used as the teacher prefix (if any).
+            # self-skill + skill-KD: the skill's own student/teacher sequences,
+            # dumped to a SEPARATE skill/ folder.
+            skill_tokens_list = rollout_data.get("sdpo_skill_tokens")
+            skill_prompt_list = rollout_data.get("sdpo_skill_prompt_tokens")
+            skill_teacher_list = rollout_data.get("sdpo_skill_teacher_prompt_tokens")
+            records = []
+            skill_records = []
+            for i in range(len(tokens_list)):
+                t = tokens_list[i]
+                tl = t.tolist() if torch.is_tensor(t) else list(t)
+                n = int(resp_lens[i])
+                split = len(tl) - n  # prompt|response boundary
+                prompt_ids, resp_ids = tl[:split], tl[split:]
+                teacher_prompt_ids = (
+                    list(teacher_prompt_list[i]) if (i < len(teacher_prompt_list) and has_prefix[i]) else []
+                )
+                # Teacher sequence = teacher_prompt (system + user+solution + assistant
+                # marker) followed by the student's response.
+                teacher_ids = (teacher_prompt_ids + resp_ids) if teacher_prompt_ids else tl
+                rec = {
+                    "has_prefix": bool(has_prefix[i]),
+                    "student_text": tok.decode(tl),
+                    "teacher_text": tok.decode(teacher_ids),
+                    "prompt_text": tok.decode(prompt_ids),
+                    "teacher_prompt_text": tok.decode(teacher_prompt_ids) if teacher_prompt_ids else "",
+                    "response_text": tok.decode(resp_ids),
+                    "response_length": n,
+                }
+                records.append(rec)
+                # Skill records go to a SEPARATE skill/ folder (not mixed into the
+                # response prompts — too hard to find otherwise). student = skill-gen
+                # prompt + skill; teacher = skill-gen prompt + own-trace hint + skill.
+                if skill_tokens_list is not None and i < len(skill_tokens_list) and skill_tokens_list[i]:
+                    sk_ids = list(skill_tokens_list[i])
+                    sk_prompt = (
+                        list(skill_prompt_list[i]) if (skill_prompt_list and i < len(skill_prompt_list) and skill_prompt_list[i]) else []
+                    )
+                    sk_teacher = (
+                        list(skill_teacher_list[i])
+                        if (skill_teacher_list and i < len(skill_teacher_list) and skill_teacher_list[i])
+                        else []
+                    )
+                    skill_records.append(
+                        {
+                            "index": i,
+                            "skill_length": len(sk_ids),
+                            "skill_text": tok.decode(sk_ids),
+                            "problem_text": tok.decode(prompt_ids),
+                            "skill_student_prompt_text": tok.decode(sk_prompt) if sk_prompt else "",
+                            "skill_teacher_prompt_text": tok.decode(sk_teacher) if sk_teacher else "",
+                            "skill_student_text": tok.decode(sk_prompt + sk_ids) if sk_prompt else tok.decode(sk_ids),
+                            "skill_teacher_text": tok.decode(sk_teacher + sk_ids) if sk_teacher else "",
+                        }
+                    )
+            rollout_id = getattr(self, "_last_rollout_id", 0)
+            import json
+
+            path = Path(dump_dir) / "sdpo_prompts" / f"{rollout_id}_rank{dist.get_rank()}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                for r in records:
+                    f.write(json.dumps({"rollout_id": rollout_id, **r}, ensure_ascii=False) + "\n")
+            logger.info(f"Dumped {len(records)} SDPO teacher/student prompts to {path}")
+            # Separate skill/ folder.
+            if skill_records:
+                spath = Path(dump_dir) / "skill" / f"{rollout_id}_rank{dist.get_rank()}.jsonl"
+                spath.parent.mkdir(parents=True, exist_ok=True)
+                with open(spath, "w") as f:
+                    for r in skill_records:
+                        f.write(json.dumps({"rollout_id": rollout_id, **r}, ensure_ascii=False) + "\n")
+                logger.info(f"Dumped {len(skill_records)} SDPO skills to {spath}")
+        except Exception as e:  # dumping must never break training
+            logger.warning(f"SDPO prompt dump failed (non-fatal): {e!r}")
+
+    def _build_sdpo_teacher_rollout_data(self, rollout_data: RolloutBatch):
+        """Build a minimal rollout_data whose token sequences are
+        teacher_prompt + response, where teacher_prompt is the FULL chat-templated
+        prompt with the correct-peer solution spliced into the USER turn (built on
+        the rollout side, see examples/SDPO/sdpo.py). The response is kept at the
+        tail so response-span outputs stay token-aligned with the student's. This
+        matches lasgroup/SDPO (teacher_input_ids = cat([teacher_prompt, response])).
+        Returns (teacher_rollout_data, has_prefix flags)."""
+        teacher_prompt_list = rollout_data["sdpo_teacher_prompt_tokens"]
+        tokens_list = rollout_data["tokens"]
+        response_lengths = rollout_data["response_lengths"]
+        teacher_tokens, teacher_total_lengths, teacher_loss_masks, has_prefix = [], [], [], []
+        for i, tokens in enumerate(tokens_list):
+            resp_len = int(response_lengths[i])
+            teacher_prompt = teacher_prompt_list[i] if i < len(teacher_prompt_list) else []
+            tok_list = tokens.tolist() if torch.is_tensor(tokens) else list(tokens)
+            if not teacher_prompt or resp_len == 0:
+                has_prefix.append(False)
+                new_tokens = tok_list
+            else:
+                has_prefix.append(True)
+                # response = last resp_len tokens of the student sequence.
+                resp_ids = tok_list[len(tok_list) - resp_len :]
+                new_tokens = list(teacher_prompt) + resp_ids
+            teacher_tokens.append(new_tokens)
+            teacher_total_lengths.append(len(new_tokens))
+            teacher_loss_masks.append([1] * resp_len)
+
+        device = torch.cuda.current_device()
+        teacher_rollout_data: RolloutBatch = {
+            "tokens": [torch.tensor(t, dtype=torch.long, device=device) for t in teacher_tokens],
+            "response_lengths": list(response_lengths),
+            "total_lengths": teacher_total_lengths,
+            "loss_masks": [torch.tensor(m, dtype=torch.int, device=device) for m in teacher_loss_masks],
+        }
+        if self.args.qkv_format == "bshd":
+            max_seq_len = max(teacher_total_lengths)
+            pad_size = get_parallel_state().tp.size * self.args.data_pad_size_multiplier
+            max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
+            teacher_rollout_data["max_seq_lens"] = [max_seq_len] * len(teacher_tokens)
+        return teacher_rollout_data, has_prefix
+
+    def _build_sdpo_skill_rollout_data(self, rollout_data: RolloutBatch):
+        """Build STUDENT and TEACHER sequences for the self-generated skill KD.
+
+        For each sample that carries a skill (sdpo_skill_tokens non-empty):
+          student seq = skill_prompt + skill_tokens          (context skill was generated in)
+          teacher seq = skill_teacher_prompt + skill_tokens  (skill_prompt + own-trace hint)
+        The skill tokens are kept at the tail so the skill-span outputs align.
+        Returns (student_rd, teacher_rd, skill_idx) where skill_idx maps each built
+        sequence back to its original sample index, or (None, None, []) if none."""
+        skill_tokens_list = rollout_data.get("sdpo_skill_tokens")
+        skill_prompt_list = rollout_data.get("sdpo_skill_prompt_tokens")
+        skill_teacher_list = rollout_data.get("sdpo_skill_teacher_prompt_tokens")
+        if not skill_tokens_list:
+            return None, None, []
+
+        device = torch.cuda.current_device()
+
+        def _pack(prompt_ids_list):
+            toks, totals, masks, resp_lens = [], [], [], []
+            for i in range(len(skill_tokens_list)):
+                skill_ids = list(skill_tokens_list[i]) if skill_tokens_list[i] else []
+                prompt_ids = list(prompt_ids_list[i]) if (i < len(prompt_ids_list) and prompt_ids_list[i]) else []
+                if not skill_ids or not prompt_ids:
+                    continue
+                seq = prompt_ids + skill_ids
+                toks.append(seq)
+                totals.append(len(seq))
+                masks.append([1] * len(skill_ids))
+                resp_lens.append(len(skill_ids))
+            return toks, totals, masks, resp_lens
+
+        skill_idx = [
+            i
+            for i in range(len(skill_tokens_list))
+            if skill_tokens_list[i]
+            and i < len(skill_prompt_list)
+            and skill_prompt_list[i]
+            and i < len(skill_teacher_list)
+            and skill_teacher_list[i]
+        ]
+        if not skill_idx:
+            return None, None, []
+
+        def _make(prompt_ids_list):
+            toks, totals, masks, resp_lens = _pack(prompt_ids_list)
+            rd: RolloutBatch = {
+                "tokens": [torch.tensor(t, dtype=torch.long, device=device) for t in toks],
+                "response_lengths": resp_lens,
+                "total_lengths": totals,
+                "loss_masks": [torch.tensor(m, dtype=torch.int, device=device) for m in masks],
+            }
+            if self.args.qkv_format == "bshd":
+                pad_size = get_parallel_state().tp.size * self.args.data_pad_size_multiplier
+                msl = (max(totals) + pad_size - 1) // pad_size * pad_size
+                rd["max_seq_lens"] = [msl] * len(toks)
+            return rd
+
+        return _make(skill_prompt_list), _make(skill_teacher_list), skill_idx
+
+    def _num_local_gbs(self) -> int:
+        """Local (per-DP-rank) global batch size — the divisor get_data_iterator
+        requires every rollout_data sample count to be a multiple of."""
+        return self.args.global_batch_size // get_parallel_state().intra_dp.size
+
+    @staticmethod
+    def _pad_min_rollout_data_to_multiple(rd: RolloutBatch, multiple: int, device) -> int:
+        """Pad a MINIMAL teacher/student rollout_data (tokens/total_lengths/
+        response_lengths/loss_masks[/max_seq_lens]) with 1-token dummy samples so
+        its sample count is a multiple of `multiple` (get_data_iterator requires
+        num_local_samples % num_local_gbs == 0). Returns the number of real
+        (non-pad) samples so callers can drop the padded outputs."""
+        n_real = len(rd["tokens"])
+        if multiple <= 0:
+            return n_real
+        pad = (-n_real) % multiple
+        for _ in range(pad):
+            rd["tokens"].append(torch.tensor([0], dtype=torch.long, device=device))
+            rd["total_lengths"].append(1)
+            rd["response_lengths"].append(1)
+            rd["loss_masks"].append(torch.zeros((1,), dtype=torch.int, device=device))
+        if "max_seq_lens" in rd and rd["max_seq_lens"]:
+            rd["max_seq_lens"] = [rd["max_seq_lens"][0]] * len(rd["tokens"])
+        return n_real
+
+    def _append_sdpo_skill_samples(self, rollout_data: RolloutBatch, topk: int) -> None:
+        """Compute the skill teacher top-k and APPEND the skill sequences to
+        rollout_data as extra training samples (tagged sdpo_is_skill). The response
+        samples already present are tagged sdpo_is_skill=False. Skill samples carry
+        their own sdpo_teacher_topk_* (skill teacher target) so the shared KD path
+        produces per-token divergence on the skill span; policy_loss_function scales
+        them by --sdpo-skill-kd-coef via the sdpo_is_skill mask."""
+        n_resp = len(rollout_data["tokens"])
+        # Mark existing (response) samples as non-skill up front.
+        is_skill = [False] * n_resp
+
+        student_rd, teacher_rd, skill_idx = self._build_sdpo_skill_rollout_data(rollout_data)
+        if not skill_idx:
+            rollout_data["sdpo_is_skill"] = is_skill
+            return
+
+        device = torch.cuda.current_device()
+        gbs = self._num_local_gbs()
+
+        # Teacher top-k over the skill (skill_teacher_prompt + skill_tokens). Pad the
+        # sub-batch to a num_local_gbs multiple so get_data_iterator accepts it, then
+        # keep only the real outputs.
+        n_skill = self._pad_min_rollout_data_to_multiple(teacher_rd, gbs, device)
+        teacher_iter, teacher_nmb = get_data_iterator(self.args, self.model, teacher_rd)
+        sk_out = self.compute_topk_logprobs(teacher_iter, teacher_nmb, topk=topk)
+        sk_lp = sk_out["sdpo_topk_logprobs"][:n_skill]
+        sk_ids = sk_out["sdpo_topk_ids"][:n_skill]
+        del teacher_iter, sk_out
+        torch.cuda.empty_cache()
+
+        # Append each skill sample's student sequence + its teacher target to the
+        # main rollout_data lists so the training forward covers them.
+        skill_toks = student_rd["tokens"]
+        skill_total = student_rd["total_lengths"]
+        skill_resp = student_rd["response_lengths"]
+        skill_masks = student_rd["loss_masks"]
+        skill_rollout_lp = rollout_data.get("sdpo_skill_rollout_logprobs")
+
+        # Keys we set explicitly per skill sample below.
+        explicit = {
+            "tokens",
+            "total_lengths",
+            "response_lengths",
+            "loss_masks",
+            "sdpo_teacher_topk_logprobs",
+            "sdpo_teacher_topk_ids",
+            "sdpo_is_skill",
+            "max_seq_lens",
+        }
+        # Any OTHER per-sample list of length n_resp (log_probs, ref_log_probs,
+        # rewards, raw_reward, advantages, returns, rollout_log_probs, ...) needs an
+        # inert placeholder per skill sample so lengths stay consistent through
+        # compute_advantages_and_returns / get_batch. Skill samples are KD-only:
+        # advantages/pg contribute nothing (pure distill), and per-response-token
+        # tensors just need the right length; scalars get 0.
+        def _placeholder(key, resp_len, template):
+            if torch.is_tensor(template):
+                return torch.zeros((resp_len,), dtype=template.dtype, device=template.device)
+            if isinstance(template, (list, tuple)):
+                return type(template)([0.0] * resp_len)
+            return 0.0
+
+        list_keys = [
+            k
+            for k, v in rollout_data.items()
+            if isinstance(v, list) and len(v) == n_resp and k not in explicit
+        ]
+
+        for j, orig_i in enumerate(skill_idx):
+            rl = int(skill_resp[j])
+            rollout_data["tokens"].append(skill_toks[j])
+            rollout_data["total_lengths"].append(skill_total[j])
+            rollout_data["response_lengths"].append(rl)
+            rollout_data["loss_masks"].append(skill_masks[j])
+            rollout_data["sdpo_teacher_topk_logprobs"].append(sk_lp[j])
+            rollout_data["sdpo_teacher_topk_ids"].append(sk_ids[j])
+            is_skill.append(True)
+            for k in list_keys:
+                if k == "rollout_log_probs":
+                    # skill's own rollout logprobs (for the IS ratio); else zeros.
+                    lp = skill_rollout_lp[orig_i] if (skill_rollout_lp and orig_i < len(skill_rollout_lp)) else None
+                    if torch.is_tensor(lp):
+                        rollout_data[k].append(lp.to(device))
+                    elif lp:
+                        rollout_data[k].append(torch.tensor(lp, dtype=torch.float32, device=device))
+                    else:
+                        rollout_data[k].append(torch.zeros((rl,), device=device))
+                else:
+                    rollout_data[k].append(_placeholder(k, rl, rollout_data[k][0]))
+
+        # Pad the (response + skill) batch to a num_local_gbs multiple with inert
+        # 1-token dummies (empty loss mask, empty teacher top-k, is_skill=False ->
+        # no KD, zero everything) so get_data_iterator in train_actor accepts it.
+        n_pad = (-len(rollout_data["tokens"])) % gbs
+        for _ in range(n_pad):
+            rollout_data["tokens"].append(torch.tensor([0], dtype=torch.long, device=device))
+            rollout_data["total_lengths"].append(1)
+            rollout_data["response_lengths"].append(1)
+            rollout_data["loss_masks"].append(torch.zeros((1,), dtype=torch.int, device=device))
+            # empty teacher target (tensor slice, matching the real entries' type)
+            rollout_data["sdpo_teacher_topk_logprobs"].append(sk_lp[0][:0])
+            rollout_data["sdpo_teacher_topk_ids"].append(sk_ids[0][:0])
+            is_skill.append(False)
+            for k in list_keys:
+                rollout_data[k].append(_placeholder(k, 1, rollout_data[k][0]))
+
+        rollout_data["sdpo_is_skill"] = is_skill
+        # bshd needs a consistent max_seq_len across all (response+skill) samples.
+        if self.args.qkv_format == "bshd" and "max_seq_lens" in rollout_data:
+            msl = max(rollout_data["total_lengths"])
+            pad_size = get_parallel_state().tp.size * self.args.data_pad_size_multiplier
+            msl = (msl + pad_size - 1) // pad_size * pad_size
+            rollout_data["max_seq_lens"] = [msl] * len(rollout_data["tokens"])
+
+    def compute_topk_logprobs(self, data_iterator, num_microbatches, topk: int = 128):
+        return forward_only(
+            get_topk_logprobs,
+            self.args,
+            self.model,
+            data_iterator,
+            num_microbatches,
+            store_prefix="",
+            f_kwargs={"sdpo_topk": topk},
+        )
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

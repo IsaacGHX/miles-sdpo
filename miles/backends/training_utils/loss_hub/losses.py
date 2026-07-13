@@ -10,8 +10,13 @@ from miles.backends.training_utils.cp_utils import (
     get_sum_of_sample_mean,
 )
 from miles.backends.training_utils.loss_hub.corrections import vanilla_tis_function
-from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
+from miles.backends.training_utils.loss_hub.logit_processors import (
+    get_log_probs_and_entropy,
+    get_responses,
+    get_values,
+)
 from miles.backends.training_utils.loss_hub.math_utils import (
+    _gather_true_on_policy_full_logits,
     compute_approx_kl,
     compute_ess_ratio_contribution,
     compute_gspo_kl,
@@ -21,6 +26,141 @@ from miles.backends.training_utils.loss_hub.math_utils import (
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.misc import load_function
 from miles.utils.types import RolloutBatch
+
+
+def _sdpo_alpha_from_args(args: Namespace) -> float:
+    """Map --sdpo-divergence to the original SDPO alpha (0=forward KL[default],
+    1=reverse KL, 0.5=JSD). jeffrey isn't an alpha-mixture, so approximate as JSD
+    (symmetric); use reverse/forward explicitly if you want the pure KLs."""
+    mode = getattr(args, "sdpo_divergence", "forward_kl")
+    return {"forward_kl": 0.0, "reverse_kl": 1.0, "jsd": 0.5, "jeffrey": 0.5}.get(mode, 0.0)
+
+
+def _sdpo_add_tail_logprobs(log_probs: torch.Tensor) -> torch.Tensor:
+    """Append one aggregated tail-bucket log-prob = log(1 - sum(exp(top-k logp))),
+    computed stably via logsumexp/expm1 (matches original SDPO add_tail)."""
+    log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
+    log_s = torch.clamp(log_s, max=-1e-7)  # ensure sum(top-k probs) < 1
+    tail_log = torch.log(-torch.expm1(log_s))  # log(1 - exp(log_s))
+    return torch.cat([log_probs, tail_log], dim=-1)
+
+
+def _sdpo_kd_loss_per_token(
+    args: Namespace,
+    logits: torch.Tensor,
+    batch: RolloutBatch,
+) -> torch.Tensor | None:
+    """SDPO distribution-level KD loss, per response token, GRAD-ENABLED.
+
+    Aligned with the original lasgroup/SDPO ``compute_self_distillation_loss``:
+    - student log-probs at the TEACHER's top-k ids (teacher defines the support),
+      from the grad-enabled current forward; teacher log-probs are the detached
+      target.
+    - tail bucket via logsumexp (_sdpo_add_tail_logprobs) so top-k + tail is a
+      proper distribution.
+    - alpha-parameterised divergence in LOG space with F.kl_div(log_target=True):
+      alpha=0 -> forward KL KL(teacher‖student) [default, mass-covering KD],
+      alpha=1 -> reverse KL KL(student‖teacher),
+      0<alpha<1 -> generalized JSD via the log-mixture + torch.lerp.
+    - optional importance-sampling ratio correction exp(student_logp-old_logp)
+      clamped to <= is_clip (for off-policy/async), applied per token.
+
+    Returns a 1D tensor of per-token loss concatenated across samples (same layout
+    as get_log_probs_and_entropy["log_probs"]), or None if no teacher target.
+    """
+    import torch.nn.functional as F
+
+    t_lp_list = batch.get("sdpo_teacher_topk_logprobs")
+    t_ids_list = batch.get("sdpo_teacher_topk_ids")
+    if t_lp_list is None or t_ids_list is None:
+        return None
+
+    parallel_state = get_parallel_state()
+    tp_group = parallel_state.tp.group
+    device = logits.device
+
+    # alpha convention (original): 0.0 = forward KL, 1.0 = reverse KL, else GJSD.
+    alpha = _sdpo_alpha_from_args(args)
+    add_tail = getattr(args, "sdpo_distillation_add_tail", True)
+    is_clip = getattr(args, "sdpo_is_clip", 2.0)
+    if is_clip is not None and is_clip <= 0:
+        is_clip = None
+
+    # Old (rollout) sampled log-probs, per sample, for the IS ratio correction.
+    old_lp_list = batch.get("rollout_log_probs")
+
+    # Cap the KD computation to the first `kd_max_tokens` response tokens per
+    # sample (0/None = whole response). This bounds the expensive full-vocab
+    # log_softmax (grad) memory, and focuses distillation on the early tokens.
+    kd_max_tokens = getattr(args, "sdpo_kd_max_tokens", 0) or 0
+
+    per_token = []
+    for idx, (logits_chunk, _tokens_chunk) in enumerate(
+        get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            max_seq_lens=batch.get("max_seq_lens", None),
+        )
+    ):
+        n = logits_chunk.size(0)
+        t_ids = t_ids_list[idx]
+        if n == 0 or t_ids is None or t_ids.numel() == 0:
+            per_token.append(torch.zeros((n,), device=device))
+            continue
+        # Restrict to the first kd_max_tokens response positions (tokens beyond
+        # the cap contribute 0 to the KD loss, keeping per-sample length == n).
+        m = n if kd_max_tokens <= 0 else min(n, kd_max_tokens)
+        t_ids = t_ids[:m].to(device)  # [m, k]
+        teacher_lp = t_lp_list[idx][:m].to(device).float()  # [m, k] detached target
+
+        # Student log-softmax (grad) at the teacher's top-k ids (first m positions).
+        full_logits = _gather_true_on_policy_full_logits(
+            logits_chunk[:m].contiguous(), tp_group, vocab_size=getattr(args, "vocab_size", None)
+        )
+        student_logsm = torch.log_softmax(full_logits.float(), dim=-1)  # [m, V] grad
+        student_lp = torch.gather(student_logsm, dim=-1, index=t_ids)  # [n, k] grad
+
+        if add_tail:
+            student_lp = _sdpo_add_tail_logprobs(student_lp)  # [n, k+1]
+            teacher_lp = _sdpo_add_tail_logprobs(teacher_lp)
+        else:
+            student_lp = student_lp - torch.logsumexp(student_lp, dim=-1, keepdim=True)
+            teacher_lp = teacher_lp - torch.logsumexp(teacher_lp, dim=-1, keepdim=True)
+
+        # F.kl_div(input=log-prob, target, log_target=True) = sum target*(logtarget-input)
+        if alpha == 0.0:  # forward KL: KL(teacher ‖ student)
+            kl = F.kl_div(student_lp, teacher_lp, reduction="none", log_target=True)
+        elif alpha == 1.0:  # reverse KL: KL(student ‖ teacher)
+            kl = F.kl_div(teacher_lp, student_lp, reduction="none", log_target=True)
+        else:  # generalized JSD via log-mixture
+            a = torch.tensor(alpha, dtype=student_lp.dtype, device=student_lp.device)
+            mixture_lp = torch.logsumexp(
+                torch.stack([student_lp + torch.log1p(-a), teacher_lp + torch.log(a)]), dim=0
+            )
+            kl_teacher = F.kl_div(mixture_lp, teacher_lp, reduction="none", log_target=True)
+            kl_student = F.kl_div(mixture_lp, student_lp, reduction="none", log_target=True)
+            kl = torch.lerp(kl_student, kl_teacher, alpha)
+        d = kl.sum(-1)  # [m] per-token divergence over the first m positions
+
+        # Importance-sampling ratio correction (off-policy/async), on sampled token.
+        if is_clip is not None and old_lp_list is not None and idx < len(old_lp_list):
+            old_lp = old_lp_list[idx]
+            if torch.is_tensor(old_lp) and old_lp.numel() == n:
+                tok_m = _tokens_chunk[:m].to(device).unsqueeze(-1)
+                s_sampled = torch.gather(student_logsm, dim=-1, index=tok_m).squeeze(-1)
+                neg_approx_kl = torch.clamp((s_sampled - old_lp[:m].to(device)).detach(), min=-20.0, max=20.0)
+                ratio = torch.exp(neg_approx_kl).clamp(max=is_clip)
+                d = d * ratio
+        # Pad back to full response length n so it aligns with active_tokens /
+        # log_probs (tokens beyond the KD cap contribute 0).
+        if d.shape[0] != n:
+            d = torch.cat([d, d.new_zeros(n - d.shape[0])], dim=0)
+        per_token.append(d)
+
+    return torch.cat(per_token, dim=0)
 
 
 class LossFunction(Protocol):
@@ -269,12 +409,30 @@ def policy_loss_function(
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
+    # Per-response-token skill mask (aligned with the concatenated per-token layout),
+    # built once for both the skill entropy metric and the skill KD split.
+    _is_skill = batch.get("sdpo_is_skill")
+    skill_tok_mask = None
+    if _is_skill is not None and any(bool(x) for x in _is_skill):
+        _rl = batch["response_lengths"]
+        skill_tok_mask = torch.cat(
+            [pg_loss.new_full((int(_rl[j]),), 1.0 if bool(_is_skill[j]) else 0.0) for j in range(len(_rl))]
+        ).bool()
+
     entropy_loss = pg_loss.new_zeros(())
+    skill_entropy = pg_loss.new_zeros(())
     loss = pg_loss
     if calculate_entropy:
         entropy = log_probs_and_entropy["entropy"]
         entropy = torch.cat(entropy, dim=0)
-        entropy_loss = sum_of_sample_mean(entropy)
+        if skill_tok_mask is not None:
+            # entropy over response tokens only (skill tokens excluded), plus a
+            # separate skill-token entropy metric.
+            resp_ent = torch.where(skill_tok_mask, entropy.new_zeros(()), entropy)
+            entropy_loss = sum_of_sample_mean(resp_ent)
+            skill_entropy = sum_of_sample_mean(torch.where(skill_tok_mask, entropy, entropy.new_zeros(()))).detach()
+        else:
+            entropy_loss = sum_of_sample_mean(entropy)
         if args.entropy_coef != 0:
             loss = pg_loss - args.entropy_coef * entropy_loss
         else:
@@ -301,6 +459,57 @@ def policy_loss_function(
 
         if args.kl_loss_coef != 0:
             loss = loss + args.kl_loss_coef * kl_loss
+
+    # SDPO distribution-level knowledge-distillation loss (grad through student):
+    # loss += kd_coef * mean_token D(student_dist ‖ teacher_dist). This is a real
+    # supervised distillation objective (strong, directional gradient), unlike the
+    # advantage-hook path that fed the divergence into REINFORCE.
+    sdpo_kd_loss = pg_loss.new_zeros(())
+    sdpo_skill_kd_loss = pg_loss.new_zeros(())
+    sdpo_kd_clip_cov_frac = pg_loss.new_zeros(())
+    if getattr(args, "sdpo_kd_loss", False):
+        kd = _sdpo_kd_loss_per_token(args, logits, batch)
+        if kd is not None:
+            kd = torch.where(
+                active_tokens,
+                torch.nan_to_num(kd, nan=0.0, posinf=0.0, neginf=0.0),
+                kd.new_zeros(()),
+            )
+            # KD Clip-Cov (arXiv:2505.22617, adapted to distillation): the entropy
+            # collapse is driven by a few tokens with the LARGEST per-token KD
+            # divergence (the '<answer>'/letter positions the answer-in-prefix
+            # teacher over-weights). Detach the gradient on the top-`frac` of ACTIVE
+            # tokens (batch-wide) so those positions no longer push the policy toward
+            # a spike; the loss value is unchanged (kept for logging), only grad is cut.
+            cc_frac = float(getattr(args, "sdpo_kd_clip_cov_frac", 0.0) or 0.0)
+            if cc_frac > 0.0:
+                with torch.no_grad():
+                    active_kd = kd[active_tokens]
+                    clip_mask = None
+                    if active_kd.numel() > 0:
+                        k = max(1, int(active_kd.numel() * cc_frac))
+                        # threshold = k-th largest active KD divergence value
+                        thresh = torch.topk(active_kd, k, largest=True).values.min()
+                        clip_mask = active_tokens & (kd >= thresh)
+                        sdpo_kd_clip_cov_frac = clip_mask.float().sum() / active_tokens.float().sum().clamp(min=1.0)
+                if clip_mask is not None:
+                    # Freeze gradient on clipped tokens: keep value, drop grad.
+                    kd = torch.where(clip_mask, kd.detach(), kd)
+
+            # Skill-KD (option A): skill sequences are appended to the batch tagged
+            # sdpo_is_skill. Split the per-token KD into response vs skill and weight
+            # them by their own coefficients (skill uses --sdpo-skill-kd-coef). Reuse
+            # the per-token skill mask built above (for the entropy split).
+            if skill_tok_mask is not None:
+                resp_kd = torch.where(skill_tok_mask, kd.new_zeros(()), kd)
+                skill_kd = torch.where(skill_tok_mask, kd, kd.new_zeros(()))
+                sdpo_kd_loss = sum_of_sample_mean(resp_kd)
+                sdpo_skill_kd_loss = sum_of_sample_mean(skill_kd)
+                loss = loss + getattr(args, "sdpo_kd_coef", 1.0) * sdpo_kd_loss
+                loss = loss + getattr(args, "sdpo_skill_kd_coef", 1.0) * sdpo_skill_kd_loss
+            else:
+                sdpo_kd_loss = sum_of_sample_mean(kd)
+                loss = loss + getattr(args, "sdpo_kd_coef", 1.0) * sdpo_kd_loss
 
     # make sure the gradient could backprop correctly.
     if log_probs.numel() == 0:
@@ -344,6 +553,22 @@ def policy_loss_function(
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if getattr(args, "sdpo_kd_loss", False):
+        reported_loss["sdpo_kd_loss"] = sdpo_kd_loss.clone().detach()
+        if float(getattr(args, "sdpo_kd_clip_cov_frac", 0.0) or 0.0) > 0.0:
+            reported_loss["sdpo_kd_clip_cov_frac"] = (
+                sdpo_kd_clip_cov_frac.clone().detach()
+                if isinstance(sdpo_kd_clip_cov_frac, torch.Tensor)
+                else sdpo_kd_clip_cov_frac
+            )
+        if getattr(args, "sdpo_skill_kd", False):
+            reported_loss["sdpo_skill_kd_loss"] = sdpo_skill_kd_loss.clone().detach()
+            # dedicated skill/ panel: skill KD (= skill "kl") and skill-token entropy.
+            reported_loss["skill/kl"] = sdpo_skill_kd_loss.clone().detach()
+            reported_loss["skill/entropy"] = (
+                skill_entropy.clone().detach() if isinstance(skill_entropy, torch.Tensor) else skill_entropy
+            )
 
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.

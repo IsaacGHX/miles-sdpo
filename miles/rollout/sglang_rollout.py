@@ -130,7 +130,9 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
-async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
+async def generate(
+    args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False
+) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
         assert isinstance(sample.prompt, str)
@@ -167,9 +169,18 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    # Eval only measures pass@1 and never uses the OPD/SDPO distillation signal,
+    # so it must NOT request top-k logprobs — doing so wastes compute and OOMs the
+    # logits processor on long (e.g. 16k) eval sequences. Gate top-k on training.
     opd_top_k = getattr(args, "opd_log_prob_top_k", 0) or 0
     opd_top_k_strategy = getattr(args, "opd_top_k_strategy", "only-student")
-    if getattr(args, "use_opd", False) and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
+    want_top_k = (
+        not evaluation
+        and getattr(args, "use_opd", False)
+        and opd_top_k > 0
+        and opd_top_k_strategy != "only-teacher"
+    )
+    if want_top_k:
         payload["top_logprobs_num"] = opd_top_k
 
     if is_lora_enabled(args):
@@ -198,7 +209,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         headers = {"X-SMG-Routing-Key": sample.session_id}
 
     output = await post(url, payload, headers=headers)
-    if getattr(args, "use_opd", False) and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
+    if want_top_k:
         output_top_logprobs = output.get("meta_info", {}).get("output_top_logprobs")
         if output_top_logprobs is not None:
             sample.metadata.setdefault("opd_student_top_logprobs", [])
@@ -277,7 +288,7 @@ async def generate_and_rm(
                 )
                 sample = output.samples
             else:
-                sample = await generate(args, sample, sampling_params)
+                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -491,6 +502,9 @@ EVAL_PROMPT_DATASET = {}
 
 
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
+    # Group RM defers scoring to a whole-group step that eval does not run, so eval
+    # samples would have no reward. --eval-custom-rm-path supplies a per-sample eval
+    # RM instead, which is what makes eval possible while training uses --group-rm.
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
     coros = []

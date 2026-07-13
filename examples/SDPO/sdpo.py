@@ -1,0 +1,974 @@
+"""Minimal SDPO (prefix-conditioned self-distillation) reward function for Miles.
+
+SDPO idea
+---------
+Rollout is exactly GRPO (n_samples_per_prompt traces per prompt). After the
+group is generated we:
+
+1. Grade every trace against the label to know which ones are *correct*.
+2. For every trace, RANDOMLY pick one *other* correct trace in the group to use
+   as a *prefix* (a "hint"); the prefix is never the trace itself.
+3. Format that correct peer solution with the prefix template (see
+   ``SOLUTION_TEMPLATE`` / ``PREFIX_INSTRUCTION`` below) and insert it between
+   the prompt and this trace's response. Ask the teacher to score
+   ``prompt + prefix + response`` and read its next-token behaviour over the
+   response span. The teacher has seen a correct hint; the student never did.
+4. The student signal is the ORIGINAL rollout one, conditioned on
+   ``prompt + response`` with no prefix:
+     - ``topk`` mode   -> the per-position top-k distribution captured during
+       rollout into ``sample.metadata["opd_student_top_logprobs"]``, plus a
+       single aggregated "tail" bucket for all remaining vocabulary mass.
+     - ``sampled`` mode -> the per-token sampled log-prob in
+       ``sample.rollout_log_probs``.
+5. Compute a per-token divergence between teacher (with prefix) and student
+   (without prefix) and store it in ``sample.opd_reverse_kl``. The framework
+   subtracts ``opd_kl_coef * opd_reverse_kl`` from the GRPO advantages
+   (see ``miles/backends/training_utils/loss_hub/opd.py``); no training-side
+   change is needed.
+
+Correct-trace policy (see ``sdpo_group_reward``)
+    - 0 correct traces in the group -> no KL for anyone.
+    - >= 1 correct trace            -> each trace draws a random correct peer
+                                       (never itself) as its prefix; a trace
+                                       that is the sole correct one gets no
+                                       prefix (self-excluded pool is empty).
+
+Wiring
+------
+Use this as a *group* reward model::
+
+    --group-rm
+    --custom-rm-path examples.SDPO.sdpo.sdpo_group_reward
+    --rm-url http://<TEACHER_IP>:<TEACHER_PORT>/generate
+    --use-opd --opd-type sglang --opd-log-prob-top-k 128
+    --opd-kl-coef 1.0
+    --sdpo-divergence jsd            # reverse_kl | forward_kl | jsd
+    --sdpo-logprob-mode topk         # topk | sampled
+
+Because ``--group-rm`` hands us the whole prompt group at once
+(see ``sglang_rollout.generate_and_rm_group``), we can choose a prefix from
+peer traces. This module only supports ``context_parallel_size == 1``: the
+divergence is computed on the full, un-sharded response token sequence.
+"""
+
+import asyncio
+import logging
+import math
+import os
+import random
+import re
+import time
+from argparse import Namespace
+from collections.abc import Sequence
+from typing import Any
+
+import numpy as np
+import torch
+
+from miles.rollout.rm_hub.math_dapo_utils import compute_score as _dapo_compute_score
+from miles.rollout.rm_hub.math_utils import extract_answer as extract_boxed_answer
+from miles.rollout.rm_hub.math_utils import grade_answer_verl
+from miles.utils.http_utils import post  # miles' shared HTTP client: retries + shared pool
+from miles.utils.types import Sample
+
+logger = logging.getLogger(__name__)
+
+# Per-phase wall-clock accumulators for one rollout's worth of SDPO scoring.
+# These sum across all traces (concurrent), so they overcount vs wall time, but
+# their RATIO tells us where time goes: HTTP teacher-scoring wait vs CPU prep vs
+# vectorized divergence. Reset + logged per group-reward batch call.
+_sdpo_timing = {"tokenize": 0.0, "student_maps": 0.0, "teacher_http": 0.0, "teacher_maps": 0.0, "divergence": 0.0}
+_sdpo_calls = 0
+
+# --------------------------------------------------------------------------- #
+# prefix templates  (edit to taste -- this is the "prefix format")
+# --------------------------------------------------------------------------- #
+# The prefix is everything that follows {prompt} in a reprompt template: a
+# correct peer solution plus an instruction. It is tokenized and inserted
+# between the original prompt tokens and this trace's response tokens, so the
+# response stays at the tail and per-position alignment is preserved.
+SOLUTION_TEMPLATE = "\n\nCorrect solution:\n\n{successful_previous_attempt}"
+PREFIX_INSTRUCTION = "\n\nCorrectly solve the original question.\n\n"
+
+
+def _strip_thinking_blocks(text: str) -> str:
+    """Remove <think>...</think> blocks from a response (for thinking models like Qwen3).
+    Strips leading/trailing whitespace after removal so the peer solution stays clean."""
+    stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return stripped.strip()
+
+
+def _render_prefix(peer_response: str, remove_thinking: bool = False) -> str:
+    content = _strip_thinking_blocks(peer_response) if remove_thinking else peer_response
+    return SOLUTION_TEMPLATE.format(successful_previous_attempt=content) + PREFIX_INSTRUCTION
+
+
+def _gen_prompt_suffix(tok) -> str:
+    """The exact string the chat template appends AFTER the user content when
+    add_generation_prompt=True — e.g. '<|im_end|>\\n<|im_start|>assistant\\n' for
+    ChatML (Qwen2.5/Qwen3). Derived from the tokenizer so it is template-agnostic.
+
+    We use this to splice the correct-peer solution into the USER turn (as context),
+    NOT after the assistant marker. This matches lasgroup/SDPO, which builds the
+    teacher input as apply_chat_template([system, {user: question + solution +
+    instruction}], add_generation_prompt=True) then concatenates the response —
+    i.e. the solution lives in the user turn, followed by a fresh assistant marker.
+    Inserting it after '<|im_start|>assistant' instead (the old bug) pollutes the
+    assistant turn and teaches the model to echo a pre-filled answer.
+    """
+    sentinel = " SDPO_SENTINEL "
+    rendered = tok.apply_chat_template(
+        [{"role": "user", "content": sentinel}], tokenize=False, add_generation_prompt=True
+    )
+    return rendered.split(sentinel, 1)[1] if sentinel in rendered else ""
+
+
+# Special/EOS tokens a rollout response may end with; they must be stripped before
+# the response is embedded as text inside the teacher's USER turn, otherwise the
+# stray <|im_end|> closes the user turn early and corrupts the chat structure.
+_RESPONSE_EOS_MARKERS = ("<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>")
+
+
+def _strip_response_eos(text: str) -> str:
+    """Remove trailing chat/EOS markers (and whitespace) from a rollout response."""
+    out = (text or "").rstrip()
+    changed = True
+    while changed:
+        changed = False
+        for marker in _RESPONSE_EOS_MARKERS:
+            if out.endswith(marker):
+                out = out[: -len(marker)].rstrip()
+                changed = True
+    return out
+
+
+def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_response: str, remove_thinking: bool = False) -> str:
+    """Insert the correct-peer solution + instruction into the USER turn of the
+    student's (already chat-templated) prompt, before the assistant generation
+    marker. Returns the full teacher prompt string (system + user+solution +
+    assistant marker).
+
+    The peer response is stripped of its trailing <|im_end|>/EOS first — it was a
+    full generated turn, and leaving that marker in mid-user-turn would close the
+    user turn early and corrupt the teacher prompt (the model would then see the
+    solution as a separate malformed turn instead of context)."""
+    solution_section = _render_prefix(_strip_response_eos(peer_response), remove_thinking=remove_thinking)
+    if gen_suffix and gen_suffix in student_prompt:
+        idx = student_prompt.rfind(gen_suffix)
+        return student_prompt[:idx] + solution_section + student_prompt[idx:]
+    # Fallback (unknown template): append at the end. Not ideal but never crashes.
+    return student_prompt + solution_section
+
+
+# --------------------------------------------------------------------------- #
+# config helpers
+# --------------------------------------------------------------------------- #
+
+
+def _divergence_mode(args: Namespace) -> str:
+    mode = getattr(args, "sdpo_divergence", "jsd")
+    if mode not in ("reverse_kl", "forward_kl", "jsd"):
+        raise ValueError(f"Unknown --sdpo-divergence {mode!r}; use reverse_kl | forward_kl | jsd.")
+    return mode
+
+
+def _logprob_mode(args: Namespace) -> str:
+    mode = getattr(args, "sdpo_logprob_mode", "topk")
+    if mode not in ("topk", "sampled"):
+        raise ValueError(f"Unknown --sdpo-logprob-mode {mode!r}; use topk | sampled.")
+    return mode
+
+
+def _prompt_len(sample: Sample) -> int:
+    return len(sample.tokens) - sample.response_length
+
+
+def _response_tokens(sample: Sample) -> list[int]:
+    return sample.tokens[_prompt_len(sample) :]
+
+
+def _extract_tagged_answer(text: str, tag: str = "answer") -> str | None:
+    """Extract the content of the LAST <tag>...</tag> block, or None if absent.
+
+    Open-ended SDPO asks the model to wrap its final answer in <answer>...</answer>
+    (see examples/SDPO/build_sci_dataset.py). We take the last occurrence so a
+    model that reasons and revises still yields its final answer. Returns None
+    (not "") when the tag is missing so callers can treat "no answer" as wrong.
+    """
+    if not text:
+        return None
+    matches = re.findall(rf"<{tag}>(.*?)</{tag}>", text, flags=re.DOTALL | re.IGNORECASE)
+    if matches:
+        return matches[-1].strip()
+    # Tolerate an unclosed final tag ("<answer> foo" with no </answer>).
+    m = re.search(rf"<{tag}>(.*)$", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _extract_answer(args: Namespace, sample: Sample) -> str | None:
+    """The model's final answer: prefer the <answer> tag, fall back to \\boxed{}."""
+    tag = getattr(args, "sdpo_answer_tag", "answer")
+    tagged = _extract_tagged_answer(sample.response, tag)
+    if tagged is not None:
+        return tagged
+    return extract_boxed_answer(sample.response)
+
+
+def _is_correct(sample: Sample, args: Namespace | None = None) -> bool:
+    """Grade a trace against its label with exact/heuristic matching (no LLM).
+
+    The SciKnowEval dataset (see build_sci_dataset.py) is multiple choice: the
+    label is the answer LETTER and the model outputs the letter inside
+    <answer>...</answer>. We do a case-insensitive letter match on the extracted
+    answer. Non-letter labels (if any) fall back to math-style grading.
+    """
+    # DAPO math dataset: integer answers in \boxed{}. Use DAPO's own grader with
+    # strict_box_verify=True (the default minerva path expects an "Answer: X" line;
+    # the strict-box path extracts the \boxed{} answer, which is what the models emit).
+    if args is not None and getattr(args, "sdpo_grader", "mcq") == "dapo":
+        label = (sample.label or "").strip()
+        if not label:
+            return False
+        try:
+            return bool(_dapo_compute_score(sample.response or "", label, strict_box_verify=True)["acc"])
+        except Exception:
+            return bool(grade_answer_verl(sample.response or "", label))
+
+    tag = getattr(args, "sdpo_answer_tag", "answer") if args is not None else "answer"
+    extracted = _extract_tagged_answer(sample.response, tag)
+    if extracted is None:
+        extracted = extract_boxed_answer(sample.response)
+    label = (sample.label or "").strip()
+    if not label:
+        return False
+
+    # Legacy single-letter labels (old MCQ dataset): case-insensitive letter match.
+    if len(label) == 1 and label.isalpha():
+        pred = (extracted or "").strip()
+        if len(pred) > 1:  # e.g. "B." or "(B)" -> keep first alpha char
+            pred = next((c for c in pred if c.isalpha()), pred)
+        return pred.upper() == label.upper()
+
+    # Open-ended: exact (normalized) match or math-style grading.
+    pred = (extracted or "").strip()
+    if pred and pred.lower() == label.lower():
+        return True
+    return bool(grade_answer_verl(extracted or sample.response, label))
+
+
+async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
+    """Correctness for every trace in a group (deterministic matching)."""
+    return [_is_correct(s, args) for s in group]
+
+
+# --------------------------------------------------------------------------- #
+# Skill prompts  (used by the self-generated skill)
+# --------------------------------------------------------------------------- #
+
+_SKILL_SYSTEM_PROMPT = (
+    "You distill a worked solution into a SKILL: the minimal set of transferable, "
+    "procedural know-how needed to solve problems of this kind. A skill is NOT the "
+    "answer and NOT a step-by-step derivation of this instance. It is generic "
+    "procedure: what to recognize in the problem, which concepts/techniques/"
+    "theorems/conventions to apply and in what order, common pitfalls to avoid, and "
+    "any output-format requirement.\n\n"
+    "Hard constraints:\n"
+    "- Be EXTREMELY compressed: at most 3 bullets, each a short imperative phrase.\n"
+    "- Procedural and reusable, never instance-specific. No numbers, names, or "
+    "intermediate/final values from this particular problem.\n"
+    "- Never reveal or hint at the final answer.\n"
+    "- Output ONLY the bullets (prefixed with '- '), nothing else."
+)
+
+# Incorrect-trace variant: the attempt is WRONG. Instead of distilling know-how
+# FROM the (flawed) trace, distill a recovery/pitfall-prevention skill: locate the
+# error class and turn it into generic procedure that would have prevented it. The
+# ground-truth answer is provided so the model knows the attempt failed and can
+# reason about where — but, like the correct-trace skill, the output must stay
+# generic and must NOT reveal the answer (the skill is reused as a teacher prefix /
+# KD target across the problem type).
+_SKILL_SYSTEM_PROMPT_INCORRECT = (
+    "You are given a FAILED attempt at a problem and the ground-truth answer. The "
+    "attempt is WRONG. Diagnose the error and distill a SKILL: transferable, "
+    "procedural know-how that would PREVENT this class of mistake on problems of "
+    "this kind. Frame it as what to check / recognize / do differently, not a "
+    "narration of this instance's slip.\n\n"
+    "Hard constraints:\n"
+    "- Be EXTREMELY compressed: at most 3 bullets, each a short imperative phrase.\n"
+    "- Procedural and reusable, never instance-specific. No numbers, names, or "
+    "intermediate/final values from this particular problem.\n"
+    "- Never reveal or hint at the ground-truth answer.\n"
+    "- Output ONLY the bullets (prefixed with '- '), nothing else."
+)
+
+# Answer-format scaffolding that datasets inject into the problem text (e.g. DAPO:
+# "... The last line of your response should be of the form Answer: \boxed{$Answer}
+# ..." and "Remember to put your answer on its own line after 'Answer:'."). If left
+# in the skill-gen PROBLEM, the model dutifully appends "Answer: \boxed{...}" to the
+# skill, leaking the answer into the skill-KD target. Strip these instruction lines.
+_ANSWER_FORMAT_PATTERNS = [
+    re.compile(r"Solve the following math problem step by step\.\s*", re.IGNORECASE),
+    re.compile(r"The last line of your response should be of the form[^\n]*\n?", re.IGNORECASE),
+    re.compile(r"Remember to put your answer[^\n]*\n?", re.IGNORECASE),
+    re.compile(r"[Pp]ut your (?:final )?answer (?:in|inside)[^\n]*\\boxed\{\}[^\n]*\n?"),
+]
+
+
+def _clean_problem_for_skill(problem: str) -> str:
+    """Remove answer-format instructions from the problem so the skill generator
+    sees only the math, not 'put your answer in \\boxed{}' (which leaks the answer
+    format into the skill)."""
+    out = problem or ""
+    for pat in _ANSWER_FORMAT_PATTERNS:
+        out = pat.sub("", out)
+    return out.strip()
+
+
+def _skill_user_prompt(problem: str, solution: str) -> str:
+    return (
+        f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
+        f"WORKED SOLUTION (reference, do not echo):\n{solution}\n\n"
+        "Distill the transferable skill (<=3 terse procedural bullets)."
+    )
+
+
+def _skill_user_prompt_incorrect(problem: str, attempt: str, ground_truth: str) -> str:
+    """User prompt for the incorrect-trace skill: the attempt is wrong; give the
+    ground-truth answer so the model can locate the error class and distill a
+    pitfall-prevention skill (still generic, still no answer in the output)."""
+    gt = (ground_truth or "").strip()
+    return (
+        f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
+        f"FAILED ATTEMPT (wrong, do not echo):\n{attempt}\n\n"
+        f"GROUND-TRUTH ANSWER (for your diagnosis only, do NOT put it in the skill):\n{gt}\n\n"
+        "Diagnose the error and distill a pitfall-prevention skill "
+        "(<=3 terse procedural bullets)."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Self-generated skill  (the current policy writes the skill during rollout)
+# --------------------------------------------------------------------------- #
+
+
+def _skill_gen_prompt_ids(
+    args, tok, problem: str, solution: str, *, correct: bool = True, ground_truth: str = ""
+) -> list[int]:
+    """Chat-templated skill-generation prompt (system=SKILL prompt, user=problem+
+    solution + distill instruction), tokenized, with the assistant generation
+    marker appended. This is the STUDENT context the skill is generated in.
+
+    correct=False switches to the incorrect-trace framing: the attempt is wrong,
+    the ground truth is supplied, and the model distills a pitfall-prevention skill
+    instead of distilling know-how from a flawed solution.
+    """
+    solution = _strip_response_eos(solution)
+    if correct:
+        system = _SKILL_SYSTEM_PROMPT
+        user = _skill_user_prompt(problem, solution)
+    else:
+        system = _SKILL_SYSTEM_PROMPT_INCORRECT
+        user = _skill_user_prompt_incorrect(problem, solution, ground_truth)
+    text = tok.apply_chat_template(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return tok.encode(text, add_special_tokens=False)
+
+
+async def _self_generate_skill(args: Namespace, prompt_ids: list[int]):
+    """Have the current policy (rollout engine) generate a skill from the skill-gen
+    prompt. Returns (skill_text, skill_token_ids, skill_logprobs) or None on failure."""
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    payload = {
+        "input_ids": prompt_ids,
+        "sampling_params": {
+            "temperature": getattr(args, "rollout_temperature", 1.0),
+            "max_new_tokens": int(getattr(args, "sdpo_skill_max_new_tokens", 512)),
+            "skip_special_tokens": False,
+        },
+        "return_logprob": True,
+    }
+    try:
+        out = await post(url, payload)
+        meta = out.get("meta_info", {})
+        otl = meta.get("output_token_logprobs")  # list of [logprob, token_id, ...]
+        if not otl:
+            return None
+        skill_tokens = [int(x[1]) for x in otl]
+        skill_logprobs = [float(x[0]) for x in otl]
+        # Drop trailing EOS/stop tokens (natural stop appends e.g. <|endoftext|> /
+        # <|im_end|>). Keep tokens+logprobs aligned so the skill (dump + skill-KD
+        # target) is clean and doesn't end on a special token.
+        tok = _tokenizer(args)
+        stop_ids = {tok.eos_token_id}
+        for s in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>"):
+            try:
+                sid = tok.convert_tokens_to_ids(s)
+                if isinstance(sid, int) and sid >= 0:
+                    stop_ids.add(sid)
+            except Exception:
+                pass
+        while skill_tokens and skill_tokens[-1] in stop_ids:
+            skill_tokens.pop()
+            skill_logprobs.pop()
+        if not skill_tokens:
+            return None
+        return tok.decode(skill_tokens), skill_tokens, skill_logprobs
+    except Exception as e:
+        logger.warning(f"self-skill generation failed ({e!r}); falling back to full trace.")
+        return None
+
+
+def _tokenizer(args: Namespace):
+    # GenerateState is a process-wide singleton shared with rollout; reuse its
+    # tokenizer so we tokenize the prefix exactly like the rollout engine does.
+    from miles.rollout.sglang_rollout import GenerateState
+
+    return GenerateState(args).tokenizer
+
+
+# --------------------------------------------------------------------------- #
+# teacher scoring
+# --------------------------------------------------------------------------- #
+
+
+def _teacher_url(args: Namespace) -> str:
+    """Where to send teacher scoring requests.
+
+    True SDPO is *self*-distillation: the teacher is the current policy
+    conditioned on a correct prefix, i.e. the rollout engine itself (which is
+    re-synced to the latest student weights every rollout). With
+    ``--sdpo-self-teacher`` (default) we score against that engine, so no
+    separate teacher server is needed. Set ``--no-sdpo-self-teacher`` to use a
+    fixed external teacher at ``--rm-url`` instead.
+    """
+    if getattr(args, "sdpo_self_teacher", True):
+        return f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    return args.rm_url
+
+
+async def _teacher_score(args: Namespace, input_ids: list[int], token_ids: list[int] | None):
+    payload = {
+        "input_ids": input_ids,
+        "sampling_params": {"temperature": 0, "max_new_tokens": 0, "skip_special_tokens": False},
+        "return_logprob": True,
+        "logprob_start_len": 0,
+    }
+    if token_ids:
+        payload["token_ids_logprob"] = token_ids
+    # Use miles' shared HTTP client (http_utils.post): it retries on transient
+    # failures (max_retries=60), shares one global connection pool with rollout
+    # generation (timeout=None, sized to server concurrency), and can dispatch
+    # via Ray. This is what rollout generation and the official OPD scorer use;
+    # a hand-rolled aiohttp session with a hard connect timeout instead crashed
+    # the whole job whenever the router was momentarily saturated.
+    return await post(_teacher_url(args), payload)
+
+
+def _trim_to_response(values: list[Any], response_length: int) -> list[Any]:
+    """Drop SGLang's leading placeholder position, then keep the response span.
+
+    This is the alignment guarantee: position i of the returned list is the
+    teacher's prediction for response token i, exactly matching the student.
+    """
+    if values is None:
+        raise ValueError("Teacher response is missing an expected meta_info logprob field.")
+    trimmed = values[1:][-response_length:] if response_length > 0 else []
+    if len(trimmed) != response_length:
+        raise ValueError(
+            f"Teacher/response alignment mismatch: got {len(trimmed)} positions, expected {response_length}."
+        )
+    return trimmed
+
+
+def _entries_to_map(entries: Any) -> dict[int, float]:
+    if not entries:
+        return {}
+    return {int(e[1]): float(e[0]) for e in entries if e is not None}
+
+
+# --------------------------------------------------------------------------- #
+# divergences
+# --------------------------------------------------------------------------- #
+
+
+def _distribution_divergence(p_s: Sequence[float], p_t: Sequence[float], mode: str) -> float:
+    eps = 1e-12
+    if mode == "reverse_kl":
+        return sum(s * math.log((s + eps) / (t + eps)) for s, t in zip(p_s, p_t, strict=True))
+    if mode == "forward_kl":
+        return sum(t * math.log((t + eps) / (s + eps)) for s, t in zip(p_s, p_t, strict=True))
+    if mode == "jeffrey":
+        return sum(
+            s * math.log((s + eps) / (t + eps)) + t * math.log((t + eps) / (s + eps))
+            for s, t in zip(p_s, p_t, strict=True)
+        )
+    total = 0.0  # jsd
+    for s, t in zip(p_s, p_t, strict=True):
+        m = 0.5 * (s + t)
+        total += 0.5 * s * math.log((s + eps) / (m + eps)) + 0.5 * t * math.log((t + eps) / (m + eps))
+    return total
+
+
+def _probs_with_tail(logps: Sequence[float]) -> list[float]:
+    """Turn true (full-vocab-normalised) log-probs over a token subset into a
+    proper distribution by appending one aggregated tail bucket for all the
+    remaining vocabulary mass. No renormalisation: exp(logp) are real probs.
+    """
+    probs = [math.exp(lp) for lp in logps]
+    tail = max(0.0, 1.0 - math.fsum(probs))
+    return probs + [tail]
+
+
+def _sampled_divergence(student_logp: float, teacher_logp: float, mode: str) -> float:
+    """Per-token divergence when only the sampled token's log-prob is available.
+
+    Treats the token as a 2-point (sampled vs. rest) Bernoulli: reverse/forward
+    KL reduce to the log-prob gap on the sampled outcome; JSD uses the full
+    2-point split for a bounded, symmetric estimate.
+    """
+    if mode == "reverse_kl":
+        return student_logp - teacher_logp
+    if mode == "forward_kl":
+        return teacher_logp - student_logp
+    p_s = min(max(math.exp(student_logp), 0.0), 1.0)  # jsd over {sampled, rest}
+    p_t = min(max(math.exp(teacher_logp), 0.0), 1.0)
+    return _distribution_divergence([p_s, 1.0 - p_s], [p_t, 1.0 - p_t], "jsd")
+
+
+# --------------------------------------------------------------------------- #
+# per-sample KL computation
+# --------------------------------------------------------------------------- #
+
+
+def _topk_divergences_np(
+    student_maps: list[dict[int, float]],
+    teacher_maps: list[dict[int, float]],
+    response_tokens: list[int],
+    divergence_mode: str,
+) -> tuple[list[float], list[float], list[float]]:
+    """Numpy-vectorized replacement for the per-token divergence loop.
+
+    Numerically matches the old scalar path: exp of true (full-vocab-normalised)
+    top-k logprobs, one aggregated tail bucket = max(0, 1 - sum(probs)), missing
+    teacher id -> logprob -100, same eps=1e-12. Rows are the student's top-k ids
+    per position (assumed uniform width; ragged rows are handled per-position).
+
+    Runs on CPU only (no GPU tensors) so it never touches rollout-engine memory.
+    Returns (divergences, student_sampled_logps, teacher_sampled_logps).
+    """
+    n = len(student_maps)
+    eps = 1e-12
+    NEG = -100.0
+
+    # Batch-collect ragged rows via list comprehension (fast), then one np.array.
+    # Positions with no student ids are marked to be zeroed afterwards.
+    widths = [len(m) for m in student_maps]
+    k = max(widths, default=0)
+    if n == 0 or k == 0:
+        return [0.0] * n, [], []
+
+    uniform = all(w == k for w in widths)
+    student_sampled_logps: list[float] = []
+    teacher_sampled_logps: list[float] = []
+
+    if uniform:
+        s_rows = [[student_maps[i][t] for t in student_maps[i]] for i in range(n)]
+        t_rows = [[teacher_maps[i].get(t, NEG) for t in student_maps[i]] for i in range(n)]
+        s = np.asarray(s_rows, dtype=np.float64)
+        t = np.asarray(t_rows, dtype=np.float64)
+        p_s = np.exp(s)
+        p_t = np.exp(t)
+        tail_s = np.clip(1.0 - p_s.sum(1), 0.0, None)[:, None]
+        tail_t = np.clip(1.0 - p_t.sum(1), 0.0, None)[:, None]
+        p_s = np.concatenate([p_s, tail_s], axis=1)
+        p_t = np.concatenate([p_t, tail_t], axis=1)
+        if divergence_mode == "reverse_kl":
+            div = (p_s * np.log((p_s + eps) / (p_t + eps))).sum(1)
+        elif divergence_mode == "forward_kl":
+            div = (p_t * np.log((p_t + eps) / (p_s + eps))).sum(1)
+        else:  # jsd
+            m = 0.5 * (p_s + p_t)
+            div = (0.5 * p_s * np.log((p_s + eps) / (m + eps)) + 0.5 * p_t * np.log((p_t + eps) / (m + eps))).sum(1)
+        divergences = div.tolist()
+    else:
+        # Rare ragged case (some positions have < k ids): fall back per-position,
+        # still vectorized within each position.
+        divergences = []
+        for i in range(n):
+            sm = student_maps[i]
+            if not sm:
+                divergences.append(0.0)
+                continue
+            tm = teacher_maps[i]
+            ids = list(sm.keys())
+            p_s = np.exp(np.asarray([sm[t] for t in ids], dtype=np.float64))
+            p_t = np.exp(np.asarray([tm.get(t, NEG) for t in ids], dtype=np.float64))
+            p_s = np.append(p_s, max(0.0, 1.0 - p_s.sum()))
+            p_t = np.append(p_t, max(0.0, 1.0 - p_t.sum()))
+            if divergence_mode == "reverse_kl":
+                divergences.append(float((p_s * np.log((p_s + eps) / (p_t + eps))).sum()))
+            elif divergence_mode == "forward_kl":
+                divergences.append(float((p_t * np.log((p_t + eps) / (p_s + eps))).sum()))
+            else:
+                m = 0.5 * (p_s + p_t)
+                divergences.append(
+                    float(
+                        (0.5 * p_s * np.log((p_s + eps) / (m + eps)) + 0.5 * p_t * np.log((p_t + eps) / (m + eps))).sum()
+                    )
+                )
+
+    # Sampled-token diagnostics (cheap scalar gather).
+    for i in range(n):
+        sm = student_maps[i]
+        tok = response_tokens[i]
+        if tok in sm:
+            student_sampled_logps.append(sm[tok])
+            teacher_sampled_logps.append(teacher_maps[i].get(tok, NEG))
+
+    return divergences, student_sampled_logps, teacher_sampled_logps
+
+
+async def _compute_kl_for_sample(
+    args: Namespace,
+    sample: Sample,
+    prefix_sample: Sample,
+    logprob_mode: str,
+    divergence_mode: str,
+) -> torch.Tensor:
+    n = sample.response_length
+    prompt_tokens = sample.tokens[: _prompt_len(sample)]
+    response_tokens = _response_tokens(sample)
+
+    # Format the correct peer solution as a prefix and insert it between the
+    # prompt and this trace's response. Response stays at the tail -> aligned.
+    # NOTE: this legacy sglang-teacher path splices the solution at the
+    # prompt|response boundary (inside the assistant turn). The active megatron
+    # path (sdpo_group_reward) instead rebuilds the teacher prompt with the
+    # solution in the USER turn, matching lasgroup/SDPO. If this path is revived,
+    # port _build_teacher_prompt_str here too.
+    _t = time.perf_counter()
+    prefix_text = _render_prefix(prefix_sample.response)
+    prefix_tokens = _tokenizer(args).encode(prefix_text, add_special_tokens=False)
+    teacher_input = prompt_tokens + prefix_tokens + response_tokens
+    _sdpo_timing["tokenize"] += time.perf_counter() - _t
+
+    if logprob_mode == "sampled":
+        student_logps = sample.rollout_log_probs
+        if student_logps is None or len(student_logps) != n:
+            raise ValueError(
+                f"sampled mode needs rollout_log_probs of length {n}, got "
+                f"{None if student_logps is None else len(student_logps)}."
+            )
+        teacher = await _teacher_score(args, teacher_input, token_ids=None)
+        teacher_entries = _trim_to_response(teacher["meta_info"]["input_token_logprobs"], n)
+        divergences = []
+        for i in range(n):
+            # Alignment guarantee: the teacher's token at this position IS response[i].
+            if int(teacher_entries[i][1]) != response_tokens[i]:
+                raise ValueError(
+                    f"Token misalignment at position {i}: teacher={teacher_entries[i][1]}, "
+                    f"student={response_tokens[i]}."
+                )
+            divergences.append(_sampled_divergence(student_logps[i], float(teacher_entries[i][0]), divergence_mode))
+        return torch.tensor(divergences, dtype=torch.float32)
+
+    # topk: per-position distribution over the student's top-k tokens + a tail bucket.
+    raw = sample.metadata.get("opd_student_top_logprobs")
+    if raw is None:
+        raise ValueError("topk mode needs student top-k logprobs; set --opd-log-prob-top-k > 0 (e.g. 128).")
+    _t = time.perf_counter()
+    student_maps = [_entries_to_map(pos) for pos in (raw[-n:] if n > 0 else [])]
+    if len(student_maps) != n:
+        raise ValueError(f"Student top-k length mismatch: got {len(student_maps)}, expected {n}.")
+    # Query the teacher for exactly the student's top-k token ids at each position.
+    union_ids = sorted({tid for pos in student_maps for tid in pos})
+    _sdpo_timing["student_maps"] += time.perf_counter() - _t
+
+    _t = time.perf_counter()
+    teacher = await _teacher_score(args, teacher_input, token_ids=union_ids)
+    _sdpo_timing["teacher_http"] += time.perf_counter() - _t
+
+    _t = time.perf_counter()
+    teacher_maps = [
+        _entries_to_map(pos) for pos in _trim_to_response(teacher["meta_info"]["input_token_ids_logprobs"], n)
+    ]
+    _sdpo_timing["teacher_maps"] += time.perf_counter() - _t
+
+    # Numpy-vectorized per-token divergence, run in a worker thread so this
+    # CPU-bound work does not block the event loop (other groups' generation and
+    # scoring keep progressing, keeping the GPUs busy). Replaces a per-token
+    # Python exp/log loop that took ~0.9s per 16k trace and stalled everything.
+    _t = time.perf_counter()
+    divergences, student_sampled_logps, teacher_sampled_logps = await asyncio.to_thread(
+        _topk_divergences_np, student_maps, teacher_maps, response_tokens, divergence_mode
+    )
+    _sdpo_timing["divergence"] += time.perf_counter() - _t
+
+    # Stash per-sample scalar diagnostics for rollout logging (see
+    # _compute_metrics_from_samples). Guarded to no-op if nothing was collected.
+    if student_sampled_logps:
+        s_mean = sum(student_sampled_logps) / len(student_sampled_logps)
+        t_mean = sum(teacher_sampled_logps) / len(teacher_sampled_logps)
+        if isinstance(sample.metadata, dict):
+            sample.metadata["sdpo_student_logp_mean"] = s_mean
+            sample.metadata["sdpo_teacher_logp_mean"] = t_mean
+            sample.metadata["sdpo_logp_diff_mean"] = s_mean - t_mean
+
+    return torch.tensor(divergences, dtype=torch.float32)
+
+
+# --------------------------------------------------------------------------- #
+# entry point: group-level async reward model
+# --------------------------------------------------------------------------- #
+
+
+async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any) -> list[float]:
+    """Group RM: returns the task reward per trace and, as a side effect, writes
+    the per-token SDPO divergence into ``sample.opd_reverse_kl``.
+    """
+    logprob_mode = _logprob_mode(args)
+    divergence_mode = _divergence_mode(args)
+
+    # Correctness is always needed to choose which traces can serve as a correct
+    # peer prefix, regardless of what reward we return to the estimator. With
+    # --sdpo-judge this is an LLM-as-judge grade (open-ended answers, defeats the
+    # MCQ letter-guess hack); otherwise deterministic matching.
+    correctness = await _grade_group(args, group)
+    correct_indices = [i for i, ok in enumerate(correctness) if ok]
+
+    # Log the TRUE task success and perplexity per trace on metadata (see
+    # _compute_metrics_from_samples). Under pure distill the returned reward is 0,
+    # so success rate would otherwise be invisible; stash it here so it survives.
+    for ok, s in zip(correctness, group, strict=True):
+        if not isinstance(s.metadata, dict):
+            continue
+        s.metadata["sdpo_correct"] = 1.0 if ok else 0.0
+        # PPL of the sampled response = exp(mean negative student log-prob).
+        logps = s.rollout_log_probs
+        if logps:
+            nll = -sum(logps) / len(logps)
+            s.metadata["sdpo_ppl"] = math.exp(min(nll, 20.0))  # clamp to avoid overflow
+
+    # Pure distillation (default): return 0 task reward so the GRPO advantage is 0
+    # and the training target is exactly -opd_kl_coef * divergence. Otherwise keep
+    # the mixed GRPO(task reward) + distillation target.
+    if getattr(args, "sdpo_pure_distill", True):
+        rewards = [0.0 for _ in group]
+    else:
+        rewards = [1.0 if ok else 0.0 for ok in correctness]
+
+    # Need >= 1 correct trace to have a valid peer prefix (matching lasgroup/SDPO:
+    # _get_solution returns None only when the candidate pool is empty after self-
+    # exclusion, not when there is exactly 1 correct trace). A single correct trace
+    # can still serve as prefix for ALL incorrect traces in the group; the correct
+    # trace itself gets an empty prefix (self-excluded -> empty pool -> no prefix).
+    enable_kl = len(correct_indices) >= 1
+
+    if getattr(args, "sdpo_teacher_backend", "sglang") == "megatron":
+        # Megatron teacher path: DON'T score here. Just pick a correct peer and
+        # stash its rendered+tokenized prefix on the sample. The training side
+        # (megatron actor) then forwards prompt+prefix+response with the CURRENT
+        # policy weights (self-teacher) to get teacher log-probs — a batched,
+        # CUDA-graph'd forward, ~50x faster than SGLang eager full-seq-logprob
+        # scoring. opd_reverse_kl is computed on the training side (opd.py).
+        tok = _tokenizer(args)
+        gen_suffix = _gen_prompt_suffix(tok)
+        remove_thinking = getattr(args, "sdpo_remove_thinking_from_demonstration", False)
+        self_skill = getattr(args, "sdpo_self_skill", False)
+        skill_kd = self_skill and getattr(args, "sdpo_skill_kd", False)
+        skill_kd_mode = getattr(args, "sdpo_skill_kd_mode", "self-success")
+        skill_source = getattr(args, "sdpo_skill_source", "correct")
+
+        response_prefix = getattr(args, "sdpo_response_prefix", "trace")
+
+        # Pass 1: pick each trace's correct peer (self-excluded). prefix_text is the
+        # peer's solution (the full response). Traces with no eligible peer get no
+        # prefix. peer_by_idx
+        # remembers the chosen peer so --sdpo-response-prefix skill can later swap in
+        # that peer's self-generated skill.
+        prefix_text_by_idx: dict[int, str] = {}
+        peer_by_idx: dict[int, int] = {}
+        for i, sample in enumerate(group):
+            if not isinstance(sample.metadata, dict):
+                continue
+            if sample.response_length == 0 or not enable_kl:
+                sample.metadata["sdpo_teacher_prompt_tokens"] = []
+                continue
+            peers = [j for j in correct_indices if j != i]
+            if not peers:
+                sample.metadata["sdpo_teacher_prompt_tokens"] = []
+                continue
+            peer_j = random.choice(peers)
+            peer_by_idx[i] = peer_j
+            prefix_text_by_idx[i] = group[peer_j].response
+
+        # Optional: the CURRENT policy self-generates a skill during rollout from a
+        # trace's OWN response, and (for skill-KD) we run a second SDPO on the skill
+        # tokens. --sdpo-skill-source gates WHICH traces get a skill; it does NOT
+        # change the response teacher prefix (still a correct peer, above).
+        if self_skill:
+
+            def _problem_of(j: int) -> str:
+                md = group[j].metadata if isinstance(group[j].metadata, dict) else {}
+                q = md.get("question")
+                if q:
+                    return str(q)
+                p = group[j].prompt
+                return p if isinstance(p, str) else str(p)
+
+            def _skill_eligible(i: int) -> bool:
+                # env_feedback is a placeholder for a future env-feedback pipeline.
+                if group[i].response_length == 0:
+                    return False
+                self_ok = bool(correctness[i]) if i < len(correctness) else False
+                if skill_source == "correct":
+                    return self_ok
+                if skill_source == "incorrect":
+                    return not self_ok
+                if skill_source == "env_feedback":
+                    return False  # no env-feedback traces yet
+                return True  # "all"
+
+            skill_idxs = [i for i in range(len(group)) if isinstance(group[i].metadata, dict) and _skill_eligible(i)]
+
+            async def _gen_one(i: int):
+                # Distill the trace's OWN response into a skill. For a correct trace
+                # this is "extract the transferable procedure"; for an incorrect one
+                # it flips to "diagnose the error -> pitfall-prevention skill" (the
+                # ground-truth answer is passed so the model knows where it failed).
+                problem = _problem_of(i)
+                self_ok = bool(correctness[i]) if i < len(correctness) else False
+                gen_prompt_ids = _skill_gen_prompt_ids(
+                    args,
+                    tok,
+                    problem,
+                    group[i].response,
+                    correct=self_ok,
+                    ground_truth=(group[i].label or "") if not self_ok else "",
+                )
+                res = await _self_generate_skill(args, gen_prompt_ids)
+                return i, gen_prompt_ids, res
+
+            gen_results = await asyncio.gather(*(_gen_one(i) for i in skill_idxs))
+            for i, gen_prompt_ids, res in gen_results:
+                if res is None:
+                    continue
+                skill_text, skill_tokens, skill_logprobs = res
+                md = group[i].metadata
+                md["sdpo_skill"] = skill_text
+                # rollout-side skill metrics: length + perplexity (from the skill's
+                # own rollout logprobs). Surfaced as skill/* in _compute_metrics_from_samples.
+                md["sdpo_skill_len"] = float(len(skill_tokens))
+                if skill_logprobs:
+                    _nll = -sum(skill_logprobs) / len(skill_logprobs)
+                    md["sdpo_skill_ppl"] = math.exp(min(_nll, 20.0))
+                if skill_kd:
+                    # Skill-KD teacher hint (see DESIGN_self_skill.md):
+                    #  self-success: teacher = skill-gen prompt + the sample's OWN trace
+                    #                as hint. (skill-source already restricts to correct.)
+                    #  problem-only: teacher = skill-gen prompt, NO hint.
+                    md["sdpo_skill_tokens"] = skill_tokens
+                    md["sdpo_skill_prompt_tokens"] = gen_prompt_ids
+                    md["sdpo_skill_rollout_logprobs"] = skill_logprobs
+                    if skill_kd_mode == "self-success":
+                        gen_prompt_str = tok.decode(gen_prompt_ids)
+                        skill_teacher_str = _build_teacher_prompt_str(
+                            gen_prompt_str, gen_suffix, group[i].response, remove_thinking=remove_thinking
+                        )
+                        md["sdpo_skill_teacher_prompt_tokens"] = tok.encode(
+                            skill_teacher_str, add_special_tokens=False
+                        )
+                    else:  # problem-only: no hint -> teacher context == student context
+                        md["sdpo_skill_teacher_prompt_tokens"] = list(gen_prompt_ids)
+
+        # --sdpo-response-prefix skill: swap the response teacher prefix from the
+        # peer's full trace to that peer's self-generated skill (fall back to the
+        # trace if the peer has no skill). Requires self_skill (peers' skills exist).
+        if response_prefix == "skill" and self_skill:
+            for i in list(prefix_text_by_idx.keys()):
+                peer_j = peer_by_idx.get(i)
+                peer_md = group[peer_j].metadata if (peer_j is not None and isinstance(group[peer_j].metadata, dict)) else {}
+                peer_skill = peer_md.get("sdpo_skill")
+                # 1.0 if the response prefix used the peer's skill, 0.0 if it fell
+                # back to the full trace (peer had no skill). Aggregated into the
+                # skill/ panel as the response-prefix-is-skill fraction.
+                if isinstance(group[i].metadata, dict):
+                    group[i].metadata["sdpo_response_prefix_is_skill"] = 1.0 if peer_skill else 0.0
+                if peer_skill:
+                    prefix_text_by_idx[i] = peer_skill
+
+        # Pass 2: build the teacher prompt (peer solution/skill spliced into the USER
+        # turn, before the assistant marker) and tokenize.
+        for i, sample in enumerate(group):
+            if i not in prefix_text_by_idx:
+                continue
+            student_prompt = sample.prompt if isinstance(sample.prompt, str) else ""
+            teacher_prompt_str = _build_teacher_prompt_str(
+                student_prompt, gen_suffix, prefix_text_by_idx[i], remove_thinking=remove_thinking
+            )
+            teacher_prompt_ids = tok.encode(teacher_prompt_str, add_special_tokens=False)
+            # Training side builds teacher seq = teacher_prompt_ids + response_ids,
+            # response kept at the tail so response-span outputs stay aligned.
+            sample.metadata["sdpo_teacher_prompt_tokens"] = teacher_prompt_ids
+        return rewards
+
+    # SGLang teacher path (original): score each trace against the rollout engine
+    # over HTTP and write per-token opd_reverse_kl here. Concurrent to spread load.
+    async def _score(i: int, sample: Sample) -> torch.Tensor:
+        n = sample.response_length
+        if n == 0 or not enable_kl:
+            return torch.zeros((n,), dtype=torch.float32)
+        peers = [j for j in correct_indices if j != i]
+        prefix_sample = group[random.choice(peers)]
+        return await _compute_kl_for_sample(args, sample, prefix_sample, logprob_mode, divergence_mode)
+
+    global _sdpo_calls
+    _wall = time.perf_counter()
+    kls = await asyncio.gather(*(_score(i, s) for i, s in enumerate(group)))
+    _wall = time.perf_counter() - _wall
+    for sample, kl in zip(group, kls, strict=True):
+        sample.opd_reverse_kl = kl
+
+    # Log per-phase timing every 8 groups so we can see where a rollout's scoring
+    # time actually goes (HTTP wait vs CPU prep vs divergence). Sums are across
+    # concurrent traces, so compare RATIOS, not absolute vs wall.
+    _sdpo_calls += 1
+    if _sdpo_calls % 8 == 0:
+        t = _sdpo_timing
+        logger.info(
+            "SDPO timing (cumulative over %d groups): wall_last_group=%.1fs | "
+            "teacher_http=%.1fs student_maps=%.1fs teacher_maps=%.1fs tokenize=%.1fs divergence=%.1fs",
+            _sdpo_calls,
+            _wall,
+            t["teacher_http"],
+            t["student_maps"],
+            t["teacher_maps"],
+            t["tokenize"],
+            t["divergence"],
+        )
+
+    return rewards
+
+
+async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> float:
+    """Per-sample eval RM for SDPO (--eval-custom-rm-path).
+
+    Eval measures pass@1 and never uses the distillation signal, so it just needs
+    the task reward. Uses the same deterministic grading as the group RM.
+    """
+    if getattr(args, "sdpo_grader", "mcq") == "dapo":
+        # Math eval (AIME-2025 = integers, Minerva Math = LaTeX). Use the general
+        # math grader, which handles both, rather than the integer-only DAPO grader
+        # used for training-trace correctness (Minerva answers are not integers).
+        ok = bool(grade_answer_verl(sample.response or "", (sample.label or "").strip()))
+    else:
+        ok = _is_correct(sample, args)
+    return 1.0 if ok else 0.0

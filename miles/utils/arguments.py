@@ -1253,6 +1253,243 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--sdpo-divergence",
+                type=str,
+                choices=["reverse_kl", "forward_kl", "jsd", "jeffrey"],
+                default="jsd",
+                help=(
+                    "Divergence used by the SDPO example (examples/SDPO/sdpo.py) between the teacher "
+                    "distribution (conditioned on a correct peer prefix) and the student distribution "
+                    "(original rollout, no prefix)."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-logprob-mode",
+                type=str,
+                choices=["topk", "sampled"],
+                default="topk",
+                help=(
+                    "SDPO log-prob granularity. 'topk': compare distributions over the student top-k "
+                    "token set plus one aggregated tail bucket for the remaining vocabulary mass "
+                    "(needs --opd-log-prob-top-k > 0, e.g. 128). 'sampled': compare only the sampled "
+                    "token's log-prob (scalar per token)."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-self-teacher",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "True SDPO self-distillation: score the teacher against the rollout engine "
+                    "(the current policy, re-synced every rollout) instead of a fixed external "
+                    "teacher. Use --no-sdpo-self-teacher to score against --rm-url instead."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-ema-teacher",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Use an EMA (exponential-moving-average) copy of the policy as the SDPO "
+                    "teacher instead of the live policy. Matches lasgroup/SDPO "
+                    "(teacher_regularization='ema'). The teacher weights are a slow moving "
+                    "average of the student (teacher = (1-rate)*teacher + rate*student, updated "
+                    "each train step), so the teacher does NOT instantly follow the student into "
+                    "the 'skip reasoning, emit the answer' degenerate mode the prefix induces — "
+                    "breaking the self-reinforcing collapse that live-policy self-teaching causes. "
+                    "Only affects --sdpo-teacher-backend megatron."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-ema-teacher-rate",
+                type=float,
+                default=0.05,
+                help=(
+                    "EMA update rate for the SDPO teacher (lasgroup/SDPO default 0.05): each train "
+                    "step, teacher = (1-rate)*teacher + rate*student. Smaller = slower/more stable "
+                    "teacher. Only used with --sdpo-ema-teacher."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-teacher-backend",
+                type=str,
+                choices=["sglang", "megatron"],
+                default="sglang",
+                help=(
+                    "Where SDPO computes teacher log-probs over prompt+prefix+response. "
+                    "'sglang' (default): score via the rollout engine over HTTP during reward "
+                    "(full-sequence logprob forces eager prefill in sglang -> slow). "
+                    "'megatron': the rollout reward only picks the correct-peer prefix; the "
+                    "training actor then forwards prompt+prefix+response with the current policy "
+                    "weights (a batched, CUDA-graph'd forward) to get teacher log-probs — far "
+                    "faster (like veRL's RefWorker)."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-kd-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use a real distribution-level knowledge-distillation LOSS instead of feeding "
+                    "the divergence into the advantage (REINFORCE). With --sdpo-teacher-backend "
+                    "megatron, the teacher top-k distribution (with prefix) is a detached target, "
+                    "and the student distribution (no prefix, grad-enabled) is pulled toward it via "
+                    "D(student‖teacher) over the teacher's top-k ids + a tail bucket. Divergence set "
+                    "by --sdpo-divergence. This is the strong, directional objective matching the "
+                    "original SDPO full_logit_distillation; the advantage-hook path has weak gradient."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-kd-coef",
+                type=float,
+                default=1.0,
+                help="Weight of the SDPO distribution KD loss (only used with --sdpo-kd-loss).",
+            )
+            parser.add_argument(
+                "--sdpo-kd-max-tokens",
+                type=int,
+                default=0,
+                help=(
+                    "Cap the SDPO KD loss to the first N response tokens per sample (0 = whole "
+                    "response). Bounds the full-vocab log-softmax memory and focuses distillation "
+                    "on early tokens. Tokens beyond N contribute 0 to the KD loss."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-is-clip",
+                type=float,
+                default=2.0,
+                help=(
+                    "Importance-sampling ratio clip for the SDPO KD loss under off-policy/async "
+                    "(matches original SDPO is_clip=2.0). Per token, the KD loss is scaled by "
+                    "exp(student_logp - old_logp).clamp(max=is_clip). Set <=0 to disable."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-kd-clip-cov-frac",
+                type=float,
+                default=0.0,
+                help=(
+                    "KD Clip-Cov (adapted from arXiv:2505.22617 'Entropy Mechanism of RL'): "
+                    "detach the gradient of the top-fraction of response tokens with the LARGEST "
+                    "per-token KD divergence, batch-wide. Those few high-divergence tokens (e.g. "
+                    "the '<answer>'/letter positions the answer-in-prefix teacher over-weights) "
+                    "drive the entropy collapse; freezing their update keeps the distillation "
+                    "signal on the rest while preserving policy entropy. 0.0 = disabled. Try 0.002 "
+                    "(0.2%). The loss VALUE is unchanged (kept for logging); only gradient is cut."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-distillation-add-tail",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Add an aggregated tail bucket to the top-k distributions before the KD "
+                    "divergence (matches original SDPO distillation_add_tail=True). "
+                    "--no-sdpo-distillation-add-tail renormalizes over the top-k instead."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-pure-distill",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Pure distillation: the SDPO group RM returns a task reward of 0 for every "
+                    "trace, so the GRPO advantage is 0 and the training target is exactly "
+                    "-opd_kl_coef * divergence (the distillation signal only). Trace correctness "
+                    "is still computed internally to pick correct-peer prefixes. Use "
+                    "--no-sdpo-pure-distill to keep the mixed GRPO(task reward) + distillation target."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-remove-thinking-from-demonstration",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Strip <think>...</think> blocks from the correct peer response before "
+                    "inserting it as the teacher prefix. Recommended for thinking models "
+                    "(e.g. Qwen3) where the peer response contains a long reasoning chain; "
+                    "leaving it in makes the teacher prefix huge and teaches the student to "
+                    "echo the reasoning verbatim rather than reason independently. "
+                    "Default False (safe for non-thinking models like Qwen2.5)."
+                ),
+            )
+            # ---- Self-generated skill + skill-SDPO (examples/SDPO/sdpo.py) ------
+            # See DESIGN_self_skill.md.
+            parser.add_argument(
+                "--sdpo-self-skill",
+                action="store_true",
+                default=False,
+                help=(
+                    "The CURRENT policy self-generates the skill during rollout (an extra "
+                    "generation against the rollout engine with a skill-gen prompt), and that "
+                    "on-policy skill replaces the peer trace as the response-SDPO teacher prefix. "
+                    "Unlike --sdpo-trace-condense (external LLM), the skill is trainable — see "
+                    "--sdpo-skill-kd. Mutually exclusive with --sdpo-trace-condense."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-skill-kd",
+                action="store_true",
+                default=False,
+                help=(
+                    "Add a SECOND KD objective on the self-generated skill's own tokens (requires "
+                    "--sdpo-self-skill). Same divergence/IS machinery as the response KD, on the "
+                    "(skill-gen prompt, skill) pair with a teacher hint (see --sdpo-skill-kd-mode)."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-skill-kd-coef",
+                type=float,
+                default=1.0,
+                help="Weight of the skill KD term (independent of the response --sdpo-kd-coef).",
+            )
+            parser.add_argument(
+                "--sdpo-skill-kd-mode",
+                type=str,
+                choices=["self-success", "problem-only"],
+                default="self-success",
+                help=(
+                    "Which skills get skill-KD and what the teacher hint is. 'self-success': only "
+                    "when the sample itself answered correctly; teacher hint = the sample's OWN "
+                    "correct trace. 'problem-only': any sample, teacher = skill-gen prompt with NO "
+                    "hint (regularization toward the EMA teacher's skill, no correct-answer info)."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-skill-max-new-tokens",
+                type=int,
+                default=512,
+                help="max_new_tokens for the self-skill generation call during rollout.",
+            )
+            parser.add_argument(
+                "--sdpo-skill-source",
+                type=str,
+                choices=["correct", "incorrect", "env_feedback", "all"],
+                default="correct",
+                help=(
+                    "Which rollout traces get a self-generated skill (and, if eligible, skill-KD). "
+                    "Does NOT change the response-SDPO teacher prefix (always a correct peer). "
+                    "'correct': only traces the sample answered correctly. 'incorrect': only wrong "
+                    "traces. 'env_feedback': PLACEHOLDER for future env-feedback traces (no-op until "
+                    "that pipeline exists). 'all': every trace. The skill is generated from the "
+                    "trace's own response as the worked solution."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-response-prefix",
+                type=str,
+                choices=["trace", "skill"],
+                default="trace",
+                help=(
+                    "What the RESPONSE-SDPO teacher prefix is: 'trace' (default) = the correct "
+                    "peer's full solution (base SDPO); 'skill' = that peer's self-generated skill "
+                    "instead (requires --sdpo-self-skill and the peer to have a skill; falls back "
+                    "to the full trace when the peer has none). Lets the teacher's privileged info "
+                    "be the distilled skill rather than the worked solution."
+                ),
+            )
             return parser
 
         def add_lora_arguments(parser):
