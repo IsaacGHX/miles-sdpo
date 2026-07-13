@@ -701,9 +701,11 @@ class MegatronTrainRayActor(TrainRayActor):
             tokens_list = rollout_data["tokens"]
             resp_lens = rollout_data["response_lengths"]
             teacher_prompt_list = rollout_data["sdpo_teacher_prompt_tokens"]
-            # trace-condense: the distilled skill used as the teacher prefix (if any).
-            # self-skill + skill-KD: the skill's own student/teacher sequences,
-            # dumped to a SEPARATE skill/ folder.
+            # Skill dump: triggered whenever a skill was GENERATED (sdpo_skill text is
+            # present), independent of skill-KD. self-skill/trace-condense always set
+            # the text; the token/logprob fields below are the extra skill-KD payload
+            # (only present with --sdpo-skill-kd) and are logged when available.
+            skill_text_list = rollout_data.get("sdpo_skill")
             skill_tokens_list = rollout_data.get("sdpo_skill_tokens")
             skill_prompt_list = rollout_data.get("sdpo_skill_prompt_tokens")
             skill_teacher_list = rollout_data.get("sdpo_skill_teacher_prompt_tokens")
@@ -732,10 +734,20 @@ class MegatronTrainRayActor(TrainRayActor):
                 }
                 records.append(rec)
                 # Skill records go to a SEPARATE skill/ folder (not mixed into the
-                # response prompts — too hard to find otherwise). student = skill-gen
-                # prompt + skill; teacher = skill-gen prompt + own-trace hint + skill.
-                if skill_tokens_list is not None and i < len(skill_tokens_list) and skill_tokens_list[i]:
-                    sk_ids = list(skill_tokens_list[i])
+                # response prompts — too hard to find otherwise). Dump whenever a skill
+                # was generated (sdpo_skill text present), regardless of skill-KD. The
+                # skill-KD token payload (sk_ids/sk_prompt/sk_teacher) is optional: when
+                # present, prefer the decoded tokens (exact) and add the student/teacher
+                # sequences; when absent, fall back to the raw skill text.
+                sk_text = (
+                    skill_text_list[i] if (skill_text_list is not None and i < len(skill_text_list)) else ""
+                )
+                sk_ids = (
+                    list(skill_tokens_list[i])
+                    if (skill_tokens_list is not None and i < len(skill_tokens_list) and skill_tokens_list[i])
+                    else []
+                )
+                if sk_text or sk_ids:
                     sk_prompt = (
                         list(skill_prompt_list[i]) if (skill_prompt_list and i < len(skill_prompt_list) and skill_prompt_list[i]) else []
                     )
@@ -747,13 +759,13 @@ class MegatronTrainRayActor(TrainRayActor):
                     skill_records.append(
                         {
                             "index": i,
-                            "skill_length": len(sk_ids),
-                            "skill_text": tok.decode(sk_ids),
+                            "skill_length": len(sk_ids) if sk_ids else None,
+                            "skill_text": tok.decode(sk_ids) if sk_ids else sk_text,
                             "problem_text": tok.decode(prompt_ids),
                             "skill_student_prompt_text": tok.decode(sk_prompt) if sk_prompt else "",
                             "skill_teacher_prompt_text": tok.decode(sk_teacher) if sk_teacher else "",
-                            "skill_student_text": tok.decode(sk_prompt + sk_ids) if sk_prompt else tok.decode(sk_ids),
-                            "skill_teacher_text": tok.decode(sk_teacher + sk_ids) if sk_teacher else "",
+                            "skill_student_text": tok.decode(sk_prompt + sk_ids) if (sk_prompt and sk_ids) else "",
+                            "skill_teacher_text": tok.decode(sk_teacher + sk_ids) if (sk_teacher and sk_ids) else "",
                         }
                     )
             rollout_id = getattr(self, "_last_rollout_id", 0)
