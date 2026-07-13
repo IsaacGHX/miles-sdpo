@@ -505,7 +505,9 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     # Group RM defers scoring to a whole-group step that eval does not run, so eval
     # samples would have no reward. --eval-custom-rm-path supplies a per-sample eval
     # RM instead, which is what makes eval possible while training uses --group-rm.
-    assert not args.group_rm, "Group RM is not supported for eval rollout"
+    assert (
+        not args.group_rm or args.eval_custom_rm_path is not None
+    ), "Group RM is not supported for eval rollout; set --eval-custom-rm-path to grade eval samples per-sample."
 
     coros = []
     for dataset_cfg in getattr(args, "eval_datasets", []) or []:
@@ -527,7 +529,9 @@ async def eval_rollout_single_dataset(
         rollout_id: int, the id of the rollout, used for deterministic data generation
         dataset_cfg: configuration of the dataset
     """
-    assert not args.group_rm, "Group RM is not supported for eval rollout"
+    assert (
+        not args.group_rm or args.eval_custom_rm_path is not None
+    ), "Group RM is not supported for eval rollout; set --eval-custom-rm-path to grade eval samples per-sample."
 
     global EVAL_PROMPT_DATASET
 
@@ -611,6 +615,16 @@ async def eval_rollout_single_dataset(
     pbar.close()
 
     data.sort(key=lambda sample: sample.index)
+
+    # Under --group-rm, generate_and_rm defers scoring to a group step that eval
+    # does not run, so eval samples arrive with reward=None. Grade them here with
+    # the per-sample eval RM (the assert above guarantees it is set in that case).
+    if args.group_rm and args.eval_custom_rm_path is not None:
+        eval_rm = load_function(args.eval_custom_rm_path)
+        need_reward = [sample for sample in data if sample.reward is None]
+        rewards = await asyncio.gather(*(eval_rm(args, sample) for sample in need_reward))
+        for sample, reward in zip(need_reward, rewards, strict=True):
+            sample.reward = reward
 
     reward_key = args.eval_reward_key or args.reward_key
     return {

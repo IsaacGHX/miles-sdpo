@@ -2043,6 +2043,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--eval-custom-rm-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a per-sample reward function used only during eval rollout, with the "
+                    "signature `async def eval_rm(args, sample) -> float`. Set this to run eval while "
+                    "training uses a group RM (--group-rm): the group RM cannot score eval samples "
+                    "(there is no group step in eval), so this per-sample function grades them instead. "
+                    "Without it, eval under --group-rm is disallowed."
+                ),
+            )
+            parser.add_argument(
                 "--custom-reward-post-process-path",
                 type=str,
                 default=None,
