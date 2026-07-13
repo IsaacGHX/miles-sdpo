@@ -137,6 +137,20 @@ def add_sglang_arguments(parser):
 def validate_args(args):
     args.sglang_tp_size = args.rollout_num_gpus_per_engine
 
+    # Compat: miles code reads short parallel-size names (sglang_dp_size,
+    # sglang_pp_size, sglang_ep_size), but older sglang builds register these
+    # under the full flag names (--data-parallel-size etc. -> dest
+    # data_parallel_size), so the auto-prefixed attrs are
+    # args.sglang_{data,pipeline,expert}_parallel_size and the short names are
+    # absent. Bridge them so the rest of the codebase works on either build.
+    for short, full in (
+        ("sglang_dp_size", "sglang_data_parallel_size"),
+        ("sglang_pp_size", "sglang_pipeline_parallel_size"),
+        ("sglang_ep_size", "sglang_expert_parallel_size"),
+    ):
+        if not hasattr(args, short):
+            setattr(args, short, getattr(args, full, 1))
+
     if args.true_on_policy_mode:
         args.sglang_enable_deterministic_inference = True
 

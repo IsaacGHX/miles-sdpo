@@ -2437,7 +2437,12 @@ def miles_validate_args(args):
             args.offload_train = True
         if args.offload_rollout is None:
             args.offload_rollout = True
-        if args.sglang_cuda_graph_backend_prefill is None:
+        # Older sglang builds do not expose --sglang-cuda-graph-backend-prefill
+        # (their cuda-graph config is nested, not a flat flag), so the attr may be
+        # absent. Guard with hasattr so colocate works on either build.
+        if not hasattr(args, "sglang_cuda_graph_backend_prefill"):
+            pass
+        elif args.sglang_cuda_graph_backend_prefill is None:
             args.sglang_cuda_graph_backend_prefill = "disabled"
             logger.info(
                 "Colocate mode: defaulting --sglang-cuda-graph-backend-prefill=disabled to avoid NVLS OOM. "
