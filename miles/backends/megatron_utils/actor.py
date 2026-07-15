@@ -709,6 +709,11 @@ class MegatronTrainRayActor(TrainRayActor):
             skill_tokens_list = rollout_data.get("sdpo_skill_tokens")
             skill_prompt_list = rollout_data.get("sdpo_skill_prompt_tokens")
             skill_teacher_list = rollout_data.get("sdpo_skill_teacher_prompt_tokens")
+            # Failure-pitfall text fields (see examples/SDPO/sdpo.py): the raw per-trace
+            # pitfall (before pitfall-condense overwrites sdpo_skill) and the group's
+            # shared common-pitfall summary spliced into failed traces' teacher prefix.
+            trace_pitfall_list = rollout_data.get("sdpo_trace_pitfall")
+            group_pitfalls_list = rollout_data.get("sdpo_group_pitfalls")
             # Per-trace correctness (stashed by the SDPO group RM). Lets the skill dump
             # label whether each skill is a solution-skill (from a correct trace) or a
             # pitfall (from an incorrect trace) — the two flavors --sdpo-skill-source
@@ -774,6 +779,12 @@ class MegatronTrainRayActor(TrainRayActor):
                         else None
                     )
                     skill_kind = None if self_correct is None else ("solution" if self_correct else "pitfall")
+                    trace_pitfall = (
+                        trace_pitfall_list[i] if (trace_pitfall_list is not None and i < len(trace_pitfall_list)) else ""
+                    )
+                    group_pitfalls = (
+                        group_pitfalls_list[i] if (group_pitfalls_list is not None and i < len(group_pitfalls_list)) else ""
+                    )
                     skill_records.append(
                         {
                             "index": i,
@@ -781,6 +792,12 @@ class MegatronTrainRayActor(TrainRayActor):
                             "skill_kind": skill_kind,
                             "skill_length": sk_len,
                             "skill_text": tok.decode(sk_ids) if sk_ids else sk_text,
+                            # Raw per-trace pitfall (failed traces): preserved even when
+                            # pitfall-condense overwrites skill_text with a problem-only
+                            # prediction. The group's shared common-pitfall summary that
+                            # was spliced into this trace's teacher prefix (failed only).
+                            "trace_pitfall_text": trace_pitfall,
+                            "group_pitfalls_text": group_pitfalls,
                             "problem_text": tok.decode(prompt_ids),
                             "skill_student_prompt_text": tok.decode(sk_prompt) if sk_prompt else "",
                             "skill_teacher_prompt_text": tok.decode(sk_teacher) if sk_teacher else "",

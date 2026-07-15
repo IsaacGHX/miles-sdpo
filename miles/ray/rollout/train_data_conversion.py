@@ -111,11 +111,16 @@ def convert_samples_to_train_data(
     # NOTE: skill fields are set only on skill-ELIGIBLE samples, which may not
     # include samples[0]. Test ANY sample, not just the first, or the whole field
     # gets silently dropped whenever sample 0 happens to be ineligible.
-    if any(isinstance(s.metadata, dict) and "sdpo_skill" in s.metadata for s in samples):
-        train_data["sdpo_skill"] = [
-            (sample.metadata or {}).get("sdpo_skill", "") if isinstance(sample.metadata, dict) else ""
-            for sample in samples
-        ]
+    # sdpo_skill (final skill text; in pitfall-condense mode this is the problem-only
+    # prediction), plus the raw per-trace pitfall (before any overwrite) and the
+    # group's shared common-pitfall summary — all forwarded so the training-side dump
+    # can log them.
+    for _skill_text_key in ("sdpo_skill", "sdpo_trace_pitfall", "sdpo_group_pitfalls"):
+        if any(isinstance(s.metadata, dict) and _skill_text_key in s.metadata for s in samples):
+            train_data[_skill_text_key] = [
+                (sample.metadata or {}).get(_skill_text_key, "") if isinstance(sample.metadata, dict) else ""
+                for sample in samples
+            ]
 
     # SDPO skill-KD: the self-generated skill's tokens + its student/teacher prompts +
     # old logprobs, forwarded so the training side can run the second KD on the skill.
@@ -203,6 +208,8 @@ def split_train_data_by_dp(args, data, dp_size):
             "opd_reverse_kl",
             "sdpo_teacher_prompt_tokens",
             "sdpo_skill",
+            "sdpo_trace_pitfall",
+            "sdpo_group_pitfalls",
             "sdpo_skill_tokens",
             "sdpo_skill_prompt_tokens",
             "sdpo_skill_teacher_prompt_tokens",
