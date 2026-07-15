@@ -1415,6 +1415,23 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Default False (safe for non-thinking models like Qwen2.5)."
                 ),
             )
+            parser.add_argument(
+                "--sdpo-dynamic-filter-min-correct",
+                type=int,
+                default=0,
+                help=(
+                    "Threshold for the SDPO dynamic-sampling filter "
+                    "(miles.rollout.filter_hub.dynamic_sampling_filters.check_sdpo_group_has_prefix): "
+                    "drop any rollout group with fewer than this many correct traces, then re-sample "
+                    "(DAPO-style oversampling) so every kept group can give EVERY trace a correct-peer "
+                    "prefix. Default 0 = keep every group (no-op even if the filter path is set), so "
+                    "this stays inert unless you opt in. Set 2 for full prefix coverage (with 1 correct, "
+                    "that lone trace self-excludes to an empty peer pool); 1 guarantees a prefix for the "
+                    "incorrect traces only. Only takes effect when --dynamic-sampling-filter-path points "
+                    "at check_sdpo_group_has_prefix. Raise --over-sampling-batch-size so oversampling can "
+                    "meet the target when the threshold is high."
+                ),
+            )
             # ---- LLM-as-judge grading (examples/SDPO/sdpo.py) --------------------
             parser.add_argument(
                 "--sdpo-judge",
@@ -1558,13 +1575,29 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--sdpo-skill-kd-mode",
                 type=str,
-                choices=["self-success", "problem-only"],
+                choices=["self-success", "problem-only", "pitfall-condense"],
                 default="self-success",
                 help=(
                     "Which skills get skill-KD and what the teacher hint is. 'self-success': only "
                     "when the sample itself answered correctly; teacher hint = the sample's OWN "
                     "correct trace. 'problem-only': any sample, teacher = skill-gen prompt with NO "
-                    "hint (regularization toward the EMA teacher's skill, no correct-answer info)."
+                    "hint (regularization toward the EMA teacher's skill, no correct-answer info). "
+                    "'pitfall-condense': for FAILED traces (skill-source incorrect|all); teacher = "
+                    "the problem-solving prompt with the trace's own generated pitfalls as the "
+                    "privileged hint, distilling the group's per-trace pitfalls."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-pitfall-summary-backend",
+                type=str,
+                choices=["self", "external"],
+                default="self",
+                help=(
+                    "Second-stage aggregation of a group's per-trace pitfalls into one shared "
+                    "'common failure lessons' list. 'self' (default): the current policy over the "
+                    "rollout engine (on-policy, same generator as self-skill). 'external': the "
+                    "OpenAI-compatible LLM (--sdpo-condense-* endpoint). Only used when self-skill "
+                    "covers incorrect traces (--sdpo-skill-source incorrect|all)."
                 ),
             )
             parser.add_argument(

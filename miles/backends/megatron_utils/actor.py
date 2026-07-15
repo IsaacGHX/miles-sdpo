@@ -709,6 +709,11 @@ class MegatronTrainRayActor(TrainRayActor):
             skill_tokens_list = rollout_data.get("sdpo_skill_tokens")
             skill_prompt_list = rollout_data.get("sdpo_skill_prompt_tokens")
             skill_teacher_list = rollout_data.get("sdpo_skill_teacher_prompt_tokens")
+            # Per-trace correctness (stashed by the SDPO group RM). Lets the skill dump
+            # label whether each skill is a solution-skill (from a correct trace) or a
+            # pitfall (from an incorrect trace) — the two flavors --sdpo-skill-source
+            # all/incorrect produce. Absent -> unknown (None).
+            correct_list = rollout_data.get("sdpo_correct")
             records = []
             skill_records = []
             for i in range(len(tokens_list)):
@@ -756,10 +761,25 @@ class MegatronTrainRayActor(TrainRayActor):
                         if (skill_teacher_list and i < len(skill_teacher_list) and skill_teacher_list[i])
                         else []
                     )
+                    # skill_length: exact token count from the KD payload when present,
+                    # else the tokenized length of the skill text (so it is never null
+                    # just because skill-KD is off).
+                    sk_len = len(sk_ids) if sk_ids else (len(tok.encode(sk_text)) if sk_text else 0)
+                    # Label the skill's provenance: a correct trace yields a
+                    # solution-skill, an incorrect one a pitfall (see _gen_one in
+                    # examples/SDPO/sdpo.py). None when correctness is unavailable.
+                    self_correct = (
+                        bool(float(correct_list[i]) > 0.5)
+                        if (correct_list is not None and i < len(correct_list) and correct_list[i] is not None)
+                        else None
+                    )
+                    skill_kind = None if self_correct is None else ("solution" if self_correct else "pitfall")
                     skill_records.append(
                         {
                             "index": i,
-                            "skill_length": len(sk_ids) if sk_ids else None,
+                            "self_correct": self_correct,
+                            "skill_kind": skill_kind,
+                            "skill_length": sk_len,
                             "skill_text": tok.decode(sk_ids) if sk_ids else sk_text,
                             "problem_text": tok.decode(prompt_ids),
                             "skill_student_prompt_text": tok.decode(sk_prompt) if sk_prompt else "",

@@ -74,6 +74,16 @@ Which samples' skills get the skill-SDPO, and what the teacher hint is:
   skill-gen prompt with NO hint (student == teacher context) — degenerates to a
   self-consistency/regularization target on the skill tokens; the signal comes only
   from the EMA-teacher lag, not from a correct-answer hint.
+- **`pitfall-condense`**: for FAILED traces (requires `--sdpo-skill-source
+  incorrect|all`). A *separate* skill OPD that mirrors the response-SDPO condense
+  idea but for failure knowledge:
+  - **student** = predict the pitfalls to avoid from the PROBLEM ONLY (no attempt,
+    no answer, no privileged info). Regenerated during rollout so the KD'd tokens
+    match this problem-only context.
+  - **teacher** = the same problem-only prompt PLUS the group's per-trace failure
+    skills spliced in as privileged info ("here's how attempts actually failed").
+  - KD pulls the problem-only student toward the failure-informed teacher, i.e. the
+    policy learns to foresee this problem's traps without having seen the failures.
 
 ## Data threaded rollout -> train (per sample)
 
@@ -94,14 +104,36 @@ skill_tokens`), and `policy_loss_function` adds the skill KD term.
 | `--sdpo-self-skill` | off | Policy self-generates a skill during rollout (from a trace's own response). On by itself it only produces the skill (for skill-KD / response-prefix); it does NOT change the response prefix unless `--sdpo-response-prefix skill`. |
 | `--sdpo-skill-kd` | off | Add the second KD objective on the skill's own tokens. |
 | `--sdpo-skill-kd-coef` | 1.0 | Weight of the skill KD term (independent of response `--sdpo-kd-coef`). |
-| `--sdpo-skill-kd-mode` | self-success | `self-success` (own-trace hint) / `problem-only` (no hint). |
+| `--sdpo-skill-kd-mode` | self-success | `self-success` (own-trace hint) / `problem-only` (no hint) / `pitfall-condense` (problem-only student vs failure-informed teacher; needs skill-source incorrect\|all). |
 | `--sdpo-skill-max-new-tokens` | 512 | max_new_tokens for the self-skill generation call. |
-| `--sdpo-skill-source` | correct | Which traces get a skill: `correct` / `incorrect` / `env_feedback` (placeholder) / `all`. The skill-gen prompt adapts per trace: a CORRECT trace is distilled with the "worked solution -> transferable procedure" prompt; an INCORRECT trace uses a different prompt that tells the model the attempt is wrong, supplies the ground-truth answer (for diagnosis only, never emitted), and asks for a pitfall-prevention / error-recovery skill. Both stay generic and never reveal the answer. |
+| `--sdpo-skill-source` | correct | Which traces get a skill: `correct` / `incorrect` / `env_feedback` (placeholder) / `all`. The skill-gen prompt adapts per trace: a CORRECT trace is distilled with the "worked solution -> transferable procedure" prompt; an INCORRECT trace uses a pitfall prompt that tells the model the attempt is wrong, supplies the ground-truth answer (for diagnosis only, never emitted), tags WHY it failed (truncated / format / wrong), and asks for pitfall warnings (never a solution, never the answer). |
+| `--sdpo-pitfall-summary-backend` | self | Second-stage aggregation of a group's per-trace pitfalls into one shared "common failure lessons" list: `self` (current policy) / `external` (OpenAI-compatible LLM). Used when skill-source covers incorrect traces. |
 | `--sdpo-response-prefix` | trace | RESPONSE-SDPO teacher prefix: `trace` = correct peer's full solution (base SDPO); `skill` = that peer's self-generated skill (needs `--sdpo-self-skill` + peer to have a skill; falls back to the trace otherwise). |
 
 Note: with `--sdpo-response-prefix skill`, the peers are correct traces, so
 `--sdpo-skill-source` must include them (`correct` or `all`) or every prefix
 silently falls back to the trace.
+
+## 3. Group failure pitfalls (response-SDPO prefix)
+
+When `--sdpo-skill-source` covers incorrect traces (`incorrect` | `all`), failure
+knowledge is folded into the RESPONSE-SDPO teacher prefix in two stages:
+
+1. **Per-trace pitfalls** — every failed trace distils its own "mistakes to avoid"
+   warnings, tailored by why it failed: `truncated` (hit the length limit — likely
+   a verbosity/efficiency pitfall), `format` (no parseable answer — output-format
+   pitfall), or `wrong` (a complete but incorrect answer — conceptual pitfall).
+2. **Common lessons** — all of the group's per-trace pitfalls are fed back to the
+   skill generator (`--sdpo-pitfall-summary-backend`) and synthesized into ONE short
+   shared list of the recurring mistakes.
+
+That shared list is spliced **only into the FAILED traces' teacher prefix** (under a
+"Common mistakes to avoid" block, after the correct-peer solution/skill); CORRECT
+traces keep a clean correct-peer prefix. A failed trace with no correct peer (an
+all-wrong group) still gets a pitfalls-only prefix. Rationale: a model that failed
+cannot be trusted to rewrite a correct solution (that would hallucinate a bad KD
+target), but it *can* flag concrete errors — so failed traces contribute warnings,
+never solutions.
 
 ## Panels
 

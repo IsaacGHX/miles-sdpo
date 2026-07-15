@@ -106,7 +106,10 @@ def _strip_thinking_blocks(text: str) -> str:
 
 def _render_prefix(peer_response: str, remove_thinking: bool = False, pitfalls: str = "") -> str:
     content = _strip_thinking_blocks(peer_response) if remove_thinking else peer_response
-    section = SOLUTION_TEMPLATE.format(successful_previous_attempt=content)
+    # Skip the "Correct solution:" section entirely when there is no base solution
+    # (e.g. a failed trace in an all-wrong group gets a pitfalls-only prefix); an
+    # empty "Correct solution:" heading would mislead the teacher.
+    section = SOLUTION_TEMPLATE.format(successful_previous_attempt=content) if content and content.strip() else ""
     if pitfalls and pitfalls.strip():
         section += PITFALLS_TEMPLATE.format(pitfalls=pitfalls.strip())
     return section + PREFIX_INSTRUCTION
@@ -167,6 +170,20 @@ def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_respons
         return student_prompt[:idx] + solution_section + student_prompt[idx:]
     # Fallback (unknown template): append at the end. Not ideal but never crashes.
     return student_prompt + solution_section
+
+
+def _build_failure_teacher_prompt_str(student_prompt: str, gen_suffix: str, failure_info: str) -> str:
+    """Splice the group's per-trace failure skills into the USER turn of a
+    problem-only pitfall-prediction prompt as PRIVILEGED info (pitfall-condense
+    skill-KD teacher). Empty failure_info -> teacher == student (no privileged info,
+    KD signal 0 for that sample). Mirrors _build_teacher_prompt_str's insert point."""
+    if not (failure_info and failure_info.strip()):
+        return student_prompt
+    section = FAILURES_TEMPLATE.format(successful_previous_attempt=failure_info.strip())
+    if gen_suffix and gen_suffix in student_prompt:
+        idx = student_prompt.rfind(gen_suffix)
+        return student_prompt[:idx] + section + student_prompt[idx:]
+    return student_prompt + section
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +467,70 @@ _SKILL_SYSTEM_PROMPT_INCORRECT = (
     "- Output ONLY the numbered pitfall warnings, nothing else."
 )
 
+# Second-stage aggregation: given the pitfalls distilled from EVERY failed trace in
+# a group (each a small list of "avoid X" warnings), synthesize the COMMON failure
+# lessons — the mistakes that recur across attempts on this problem — into one short
+# shared list. This shared list (not the raw concatenation) is what gets spliced
+# into the failed traces' teacher prefix, so the teacher sees a tight "here's how
+# this group tends to fail" summary rather than a long noisy dump.
+_PITFALL_SUMMARY_SYSTEM = (
+    "You are given several sets of PITFALL WARNINGS, each distilled from a different "
+    "failed attempt at the SAME problem. Synthesize the COMMON, recurring mistakes "
+    "into one short shared list of pitfalls to avoid on this problem. Merge duplicates, "
+    "keep only the mistakes that matter most, and drop one-off noise.\n\n"
+    "Hard constraints:\n"
+    "- Output 2-4 numbered pitfall bullets, each an imperative 'Avoid ...' / "
+    "'Do not ...' / 'Watch out that ...' warning.\n"
+    "- Be concise and general enough to cover the recurring errors; still grounded in "
+    "this problem's setup where it sharpens the warning.\n"
+    "- Never state the final/ground-truth answer and never give a worked solution.\n"
+    "- Output ONLY the numbered pitfall warnings, nothing else."
+)
+
+
+def _pitfall_summary_user_prompt(problem: str, pitfall_sets: list[str]) -> str:
+    blocks = "\n\n".join(f"FAILED ATTEMPT {k + 1} PITFALLS:\n{p}" for k, p in enumerate(pitfall_sets))
+    return (
+        f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
+        f"{blocks}\n\n"
+        "Synthesize the common recurring pitfalls (2-4 numbered 'Avoid ...' bullets; "
+        "no solution, no answer)."
+    )
+
+
+# --- pitfall-condense skill-KD (⑤): the skill's own OPD --------------------- #
+# STUDENT (no privileged info): given ONLY the problem, predict the pitfalls a
+# solver should avoid — a pure "foresee the traps" task with no failed attempt and
+# no answer. TEACHER (privileged): the same problem-only prompt PLUS the group's
+# actual per-trace failure skills spliced in, so it condenses what really went
+# wrong. KD pulls the problem-only student toward the failure-informed teacher.
+_PITFALL_PREDICT_SYSTEM = (
+    "Given a problem (and NOTHING else — no attempt, no answer), predict the pitfalls "
+    "a solver is most likely to fall into on this kind of problem, as concrete "
+    "warnings to avoid.\n\n"
+    "Hard constraints:\n"
+    "- Output 2-5 numbered pitfall bullets, each an imperative 'Avoid ...' / "
+    "'Do not ...' / 'Watch out that ...' warning grounded in this problem's setup.\n"
+    "- Do NOT solve the problem or give the method/steps; only the traps to avoid.\n"
+    "- Never state a final answer.\n"
+    "- Output ONLY the numbered pitfall warnings, nothing else."
+)
+
+# Label for the privileged failure info spliced into the pitfall-condense TEACHER
+# turn (distinct from "Correct solution:" — these are observed FAILURES, not a
+# solution). Reuses the {successful_previous_attempt} field name for _render_prefix
+# compatibility but is only ever fed the concatenated failure skills.
+FAILURES_TEMPLATE = "\n\nObserved failed-attempt pitfalls (privileged, do not reveal):\n\n{successful_previous_attempt}"
+
+
+def _pitfall_predict_user_prompt(problem: str) -> str:
+    return (
+        f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
+        "Predict the pitfalls to avoid (2-5 numbered 'Avoid ...' bullets; no solution, "
+        "no answer)."
+    )
+
+
 _CONDENSE_SEM: "asyncio.Semaphore | None" = None
 _CONDENSE_SEM_LIMIT: int | None = None
 
@@ -495,15 +576,57 @@ def _skill_user_prompt(problem: str, solution: str) -> str:
     )
 
 
-def _skill_user_prompt_incorrect(problem: str, attempt: str, ground_truth: str) -> str:
+def _failure_kind(args: Namespace, sample: Sample) -> str:
+    """Classify WHY a trace failed, so the pitfall generator can tailor its
+    diagnosis. Three kinds, decided cheaply from the sample:
+      - "truncated"    : the rollout hit the response-length limit (Status.TRUNCATED)
+                         -> the attempt was cut off, not necessarily reasoned wrong.
+      - "format"       : a complete response with no parseable answer (no <answer>
+                         tag / no \\boxed) -> the reasoning may be fine but the output
+                         format is broken.
+      - "wrong"        : a complete, parseable answer that is simply incorrect.
+    """
+    try:
+        if sample.status == Sample.Status.TRUNCATED:
+            return "truncated"
+    except Exception:
+        pass
+    if _extract_answer(args, sample) is None:
+        return "format"
+    return "wrong"
+
+
+_FAILURE_NOTE = {
+    "truncated": (
+        "NOTE: this attempt was CUT OFF by the response-length limit before it "
+        "finished. The reasoning may have been on track; the pitfall is more likely "
+        "about efficiency/length (e.g. being too verbose, not reaching the answer in "
+        "time) than a conceptual error. Judge accordingly."
+    ),
+    "format": (
+        "NOTE: this attempt produced NO parseable final answer (missing/emptly answer "
+        "tag). The reasoning may be fine but the OUTPUT FORMAT is broken. The pitfall "
+        "should stress following the required answer format."
+    ),
+    "wrong": (
+        "NOTE: this attempt gave a complete but INCORRECT answer. The pitfall should "
+        "target the conceptual/computational mistake that led to the wrong answer."
+    ),
+}
+
+
+def _skill_user_prompt_incorrect(problem: str, attempt: str, ground_truth: str, failure_kind: str = "wrong") -> str:
     """User prompt for the incorrect-trace skill: the attempt is wrong; give the
     ground-truth answer ONLY so the model can localize the mistake, then emit
-    pitfall warnings (never a solution, never the answer)."""
+    pitfall warnings (never a solution, never the answer). failure_kind tailors the
+    diagnosis (truncated | format | wrong)."""
     gt = (ground_truth or "").strip()
+    note = _FAILURE_NOTE.get(failure_kind, _FAILURE_NOTE["wrong"])
     return (
         f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
         f"FAILED ATTEMPT (wrong, do not echo):\n{attempt}\n\n"
         f"GROUND-TRUTH ANSWER (for locating the mistake only, do NOT put it in the output):\n{gt}\n\n"
+        f"{note}\n\n"
         "Identify the specific mistakes and write the pitfall warnings (2-5 numbered "
         "'Avoid ...'/'Do not ...' bullets; no solution, no answer)."
     )
@@ -542,6 +665,57 @@ async def _condense_trace_to_skill(args: Namespace, problem: str, solution: str)
         return solution
 
 
+async def _external_llm_chat(args: Namespace, system: str, user: str) -> str | None:
+    """Single (system, user) -> text completion via the OpenAI-compatible condenser
+    endpoint. Returns the stripped content, or None on failure. Shared by
+    trace-condense and the pitfall summary so both use one external-LLM path."""
+    base_url = getattr(args, "sdpo_condense_base_url", "https://api.openai.com/v1").rstrip("/")
+    model = getattr(args, "sdpo_condense_model", "gpt-5.4-mini")
+    api_key = os.environ.get(getattr(args, "sdpo_condense_api_key_env", "OPENAI_API_KEY"), "") or "EMPTY"
+    max_tokens = int(getattr(args, "sdpo_condense_max_tokens", 2048))
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if model.startswith(("gpt-5", "o1", "o3", "o4")):
+        payload["max_completion_tokens"] = max_tokens
+    else:
+        payload["max_completion_tokens"] = max_tokens
+        payload["temperature"] = 0.0
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        out = await post(f"{base_url}/chat/completions", payload, max_retries=3, headers=headers)
+        return (out["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        logger.warning(f"external LLM chat failed ({e!r}).")
+        return None
+
+
+async def _generate_skill_text(args: Namespace, system: str, user: str, backend: str) -> str:
+    """Generate a skill/pitfall text from a (system, user) prompt using the selected
+    backend: 'self' = the current policy over the rollout engine (on-policy, same
+    generator class as self-skill), 'external' = the OpenAI-compatible LLM (same as
+    trace-condense). Thinking is stripped on the self path. Returns "" on failure."""
+    if backend == "external":
+        return (await _external_llm_chat(args, system, user)) or ""
+    # self / policy path: chat-template the (system, user), generate on the rollout
+    # engine, strip thinking, decode.
+    tok = _tokenizer(args)
+    text = tok.apply_chat_template(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    prompt_ids = tok.encode(text, add_special_tokens=False)
+    res = await _self_generate_skill(args, prompt_ids)
+    return res[0] if res else ""
+
+
 async def _condense_solutions(args: Namespace, pairs: list[tuple[str, str]]) -> list[str]:
     """Condense a batch of (problem, solution) pairs into skills, concurrently and
     with a process-wide cap. Deduplicates identical (problem, solution) pairs so a
@@ -568,7 +742,7 @@ async def _condense_solutions(args: Namespace, pairs: list[tuple[str, str]]) -> 
 
 
 def _skill_gen_prompt_ids(
-    args, tok, problem: str, solution: str, *, correct: bool = True, ground_truth: str = ""
+    args, tok, problem: str, solution: str, *, correct: bool = True, ground_truth: str = "", failure_kind: str = "wrong"
 ) -> list[int]:
     """Chat-templated skill-generation prompt (system=SKILL prompt, user=problem+
     solution + distill instruction), tokenized, with the assistant generation
@@ -576,7 +750,8 @@ def _skill_gen_prompt_ids(
 
     correct=False switches to the incorrect-trace framing: the attempt is wrong,
     the ground truth is supplied, and the model distills a pitfall-prevention skill
-    instead of distilling know-how from a flawed solution.
+    instead of distilling know-how from a flawed solution. failure_kind (truncated |
+    format | wrong) tailors the pitfall diagnosis.
     """
     solution = _strip_response_eos(solution)
     if correct:
@@ -584,7 +759,7 @@ def _skill_gen_prompt_ids(
         user = _skill_user_prompt(problem, solution)
     else:
         system = _SKILL_SYSTEM_PROMPT_INCORRECT
-        user = _skill_user_prompt_incorrect(problem, solution, ground_truth)
+        user = _skill_user_prompt_incorrect(problem, solution, ground_truth, failure_kind=failure_kind)
     text = tok.apply_chat_template(
         [
             {"role": "system", "content": system},
@@ -594,6 +769,31 @@ def _skill_gen_prompt_ids(
         add_generation_prompt=True,
     )
     return tok.encode(text, add_special_tokens=False)
+
+
+def _strip_think_tokens(tok, tokens: list[int], logprobs: list[float]) -> tuple[list[int], list[float]]:
+    """Drop everything up to and including the FIRST </think> from a token sequence,
+    keeping tokens and their logprobs aligned. Thinking models (e.g. nemotron3,
+    Qwen3) emit a leading <think>...</think> reasoning chain before the actual skill;
+    the real skill is what follows that closing tag. We locate it at the TOKEN level
+    (not by re-encoding the text) so the returned tokens/logprobs stay exactly the
+    ones the policy generated — required for skill-KD (logprob alignment) and for a
+    clean dump. Returns the sequence unchanged if no </think> is present."""
+    if not tokens:
+        return tokens, logprobs
+    full = tok.decode(tokens)
+    if "</think>" not in full:
+        return tokens, logprobs
+    # decode(tokens[:j]) containing </think> is monotonic in j (longer prefix, more
+    # text), so binary-search the smallest j whose prefix already closes the tag.
+    lo, hi = 1, len(tokens)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if "</think>" in tok.decode(tokens[:mid]):
+            hi = mid
+        else:
+            lo = mid + 1
+    return tokens[lo:], logprobs[lo:]
 
 
 async def _self_generate_skill(args: Namespace, prompt_ids: list[int]):
@@ -632,6 +832,13 @@ async def _self_generate_skill(args: Namespace, prompt_ids: list[int]):
         while skill_tokens and skill_tokens[-1] in stop_ids:
             skill_tokens.pop()
             skill_logprobs.pop()
+        # Thinking models (nemotron3, Qwen3, ...) prepend a <think>...</think>
+        # reasoning chain; the real skill is what follows </think>. Strip it at the
+        # token level so the dumped/KD skill is the actual roadmap, not the model's
+        # self-talk. No-op when --sdpo-remove-thinking-from-demonstration is off or
+        # the output has no </think>.
+        if getattr(args, "sdpo_remove_thinking_from_demonstration", False):
+            skill_tokens, skill_logprobs = _strip_think_tokens(tok, skill_tokens, skill_logprobs)
         if not skill_tokens:
             return None
         return tok.decode(skill_tokens), skill_tokens, skill_logprobs
@@ -1004,14 +1211,25 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # --sdpo-self-skill (on-policy, trainable) and --sdpo-trace-condense (external
         # LLM) both produce a skill prefix; running both is ambiguous.
         assert not (self_skill and condense), "use only one of --sdpo-self-skill / --sdpo-trace-condense"
+        # pitfall-condense skill-KD distils FAILED traces, so skill-source must cover them.
+        assert not (skill_kd and skill_kd_mode == "pitfall-condense" and skill_source not in ("incorrect", "all")), (
+            "--sdpo-skill-kd-mode pitfall-condense requires --sdpo-skill-source incorrect|all"
+        )
 
         response_prefix = getattr(args, "sdpo_response_prefix", "trace")
+        pitfall_backend = getattr(args, "sdpo_pitfall_summary_backend", "self")
+        # Pitfall injection is active when self-skill distils failed traces. In that
+        # mode the group's common failure lessons are spliced into FAILED traces'
+        # teacher prefix (and a failed trace with no correct peer still gets a prefix
+        # made of just those lessons).
+        pitfall_active = self_skill and skill_source in ("incorrect", "all")
 
         # Pass 1: pick each trace's correct peer (self-excluded). prefix_text is the
         # peer's solution — either the full response, or (with --sdpo-trace-condense)
-        # its distilled skill. Traces with no eligible peer get no prefix. peer_by_idx
-        # remembers the chosen peer so --sdpo-response-prefix skill can later swap in
-        # that peer's self-generated skill.
+        # its distilled skill. peer_by_idx remembers the chosen peer so
+        # --sdpo-response-prefix skill can later swap in that peer's skill. With
+        # pitfall injection, FAILED traces that have no correct peer still enter
+        # prefix_text_by_idx (empty base) so the shared pitfalls can be spliced in.
         prefix_text_by_idx: dict[int, str] = {}
         peer_by_idx: dict[int, int] = {}
         for i, sample in enumerate(group):
@@ -1022,7 +1240,14 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 continue
             peers = [j for j in correct_indices if j != i]
             if not peers:
-                sample.metadata["sdpo_teacher_prompt_tokens"] = []
+                # No correct peer. A FAILED trace under pitfall injection still gets a
+                # prefix (base empty; shared pitfalls appended in pass 2). Everyone
+                # else gets no prefix.
+                self_ok = bool(correctness[i]) if i < len(correctness) else False
+                if pitfall_active and not self_ok:
+                    prefix_text_by_idx[i] = ""
+                else:
+                    sample.metadata["sdpo_teacher_prompt_tokens"] = []
                 continue
             peer_j = random.choice(peers)
             peer_by_idx[i] = peer_j
@@ -1060,10 +1285,12 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
             async def _gen_one(i: int):
                 # Distill the trace's OWN response into a skill. For a correct trace
                 # this is "extract the transferable procedure"; for an incorrect one
-                # it flips to "diagnose the error -> pitfall-prevention skill" (the
-                # ground-truth answer is passed so the model knows where it failed).
+                # it flips to "diagnose the error -> pitfall warnings", tailored by WHY
+                # it failed (truncated | format | wrong). The ground-truth answer is
+                # passed so the model can localize where the attempt went wrong.
                 problem = _problem_of(i)
                 self_ok = bool(correctness[i]) if i < len(correctness) else False
+                fkind = "wrong" if self_ok else _failure_kind(args, group[i])
                 gen_prompt_ids = _skill_gen_prompt_ids(
                     args,
                     tok,
@@ -1071,6 +1298,7 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                     group[i].response,
                     correct=self_ok,
                     ground_truth=(group[i].label or "") if not self_ok else "",
+                    failure_kind=fkind,
                 )
                 res = await _self_generate_skill(args, gen_prompt_ids)
                 return i, gen_prompt_ids, res
@@ -1082,20 +1310,38 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 skill_text, skill_tokens, skill_logprobs = res
                 md = group[i].metadata
                 md["sdpo_skill"] = skill_text
+                # Preserve the per-trace pitfall (failed traces only) under a stable
+                # key: the pitfall-condense pass (⑤) later overwrites sdpo_skill with a
+                # problem-only prediction, but the group-pitfall summary (stage 2) and
+                # the ⑤ teacher's privileged info both need the ORIGINAL per-trace
+                # failure pitfalls.
+                self_ok_i = bool(correctness[i]) if i < len(correctness) else False
+                if not self_ok_i:
+                    md["sdpo_trace_pitfall"] = skill_text
                 # rollout-side skill metrics: length + perplexity (from the skill's
                 # own rollout logprobs). Surfaced as skill/* in _compute_metrics_from_samples.
                 md["sdpo_skill_len"] = float(len(skill_tokens))
                 if skill_logprobs:
                     _nll = -sum(skill_logprobs) / len(skill_logprobs)
                     md["sdpo_skill_ppl"] = math.exp(min(_nll, 20.0))
-                if skill_kd:
-                    # Skill-KD teacher hint (see DESIGN_self_skill.md):
+                # The skill's own tokens, the skill-gen prompt, and its rollout
+                # logprobs exist for EVERY generated skill, independent of skill-KD.
+                # Stash them unconditionally so the dump (skill_student_prompt_text /
+                # skill_text) shows the skill and the prompt that produced it even
+                # when skill-KD is off. The skill-KD *training* path is gated on
+                # --sdpo-skill-kd at its call site (actor._append_sdpo_skill_samples),
+                # not on these keys, so populating them here is dump-only and does not
+                # turn skill-KD on.
+                md["sdpo_skill_tokens"] = skill_tokens
+                md["sdpo_skill_prompt_tokens"] = gen_prompt_ids
+                md["sdpo_skill_rollout_logprobs"] = skill_logprobs
+                if skill_kd and skill_kd_mode in ("self-success", "problem-only"):
+                    # Skill-KD teacher hint (see DESIGN_self_skill.md), KD-only:
                     #  self-success: teacher = skill-gen prompt + the sample's OWN trace
                     #                as hint. (skill-source already restricts to correct.)
                     #  problem-only: teacher = skill-gen prompt, NO hint.
-                    md["sdpo_skill_tokens"] = skill_tokens
-                    md["sdpo_skill_prompt_tokens"] = gen_prompt_ids
-                    md["sdpo_skill_rollout_logprobs"] = skill_logprobs
+                    #  pitfall-condense: handled in a dedicated pass below (student is
+                    #                regenerated from a problem-only prompt).
                     if skill_kd_mode == "self-success":
                         gen_prompt_str = tok.decode(gen_prompt_ids)
                         skill_teacher_str = _build_teacher_prompt_str(
@@ -1106,6 +1352,61 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                         )
                     else:  # problem-only: no hint -> teacher context == student context
                         md["sdpo_skill_teacher_prompt_tokens"] = list(gen_prompt_ids)
+
+            # pitfall-condense skill-KD (⑤): a SEPARATE skill OPD on failed traces.
+            #  student = predict pitfalls from the PROBLEM ONLY (no attempt, no info);
+            #  teacher = same problem-only prompt + the group's per-trace failure
+            #            skills spliced in as privileged info.
+            #  KD target = the student's own problem-only pitfall generation.
+            # This regenerates the skill under the problem-only student context so the
+            # KD'd tokens match that context (the earlier per-trace pitfalls were
+            # generated with the failed attempt in context and are reused only as the
+            # teacher's privileged info).
+            if skill_kd and skill_kd_mode == "pitfall-condense":
+                failed_idxs = [
+                    i for i in skill_idxs
+                    if not (bool(correctness[i]) if i < len(correctness) else False)
+                    and isinstance(group[i].metadata, dict)
+                    and (group[i].metadata.get("sdpo_trace_pitfall") or "").strip()
+                ]
+                # Privileged failure info = all failed traces' per-trace pitfalls.
+                failure_info = "\n\n".join(
+                    (group[j].metadata.get("sdpo_trace_pitfall") or "").strip() for j in failed_idxs
+                )
+
+                async def _gen_predict(i: int):
+                    stu_text = tok.apply_chat_template(
+                        [
+                            {"role": "system", "content": _PITFALL_PREDICT_SYSTEM},
+                            {"role": "user", "content": _pitfall_predict_user_prompt(_problem_of(i))},
+                        ],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    stu_ids = tok.encode(stu_text, add_special_tokens=False)
+                    res2 = await _self_generate_skill(args, stu_ids)
+                    return i, stu_ids, res2
+
+                predict_results = await asyncio.gather(*(_gen_predict(i) for i in failed_idxs))
+                for i, stu_ids, res2 in predict_results:
+                    if res2 is None:
+                        continue
+                    p_text, p_tokens, p_logprobs = res2
+                    md = group[i].metadata
+                    # Overwrite the skill-KD payload with the problem-only student and
+                    # the failure-informed teacher. The KD student/target is now the
+                    # problem-only pitfall prediction.
+                    md["sdpo_skill"] = p_text
+                    md["sdpo_skill_len"] = float(len(p_tokens))
+                    if p_logprobs:
+                        _nll = -sum(p_logprobs) / len(p_logprobs)
+                        md["sdpo_skill_ppl"] = math.exp(min(_nll, 20.0))
+                    md["sdpo_skill_tokens"] = p_tokens
+                    md["sdpo_skill_prompt_tokens"] = stu_ids
+                    md["sdpo_skill_rollout_logprobs"] = p_logprobs
+                    stu_prompt_str = tok.decode(stu_ids)
+                    teacher_str = _build_failure_teacher_prompt_str(stu_prompt_str, gen_suffix, failure_info)
+                    md["sdpo_skill_teacher_prompt_tokens"] = tok.encode(teacher_str, add_special_tokens=False)
 
         # Optional: distill each chosen peer trace into a transferable SKILL and use
         # that as the prefix instead of the full trace (SkillOpt / trace_condense).
@@ -1148,41 +1449,73 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 if peer_skill:
                     prefix_text_by_idx[i] = peer_skill
 
-        # Group-aggregated pitfalls: when self-skill covers INCORRECT traces
-        # (--sdpo-skill-source incorrect|all), each failed trace produced a pitfall
-        # skill (mistakes to avoid, NOT a solution). Concatenate ALL of the group's
-        # failed-trace pitfalls into one block and append it to EVERY prefix, so the
-        # teacher sees the correct approach plus the full set of mistakes this group
-        # made on this problem. A model that failed cannot be trusted to rewrite the
-        # solution (that would hallucinate a bad KD target), but it CAN flag concrete
-        # errors — so incorrect traces contribute warnings, never solutions.
+        # Group-aggregated pitfalls (two stages), when self-skill covers INCORRECT
+        # traces (--sdpo-skill-source incorrect|all):
+        #   Stage 1 (above): every failed trace produced its OWN pitfall warnings.
+        #   Stage 2 (here): feed ALL of those per-trace pitfalls back to the skill
+        #     generator (self policy or external LLM, per --sdpo-pitfall-summary-
+        #     backend) and synthesize the COMMON recurring failure lessons into ONE
+        #     short shared list for the group.
+        # The shared list — not the raw concatenation — is spliced ONLY into the
+        # FAILED traces' teacher prefix (correct traces keep a clean correct-peer
+        # prefix). A model that failed cannot rewrite the solution (that would
+        # hallucinate a bad KD target), but it CAN flag concrete errors, so failed
+        # traces contribute warnings, never solutions.
         group_pitfalls = ""
-        if self_skill and skill_source in ("incorrect", "all"):
-            pit_texts = []
+        if pitfall_active:
+            def _problem_text(j: int) -> str:
+                md_j = group[j].metadata if isinstance(group[j].metadata, dict) else {}
+                q = md_j.get("question")
+                if q:
+                    return str(q)
+                p = group[j].prompt
+                return p if isinstance(p, str) else str(p)
+
+            per_trace_pitfalls = []
+            first_failed = None
             for i in range(len(group)):
                 self_ok = bool(correctness[i]) if i < len(correctness) else False
                 if self_ok:
                     continue
                 md = group[i].metadata if isinstance(group[i].metadata, dict) else {}
-                sk = md.get("sdpo_skill")
+                sk = md.get("sdpo_trace_pitfall")
                 if sk and sk.strip():
-                    pit_texts.append(sk.strip())
-            group_pitfalls = "\n\n".join(pit_texts)
+                    per_trace_pitfalls.append(sk.strip())
+                    if first_failed is None:
+                        first_failed = i
+            if len(per_trace_pitfalls) == 1:
+                # Only one failed trace -> nothing to synthesize; use it directly.
+                group_pitfalls = per_trace_pitfalls[0]
+            elif per_trace_pitfalls:
+                # Same problem across the group; use the first failed trace's text.
+                problem = _problem_text(first_failed)
+                summary = await _generate_skill_text(
+                    args,
+                    _PITFALL_SUMMARY_SYSTEM,
+                    _pitfall_summary_user_prompt(problem, per_trace_pitfalls),
+                    pitfall_backend,
+                )
+                group_pitfalls = summary.strip() if summary and summary.strip() else "\n\n".join(per_trace_pitfalls)
 
         # Pass 2: build the teacher prompt (peer solution/skill spliced into the USER
-        # turn, before the assistant marker) and tokenize.
+        # turn, before the assistant marker) and tokenize. The shared pitfalls go ONLY
+        # into failed traces' prefix; correct traces keep the clean correct-peer prefix.
         for i, sample in enumerate(group):
             if i not in prefix_text_by_idx:
                 continue
+            self_ok = bool(correctness[i]) if i < len(correctness) else False
+            pitfalls_for_i = group_pitfalls if (pitfall_active and not self_ok) else ""
             student_prompt = sample.prompt if isinstance(sample.prompt, str) else ""
             teacher_prompt_str = _build_teacher_prompt_str(
                 student_prompt, gen_suffix, prefix_text_by_idx[i], remove_thinking=remove_thinking,
-                pitfalls=group_pitfalls,
+                pitfalls=pitfalls_for_i,
             )
             teacher_prompt_ids = tok.encode(teacher_prompt_str, add_special_tokens=False)
             # Training side builds teacher seq = teacher_prompt_ids + response_ids,
             # response kept at the tail so response-span outputs stay aligned.
             sample.metadata["sdpo_teacher_prompt_tokens"] = teacher_prompt_ids
+            if isinstance(sample.metadata, dict):
+                sample.metadata["sdpo_group_pitfalls"] = pitfalls_for_i
         return rewards
 
     # SGLang teacher path (original): score each trace against the rollout engine
