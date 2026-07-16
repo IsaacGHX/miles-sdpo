@@ -1058,6 +1058,47 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_data[k].append(_placeholder(k, 1, rollout_data[k][0]))
 
         rollout_data["sdpo_is_skill"] = is_skill
+
+        # Interleave response + skill samples across the batch. Steps are carved by
+        # get_data_iterator sequentially (step i = samples[i*gbs:(i+1)*gbs]); with
+        # skill samples appended at the TAIL, the early steps would be pure-response
+        # and the late steps pure-skill, so per-step logs alternate 0 / value on
+        # entropy_loss vs sdpo_skill_kd_loss (a sawtooth on wandb). Spread each kind
+        # evenly so every step mixes both and its metrics are all non-zero.
+        #
+        # This is a REORDER ONLY — it changes which samples land in which step, not
+        # the sample count, global batch size, microbatch sizing, step count, LR
+        # schedule, or EMA cadence (all derived downstream from the same lists).
+        # Advantages are order-independent (per-sample; skill samples carry inert
+        # placeholder rewards), and per-step membership doesn't affect the summed,
+        # DP-all-reduced gradient. Keep the trailing dummies (is_skill=False, empty
+        # loss mask) at the very end untouched.
+        n_total = len(rollout_data["tokens"])
+        n_real = n_total - n_pad
+        resp_pos = [i for i in range(n_real) if not is_skill[i]]
+        skill_pos = [i for i in range(n_real) if is_skill[i]]
+        if resp_pos and skill_pos:
+            # Round-robin merge (evenly spread the smaller set through the larger).
+            merged: list[int] = []
+            a, b = (resp_pos, skill_pos) if len(resp_pos) >= len(skill_pos) else (skill_pos, resp_pos)
+            ratio = len(a) / len(b)
+            bi = 0.0
+            ai = 0
+            next_b = 0
+            while ai < len(a) or next_b < len(b):
+                # emit from the larger set, injecting from the smaller on schedule
+                if next_b < len(b) and (ai >= len(a) or ai >= (next_b + 1) * ratio):
+                    merged.append(b[next_b])
+                    next_b += 1
+                else:
+                    merged.append(a[ai])
+                    ai += 1
+            perm = merged + list(range(n_real, n_total))  # dummies stay at the tail
+            assert sorted(perm) == list(range(n_total)), "interleave permutation must be a bijection"
+            for k, v in list(rollout_data.items()):
+                if isinstance(v, list) and len(v) == n_total:
+                    rollout_data[k] = [v[p] for p in perm]
+
         # bshd needs a consistent max_seq_len across all (response+skill) samples.
         if self.args.qkv_format == "bshd" and "max_seq_lens" in rollout_data:
             msl = max(rollout_data["total_lengths"])
