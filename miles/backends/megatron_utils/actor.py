@@ -884,20 +884,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
         device = torch.cuda.current_device()
 
-        def _pack(prompt_ids_list):
-            toks, totals, masks, resp_lens = [], [], [], []
-            for i in range(len(skill_tokens_list)):
-                skill_ids = list(skill_tokens_list[i]) if skill_tokens_list[i] else []
-                prompt_ids = list(prompt_ids_list[i]) if (i < len(prompt_ids_list) and prompt_ids_list[i]) else []
-                if not skill_ids or not prompt_ids:
-                    continue
-                seq = prompt_ids + skill_ids
-                toks.append(seq)
-                totals.append(len(seq))
-                masks.append([1] * len(skill_ids))
-                resp_lens.append(len(skill_ids))
-            return toks, totals, masks, resp_lens
-
+        # A skill sample is KD-eligible only when its tokens, STUDENT prompt, AND
+        # TEACHER prompt are all present. Compute this index set ONCE and drive both
+        # _pack and skill_idx from it, so student_rd / teacher_rd / skill_idx stay
+        # index-aligned. (Previously _pack filtered on tokens+prompt only while
+        # skill_idx also required the teacher prompt; a sample with an empty teacher
+        # prompt then landed in _pack but not skill_idx, shifting every later entry
+        # and pairing skill tokens with the wrong response_length — which blew up
+        # log_rollout_data's split-by-response_lengths.)
         skill_idx = [
             i
             for i in range(len(skill_tokens_list))
@@ -909,6 +903,18 @@ class MegatronTrainRayActor(TrainRayActor):
         ]
         if not skill_idx:
             return None, None, []
+
+        def _pack(prompt_ids_list):
+            toks, totals, masks, resp_lens = [], [], [], []
+            for i in skill_idx:
+                skill_ids = list(skill_tokens_list[i])
+                prompt_ids = list(prompt_ids_list[i])
+                seq = prompt_ids + skill_ids
+                toks.append(seq)
+                totals.append(len(seq))
+                masks.append([1] * len(skill_ids))
+                resp_lens.append(len(skill_ids))
+            return toks, totals, masks, resp_lens
 
         def _make(prompt_ids_list):
             toks, totals, masks, resp_lens = _pack(prompt_ids_list)
@@ -1032,12 +1038,25 @@ class MegatronTrainRayActor(TrainRayActor):
                 if k == "rollout_log_probs":
                     # skill's own rollout logprobs (for the IS ratio); else zeros.
                     lp = skill_rollout_lp[orig_i] if (skill_rollout_lp and orig_i < len(skill_rollout_lp)) else None
+                    if lp is not None and not torch.is_tensor(lp):
+                        lp = torch.tensor(lp, dtype=torch.float32, device=device) if lp else None
                     if torch.is_tensor(lp):
-                        rollout_data[k].append(lp.to(device))
-                    elif lp:
-                        rollout_data[k].append(torch.tensor(lp, dtype=torch.float32, device=device))
+                        lp = lp.to(device)
                     else:
-                        rollout_data[k].append(torch.zeros((rl,), device=device))
+                        lp = torch.zeros((rl,), device=device)
+                    # CRITICAL: this per-token tensor MUST have length == rl (the
+                    # skill sample's response_length), or log_rollout_data's
+                    # concat-then-split-by-response_lengths crashes, and the KD IS
+                    # ratio (guarded on numel==n) silently drops. The rollout
+                    # logprobs can drift from len(skill_tokens) — e.g. </think>
+                    # stripping trims skill_tokens but not the captured logprobs, or
+                    # a max-new-tokens hit. Force-align to rl (pad with zeros / clip).
+                    if lp.numel() != rl:
+                        fixed = torch.zeros((rl,), dtype=lp.dtype, device=device)
+                        c = min(rl, lp.numel())
+                        fixed[:c] = lp[:c]
+                        lp = fixed
+                    rollout_data[k].append(lp)
                 else:
                     rollout_data[k].append(_placeholder(k, rl, rollout_data[k][0]))
 
