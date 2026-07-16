@@ -434,8 +434,25 @@ def aggregate_train_losses(
     values = values.tolist()
     num_samples_or_tokens = values[0]
 
-    for key, value in zip(keys, values[1:], strict=False):
-        loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
+    # Per-key denominator overrides: a "__denom__<key>" entry carries a summed count
+    # (e.g. response-only token count for entropy_loss under skill-KD) that <key>
+    # should be divided by instead of the batch-wide num_samples_or_tokens. Both the
+    # numerator and its __denom__ accumulate over the same mb/DP sum, so the ratio is
+    # exact. The __denom__ entries are not surfaced as metrics themselves.
+    key_to_value = dict(zip(keys, values[1:], strict=False))
+    denom_overrides = {
+        k[len("__denom__") :]: v for k, v in key_to_value.items() if k.startswith("__denom__")
+    }
+
+    for key, value in key_to_value.items():
+        if key.startswith("__denom__"):
+            continue
+        denom = denom_overrides.get(key)
+        if denom is not None:
+            # value and denom are both cp-summed already; cp.size cancels in the ratio.
+            loss_reduced[key] = value / denom if denom else 0.0
+        else:
+            loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
 
     return loss_reduced
 

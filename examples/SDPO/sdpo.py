@@ -560,11 +560,40 @@ _ANSWER_FORMAT_PATTERNS = [
 ]
 
 
+# Chat-template scaffolding. A rollout sample.prompt for DAPO math is the FULL
+# chat-templated string (system turn + user turn + assistant marker), NOT the raw
+# question — SciKnowEval instead carries the raw question in metadata["question"].
+# If we embed the whole templated string as the "PROBLEM" inside the skill-gen
+# prompt, we NEST a chat template: the model sees a second <|im_start|>system turn
+# (e.g. "You are a helpful function-calling assistant") whose instructions conflict
+# with the skill/pitfall system prompt, and the two get confused (solution skills
+# grow "Avoid ..." bullets, pitfall skills drop them). Strip the scaffolding down to
+# the last user turn's content so the generator sees only the actual problem.
+_CHAT_USER_BLOCK = re.compile(
+    r"<\|im_start\|>\s*user\s*\n(.*?)<\|im_end\|>", re.DOTALL
+)
+
+
+def _strip_chat_template(text: str) -> str:
+    """Recover the raw user-turn text from a chat-templated prompt. Returns the LAST
+    user block's content if the template markers are present; otherwise returns the
+    input unchanged (already raw, e.g. SciKnowEval's metadata['question'])."""
+    if not text or "<|im_start|>" not in text:
+        return text
+    matches = _CHAT_USER_BLOCK.findall(text)
+    if matches:
+        return matches[-1].strip()
+    # Markers present but no closed user block (unusual template): drop everything
+    # up to a 'user' header and the trailing assistant marker as a best effort.
+    return text
+
+
 def _clean_problem_for_skill(problem: str) -> str:
-    """Remove answer-format instructions from the problem so the skill generator
-    sees only the math, not 'put your answer in \\boxed{}' (which leaks the answer
-    format into the skill)."""
-    out = problem or ""
+    """Remove chat-template scaffolding AND answer-format instructions from the
+    problem so the skill generator sees only the math — not a nested system turn
+    (which confuses solution vs pitfall skills) or 'put your answer in \\boxed{}'
+    (which leaks the answer format into the skill)."""
+    out = _strip_chat_template(problem or "")
     for pat in _ANSWER_FORMAT_PATTERNS:
         out = pat.sub("", out)
     return out.strip()

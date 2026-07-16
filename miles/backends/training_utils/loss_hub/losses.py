@@ -443,6 +443,15 @@ def policy_loss_function(
 
     entropy_loss = pg_loss.new_zeros(())
     skill_entropy = pg_loss.new_zeros(())
+    # Per-key denominator override for train/entropy_loss. train/entropy_loss must
+    # keep its ORIGINAL meaning: the mean entropy over the TRAIN-ROLLOUT (response)
+    # tokens only. But skill-KD appends skill samples, and aggregate_train_losses
+    # divides every metric by the batch-wide token count (response + skill). Report
+    # the response-token count as entropy_loss's own denominator so the metric is a
+    # pure response-token mean regardless of how many skill samples were appended.
+    # (calculate_per_token_loss => sum_of_token returns a raw response-token SUM, so
+    # dividing by the summed response-token count is exact under the mb/DP reduce.)
+    entropy_denom = None
     loss = pg_loss
     if calculate_entropy:
         entropy = log_probs_and_entropy["entropy"]
@@ -453,6 +462,10 @@ def policy_loss_function(
             resp_ent = torch.where(skill_tok_mask, entropy.new_zeros(()), entropy)
             entropy_loss = sum_of_sample_mean(resp_ent)
             skill_entropy = sum_of_sample_mean(torch.where(skill_tok_mask, entropy, entropy.new_zeros(()))).detach()
+            if args.calculate_per_token_loss:
+                # response-token count (skill tokens excluded) for the denominator,
+                # via the SAME reducer as the numerator so cp/mb reduction matches.
+                entropy_denom = sum_of_sample_mean((~skill_tok_mask).to(entropy.dtype))
         else:
             entropy_loss = sum_of_sample_mean(entropy)
         if args.entropy_coef != 0:
@@ -567,6 +580,12 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
+
+    # Per-key denominator for entropy_loss (see the entropy block): a "__denom__<key>"
+    # entry tells aggregate_train_losses to divide <key> by this summed count instead
+    # of the batch-wide token count, so train/entropy_loss stays a response-only mean.
+    if entropy_denom is not None:
+        reported_loss["__denom__entropy_loss"] = entropy_denom.clone().detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
