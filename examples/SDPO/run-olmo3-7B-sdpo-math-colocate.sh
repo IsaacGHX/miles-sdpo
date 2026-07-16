@@ -174,7 +174,11 @@ GRPO_ARGS=(
    --sdpo-ema-teacher-rate 0.05
    --sdpo-logprob-mode topk
    --opd-log-prob-top-k 100
-   --sdpo-divergence jsd
+   # jeffrey_jsd = forward KL + JSD (Jeffrey with its reverse-KL half swapped for the
+   # milder, bounded JSD). Keeps forward-KL mass-covering while the JSD term is far
+   # less mode-seeking than a raw reverse KL, so it distills hard without collapsing
+   # entropy as fast. (reverse_kl | forward_kl | jsd | jeffrey | jeffrey_jsd)
+   --sdpo-divergence jeffrey_jsd
    --sdpo-is-clip 2.0
    --sdpo-kd-loss
    --sdpo-kd-coef 1.0

@@ -1256,12 +1256,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--sdpo-divergence",
                 type=str,
-                choices=["reverse_kl", "forward_kl", "jsd", "jeffrey"],
+                choices=["reverse_kl", "forward_kl", "jsd", "jeffrey", "jeffrey_jsd"],
                 default="jsd",
                 help=(
                     "Divergence used by the SDPO example (examples/SDPO/sdpo.py) between the teacher "
                     "distribution (conditioned on a correct peer prefix) and the student distribution "
-                    "(original rollout, no prefix)."
+                    "(original rollout, no prefix). 'jeffrey' = forward KL + reverse KL (symmetric). "
+                    "'jeffrey_jsd' = forward KL + JSD (Jeffrey with the reverse-KL half swapped for "
+                    "the milder, bounded JSD — less mode-seeking / entropy collapse)."
                 ),
             )
             parser.add_argument(

@@ -193,8 +193,11 @@ def _build_failure_teacher_prompt_str(student_prompt: str, gen_suffix: str, fail
 
 def _divergence_mode(args: Namespace) -> str:
     mode = getattr(args, "sdpo_divergence", "jsd")
-    if mode not in ("reverse_kl", "forward_kl", "jsd"):
-        raise ValueError(f"Unknown --sdpo-divergence {mode!r}; use reverse_kl | forward_kl | jsd.")
+    if mode not in ("reverse_kl", "forward_kl", "jsd", "jeffrey", "jeffrey_jsd"):
+        raise ValueError(
+            f"Unknown --sdpo-divergence {mode!r}; use "
+            "reverse_kl | forward_kl | jsd | jeffrey | jeffrey_jsd."
+        )
     return mode
 
 
@@ -926,11 +929,19 @@ def _distribution_divergence(p_s: Sequence[float], p_t: Sequence[float], mode: s
         return sum(s * math.log((s + eps) / (t + eps)) for s, t in zip(p_s, p_t, strict=True))
     if mode == "forward_kl":
         return sum(t * math.log((t + eps) / (s + eps)) for s, t in zip(p_s, p_t, strict=True))
-    if mode == "jeffrey":
+    if mode == "jeffrey":  # forward KL + reverse KL
         return sum(
             s * math.log((s + eps) / (t + eps)) + t * math.log((t + eps) / (s + eps))
             for s, t in zip(p_s, p_t, strict=True)
         )
+    if mode == "jeffrey_jsd":  # forward KL + JSD (reverse-KL half swapped for JSD)
+        total = 0.0
+        for s, t in zip(p_s, p_t, strict=True):
+            m = 0.5 * (s + t)
+            fkl = t * math.log((t + eps) / (s + eps))
+            jsd = 0.5 * s * math.log((s + eps) / (m + eps)) + 0.5 * t * math.log((t + eps) / (m + eps))
+            total += fkl + jsd
+        return total
     total = 0.0  # jsd
     for s, t in zip(p_s, p_t, strict=True):
         m = 0.5 * (s + t)

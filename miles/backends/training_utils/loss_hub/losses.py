@@ -29,11 +29,12 @@ from miles.utils.types import RolloutBatch
 
 
 def _sdpo_alpha_from_args(args: Namespace) -> float:
-    """Map --sdpo-divergence to the original SDPO alpha (0=forward KL[default],
-    1=reverse KL, 0.5=JSD). jeffrey isn't an alpha-mixture, so approximate as JSD
-    (symmetric); use reverse/forward explicitly if you want the pure KLs."""
+    """Map --sdpo-divergence to the original SDPO alpha for the ALPHA-MIXTURE modes
+    (0=forward KL[default], 1=reverse KL, 0.5=JSD). The additive modes (jeffrey,
+    jeffrey_jsd) are NOT alpha-mixtures and are handled separately in the KD loss;
+    this returns 0.0 for them (unused)."""
     mode = getattr(args, "sdpo_divergence", "forward_kl")
-    return {"forward_kl": 0.0, "reverse_kl": 1.0, "jsd": 0.5, "jeffrey": 0.5}.get(mode, 0.0)
+    return {"forward_kl": 0.0, "reverse_kl": 1.0, "jsd": 0.5}.get(mode, 0.0)
 
 
 def _sdpo_add_tail_logprobs(log_probs: torch.Tensor) -> torch.Tensor:
@@ -79,7 +80,12 @@ def _sdpo_kd_loss_per_token(
     tp_group = parallel_state.tp.group
     device = logits.device
 
-    # alpha convention (original): 0.0 = forward KL, 1.0 = reverse KL, else GJSD.
+    # Divergence mode. Alpha-mixture modes (forward_kl/reverse_kl/jsd) use `alpha`
+    # below (0.0 = forward KL, 1.0 = reverse KL, 0.5 = JSD). Additive modes are:
+    #   jeffrey      = forward KL + reverse KL           (symmetric, RKL + FKL)
+    #   jeffrey_jsd  = forward KL + JSD                  (Jeffrey with its RKL half
+    #                  swapped for the milder, bounded JSD — less mode-seeking)
+    div_mode = getattr(args, "sdpo_divergence", "forward_kl")
     alpha = _sdpo_alpha_from_args(args)
     add_tail = getattr(args, "sdpo_distillation_add_tail", True)
     is_clip = getattr(args, "sdpo_is_clip", 2.0)
@@ -130,20 +136,36 @@ def _sdpo_kd_loss_per_token(
             student_lp = student_lp - torch.logsumexp(student_lp, dim=-1, keepdim=True)
             teacher_lp = teacher_lp - torch.logsumexp(teacher_lp, dim=-1, keepdim=True)
 
-        # F.kl_div(input=log-prob, target, log_target=True) = sum target*(logtarget-input)
-        if alpha == 0.0:  # forward KL: KL(teacher ‖ student)
-            kl = F.kl_div(student_lp, teacher_lp, reduction="none", log_target=True)
-        elif alpha == 1.0:  # reverse KL: KL(student ‖ teacher)
-            kl = F.kl_div(teacher_lp, student_lp, reduction="none", log_target=True)
-        else:  # generalized JSD via log-mixture
-            a = torch.tensor(alpha, dtype=student_lp.dtype, device=student_lp.device)
+        # Per-token divergence terms in LOG space. F.kl_div(input=log-prob, target,
+        # log_target=True) = sum target*(logtarget - input), summed over the vocab
+        # axis to get a [m] per-token value.
+        def _forward_kl() -> torch.Tensor:  # KL(teacher ‖ student), mass-covering
+            return F.kl_div(student_lp, teacher_lp, reduction="none", log_target=True).sum(-1)
+
+        def _reverse_kl() -> torch.Tensor:  # KL(student ‖ teacher), mode-seeking
+            return F.kl_div(teacher_lp, student_lp, reduction="none", log_target=True).sum(-1)
+
+        def _jsd(a: float = 0.5) -> torch.Tensor:  # generalized JSD via log-mixture
+            at = torch.tensor(a, dtype=student_lp.dtype, device=student_lp.device)
             mixture_lp = torch.logsumexp(
-                torch.stack([student_lp + torch.log1p(-a), teacher_lp + torch.log(a)]), dim=0
+                torch.stack([student_lp + torch.log1p(-at), teacher_lp + torch.log(at)]), dim=0
             )
             kl_teacher = F.kl_div(mixture_lp, teacher_lp, reduction="none", log_target=True)
             kl_student = F.kl_div(mixture_lp, student_lp, reduction="none", log_target=True)
-            kl = torch.lerp(kl_student, kl_teacher, alpha)
-        d = kl.sum(-1)  # [m] per-token divergence over the first m positions
+            return torch.lerp(kl_student, kl_teacher, a).sum(-1)
+
+        if div_mode == "jeffrey":
+            # Jeffrey = forward KL + reverse KL (symmetric; RKL with an added FKL).
+            d = _forward_kl() + _reverse_kl()
+        elif div_mode == "jeffrey_jsd":
+            # Jeffrey with the reverse-KL half replaced by JSD (milder, bounded).
+            d = _forward_kl() + _jsd()
+        elif alpha == 0.0:
+            d = _forward_kl()
+        elif alpha == 1.0:
+            d = _reverse_kl()
+        else:
+            d = _jsd(alpha)
 
         # Importance-sampling ratio correction (off-policy/async), on sampled token.
         if is_clip is not None and old_lp_list is not None and idx < len(old_lp_list):
