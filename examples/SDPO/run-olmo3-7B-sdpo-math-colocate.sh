@@ -39,9 +39,9 @@ echo "SDPO dump dir: ${DUMP_DIR}"
 CKPT_ARGS=(
    --hf-checkpoint /root/Olmo-3-7B-Instruct
    --ref-load /root/Olmo-3-7B-Instruct_torch_dist
-   --load /root/Olmo-3-7B-Instruct_miles/
-   --save /root/Olmo-3-7B-Instruct_miles/
-   --save-interval 50
+   # --load /root/Olmo-3-7B-Instruct_miles/
+   # --save /root/Olmo-3-7B-Instruct_miles/
+   # --save-interval 50
    --dump-details "${DUMP_DIR}"
    # skip the heavy per-token train_data/*.pt and policy_loss_debug/*.pt dumps;
    # keep rollout_data + sdpo_prompts + skill dumps.
@@ -106,9 +106,14 @@ RM_ARGS=(
    #  pitfall-condense : FAILED traces (needs skill-source incorrect|all); student =
    #                     predict pitfalls from the PROBLEM ONLY, teacher = same prompt
    #                     + the group's per-trace failure pitfalls as privileged info.
-   # --sdpo-skill-kd
+   #  both            : (needs skill-source all) correct traces -> self-success KD on
+   #                     the solution-skill AND failed traces -> pitfall-condense KD on
+   #                     the pitfall. Trains both skill flavors at once.
+   # Enable the second SDPO objective ON THE SKILL'S OWN TOKENS (the skill KD
+   # training target): loss += sdpo-skill-kd-coef * D(student_skill ‖ teacher_skill).
+   --sdpo-skill-kd
    --sdpo-skill-kd-coef 1.0
-   --sdpo-skill-kd-mode self-success
+   --sdpo-skill-kd-mode both
    # Response-SDPO teacher prefix = the correct peer's SKILL (not its full trace).
    # Needs --sdpo-self-skill + --sdpo-skill-source covering correct peers (it does).
    # Falls back to the trace if a peer has no skill.
@@ -205,8 +210,7 @@ SGLANG_ARGS=(
    # each GPU; colocate onloads/offloads around each phase. Raise cautiously if
    # rollout underutilizes memory; drop if the logits_processor OOMs on a long batch.
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.9
-   --sglang-chunked-prefill-size 8192
+   --sglang-mem-fraction-static 0.85
    --sglang-router-policy round_robin
 )
 

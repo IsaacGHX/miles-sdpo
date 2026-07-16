@@ -1575,7 +1575,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--sdpo-skill-kd-mode",
                 type=str,
-                choices=["self-success", "problem-only", "pitfall-condense"],
+                choices=["self-success", "problem-only", "pitfall-condense", "both"],
                 default="self-success",
                 help=(
                     "Which skills get skill-KD and what the teacher hint is. 'self-success': only "
@@ -1584,7 +1584,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "hint (regularization toward the EMA teacher's skill, no correct-answer info). "
                     "'pitfall-condense': for FAILED traces (skill-source incorrect|all); teacher = "
                     "the problem-solving prompt with the trace's own generated pitfalls as the "
-                    "privileged hint, distilling the group's per-trace pitfalls."
+                    "privileged hint, distilling the group's per-trace pitfalls. 'both' (requires "
+                    "skill-source all): correct traces use the self-success solution-skill KD AND "
+                    "failed traces use the pitfall-condense KD, so both skill flavors are trained."
                 ),
             )
             parser.add_argument(

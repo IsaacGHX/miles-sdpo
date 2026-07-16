@@ -1211,9 +1211,15 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # --sdpo-self-skill (on-policy, trainable) and --sdpo-trace-condense (external
         # LLM) both produce a skill prefix; running both is ambiguous.
         assert not (self_skill and condense), "use only one of --sdpo-self-skill / --sdpo-trace-condense"
-        # pitfall-condense skill-KD distils FAILED traces, so skill-source must cover them.
+        # pitfall-condense (and the pitfall half of 'both') distils FAILED traces, so
+        # skill-source must cover them. 'both' additionally does self-success on correct
+        # traces, so it wants BOTH flavors -> require skill-source all.
         assert not (skill_kd and skill_kd_mode == "pitfall-condense" and skill_source not in ("incorrect", "all")), (
             "--sdpo-skill-kd-mode pitfall-condense requires --sdpo-skill-source incorrect|all"
+        )
+        assert not (skill_kd and skill_kd_mode == "both" and skill_source != "all"), (
+            "--sdpo-skill-kd-mode both trains correct (self-success) AND failed "
+            "(pitfall-condense) traces, so it requires --sdpo-skill-source all"
         )
 
         response_prefix = getattr(args, "sdpo_response_prefix", "trace")
@@ -1335,14 +1341,18 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 md["sdpo_skill_tokens"] = skill_tokens
                 md["sdpo_skill_prompt_tokens"] = gen_prompt_ids
                 md["sdpo_skill_rollout_logprobs"] = skill_logprobs
-                if skill_kd and skill_kd_mode in ("self-success", "problem-only"):
-                    # Skill-KD teacher hint (see DESIGN_self_skill.md), KD-only:
-                    #  self-success: teacher = skill-gen prompt + the sample's OWN trace
-                    #                as hint. (skill-source already restricts to correct.)
-                    #  problem-only: teacher = skill-gen prompt, NO hint.
-                    #  pitfall-condense: handled in a dedicated pass below (student is
-                    #                regenerated from a problem-only prompt).
-                    if skill_kd_mode == "self-success":
+                # Skill-KD teacher hint (see DESIGN_self_skill.md), KD-only:
+                #  self-success: teacher = skill-gen prompt + the sample's OWN trace
+                #                as hint. (skill-source already restricts to correct.)
+                #  problem-only: teacher = skill-gen prompt, NO hint.
+                #  pitfall-condense: handled in a dedicated pass below (student is
+                #                regenerated from a problem-only prompt).
+                #  both: correct traces take the self-success teacher here; failed
+                #                traces are handled by the pitfall-condense pass below.
+                self_ok_kd = bool(correctness[i]) if i < len(correctness) else False
+                use_self_success = skill_kd_mode == "self-success" or (skill_kd_mode == "both" and self_ok_kd)
+                if skill_kd and (use_self_success or skill_kd_mode == "problem-only"):
+                    if use_self_success:
                         gen_prompt_str = tok.decode(gen_prompt_ids)
                         skill_teacher_str = _build_teacher_prompt_str(
                             gen_prompt_str, gen_suffix, group[i].response, remove_thinking=remove_thinking
@@ -1362,7 +1372,9 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
             # KD'd tokens match that context (the earlier per-trace pitfalls were
             # generated with the failed attempt in context and are reused only as the
             # teacher's privileged info).
-            if skill_kd and skill_kd_mode == "pitfall-condense":
+            if skill_kd and skill_kd_mode in ("pitfall-condense", "both"):
+                # 'both' also runs self-success on correct traces (handled above); here
+                # we only (re)build the FAILED traces' skill-KD via pitfall-condense.
                 failed_idxs = [
                     i for i in skill_idxs
                     if not (bool(correctness[i]) if i < len(correctness) else False)
