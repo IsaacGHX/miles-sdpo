@@ -957,6 +957,76 @@ class MegatronTrainRayActor(TrainRayActor):
             rd["max_seq_lens"] = [rd["max_seq_lens"][0]] * len(rd["tokens"])
         return n_real
 
+    def _pad_rollout_to_dp_agreed_count(self, rollout_data, is_skill, gbs, device, sk_lp, sk_ids) -> int:
+        """Pad rollout_data with inert 1-token dummies up to a count that is (a) a
+        multiple of gbs and (b) IDENTICAL across all DP ranks. Returns n_pad.
+
+        CRITICAL (DP collective): each DP rank appends a DIFFERENT number of skill
+        samples (its local correct/incorrect trace count varies), so a purely-local
+        pad to a gbs multiple would leave ranks with DIFFERENT sample counts ->
+        DIFFERENT num_steps_per_rollout (= num_local_samples // gbs). get_data_iterator
+        then all-reduces a num_microbatches tensor whose LENGTH is num_steps, so
+        mismatched step counts crash/hang the collective. Agree on a common padded
+        count = the batch-wide MAX (rounded up to a gbs multiple) so every rank runs
+        the same number of training steps. EVERY rank (including ones with no skill
+        samples) must call this so the MAX all-reduce doesn't desync. Extra dummies
+        are inert: is_skill=False, empty loss mask -> zero loss, zero grad.
+        """
+        local_count = len(rollout_data["tokens"])
+        target_count = ((local_count + gbs - 1) // gbs) * gbs if gbs > 0 else local_count
+        try:
+            t = torch.tensor([target_count], device=device, dtype=torch.long)
+            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=get_parallel_state().intra_dp.group)
+            target_count = int(t.item())
+        except Exception as e:
+            logger.warning(f"[SDPO skill-KD] DP count all-reduce failed ({e!r}); using local pad.")
+        n_pad = target_count - local_count
+        if n_pad <= 0:
+            return 0
+
+        # Empty teacher top-k slices matching the real entries' tensor type. Prefer an
+        # existing skill teacher tensor; else derive an empty one from the response
+        # teacher target already in rollout_data.
+        def _empty_like_topk(key):
+            if sk_lp is not None and key == "sdpo_teacher_topk_logprobs" and len(sk_lp):
+                return sk_lp[0][:0]
+            if sk_ids is not None and key == "sdpo_teacher_topk_ids" and len(sk_ids):
+                return sk_ids[0][:0]
+            lst = rollout_data.get(key)
+            if lst:
+                return lst[0][:0]
+            return torch.zeros((0,), device=device)
+
+        explicit = {
+            "tokens", "total_lengths", "response_lengths", "loss_masks",
+            "sdpo_teacher_topk_logprobs", "sdpo_teacher_topk_ids", "sdpo_is_skill", "max_seq_lens",
+        }
+        list_keys = [
+            k for k, v in rollout_data.items()
+            if isinstance(v, list) and len(v) == local_count and k not in explicit
+        ]
+
+        def _placeholder(template):
+            if torch.is_tensor(template):
+                return torch.zeros((1,), dtype=template.dtype, device=template.device)
+            if isinstance(template, (list, tuple)):
+                return type(template)([0.0])
+            return 0.0
+
+        for _ in range(n_pad):
+            rollout_data["tokens"].append(torch.tensor([0], dtype=torch.long, device=device))
+            rollout_data["total_lengths"].append(1)
+            rollout_data["response_lengths"].append(1)
+            rollout_data["loss_masks"].append(torch.zeros((1,), dtype=torch.int, device=device))
+            if "sdpo_teacher_topk_logprobs" in rollout_data:
+                rollout_data["sdpo_teacher_topk_logprobs"].append(_empty_like_topk("sdpo_teacher_topk_logprobs"))
+            if "sdpo_teacher_topk_ids" in rollout_data:
+                rollout_data["sdpo_teacher_topk_ids"].append(_empty_like_topk("sdpo_teacher_topk_ids"))
+            is_skill.append(False)
+            for k in list_keys:
+                rollout_data[k].append(_placeholder(rollout_data[k][0]))
+        return n_pad
+
     def _append_sdpo_skill_samples(self, rollout_data: RolloutBatch, topk: int) -> None:
         """Compute the skill teacher top-k and APPEND the skill sequences to
         rollout_data as extra training samples (tagged sdpo_is_skill). The response
@@ -967,14 +1037,20 @@ class MegatronTrainRayActor(TrainRayActor):
         n_resp = len(rollout_data["tokens"])
         # Mark existing (response) samples as non-skill up front.
         is_skill = [False] * n_resp
+        device = torch.cuda.current_device()
+        gbs = self._num_local_gbs()
 
         student_rd, teacher_rd, skill_idx = self._build_sdpo_skill_rollout_data(rollout_data)
         if not skill_idx:
+            # This rank has no skill samples. Other DP ranks may still append some and
+            # pad the batch UP, changing num_steps_per_rollout. We must agree on the
+            # SAME padded sample count on every rank (see the DP-collective note in the
+            # pad block below) or get_data_iterator's num_microbatches all-reduce
+            # (length == num_steps) desyncs and hangs. Participate in the MAX all-reduce
+            # with our own count, then pad to the agreed target with inert dummies.
             rollout_data["sdpo_is_skill"] = is_skill
+            self._pad_rollout_to_dp_agreed_count(rollout_data, is_skill, gbs, device, None, None)
             return
-
-        device = torch.cuda.current_device()
-        gbs = self._num_local_gbs()
 
         # Teacher top-k over the skill (skill_teacher_prompt + skill_tokens). Pad the
         # sub-batch to a num_local_gbs multiple so get_data_iterator accepts it, then
@@ -1060,22 +1136,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     rollout_data[k].append(_placeholder(k, rl, rollout_data[k][0]))
 
-        # Pad the (response + skill) batch to a num_local_gbs multiple with inert
-        # 1-token dummies (empty loss mask, empty teacher top-k, is_skill=False ->
-        # no KD, zero everything) so get_data_iterator in train_actor accepts it.
-        n_pad = (-len(rollout_data["tokens"])) % gbs
-        for _ in range(n_pad):
-            rollout_data["tokens"].append(torch.tensor([0], dtype=torch.long, device=device))
-            rollout_data["total_lengths"].append(1)
-            rollout_data["response_lengths"].append(1)
-            rollout_data["loss_masks"].append(torch.zeros((1,), dtype=torch.int, device=device))
-            # empty teacher target (tensor slice, matching the real entries' type)
-            rollout_data["sdpo_teacher_topk_logprobs"].append(sk_lp[0][:0])
-            rollout_data["sdpo_teacher_topk_ids"].append(sk_ids[0][:0])
-            is_skill.append(False)
-            for k in list_keys:
-                rollout_data[k].append(_placeholder(k, 1, rollout_data[k][0]))
-
+        # Pad the (response + skill) batch to a DP-agreed count with inert 1-token
+        # dummies so get_data_iterator accepts it AND every DP rank runs the same
+        # number of training steps (see _pad_rollout_to_dp_agreed_count).
+        n_pad = self._pad_rollout_to_dp_agreed_count(rollout_data, is_skill, gbs, device, sk_lp, sk_ids)
         rollout_data["sdpo_is_skill"] = is_skill
 
         # Interleave response + skill samples across the batch. Steps are carved by
