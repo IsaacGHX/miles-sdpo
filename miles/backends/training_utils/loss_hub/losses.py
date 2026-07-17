@@ -451,6 +451,14 @@ def policy_loss_function(
     # pure response-token mean regardless of how many skill samples were appended.
     # (calculate_per_token_loss => sum_of_token returns a raw response-token SUM, so
     # dividing by the summed response-token count is exact under the mb/DP reduce.)
+    # Whether this RUN uses skill-KD (a run-level flag, NOT per-microbatch). The
+    # reported_loss key set must be identical across every microbatch, because
+    # aggregate_train_losses sums the value tensors positionally — so the
+    # __denom__entropy_loss key must be emitted for ALL microbatches of a skill-KD
+    # run, even ones that happen to contain no skill samples (after interleaving,
+    # some microbatches are pure-response). Keying it off the per-microbatch
+    # skill_tok_mask made the key count vary (13 vs 14) and crashed the reduce.
+    skill_kd_run = bool(getattr(args, "sdpo_skill_kd", False)) and args.calculate_per_token_loss
     entropy_denom = None
     loss = pg_loss
     if calculate_entropy:
@@ -462,12 +470,17 @@ def policy_loss_function(
             resp_ent = torch.where(skill_tok_mask, entropy.new_zeros(()), entropy)
             entropy_loss = sum_of_sample_mean(resp_ent)
             skill_entropy = sum_of_sample_mean(torch.where(skill_tok_mask, entropy, entropy.new_zeros(()))).detach()
-            if args.calculate_per_token_loss:
-                # response-token count (skill tokens excluded) for the denominator,
-                # via the SAME reducer as the numerator so cp/mb reduction matches.
-                entropy_denom = sum_of_sample_mean((~skill_tok_mask).to(entropy.dtype))
+            resp_tok_mask = (~skill_tok_mask).to(entropy.dtype)
         else:
             entropy_loss = sum_of_sample_mean(entropy)
+            # No skill samples in this microbatch: every response token counts.
+            resp_tok_mask = entropy.new_ones(entropy.shape)
+        # Response-only denominator for the reported entropy metric, via the SAME
+        # reducer as the numerator so cp/mb reduction matches. Emitted for every
+        # microbatch of a skill-KD run (stable key set); None otherwise so non-skill
+        # runs keep the original global-token normalization exactly.
+        if skill_kd_run:
+            entropy_denom = sum_of_sample_mean(resp_tok_mask)
         if args.entropy_coef != 0:
             loss = pg_loss - args.entropy_coef * entropy_loss
         else:
