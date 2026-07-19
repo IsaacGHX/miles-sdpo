@@ -112,7 +112,7 @@ RM_ARGS=(
    # Enable the second SDPO objective ON THE SKILL'S OWN TOKENS (the skill KD
    # training target): loss += sdpo-skill-kd-coef * D(student_skill ‖ teacher_skill).
    --sdpo-skill-kd
-   --sdpo-skill-kd-coef 1.0
+   --sdpo-skill-kd-coef 0.01
    --sdpo-skill-kd-mode both
    # Response-SDPO teacher prefix = the correct peer's SKILL (not its full trace).
    # Needs --sdpo-self-skill + --sdpo-skill-source covering correct peers (it does).
@@ -161,7 +161,7 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 24576
+   --max-tokens-per-gpu 14042
 )
 
 GRPO_ARGS=(
@@ -178,7 +178,7 @@ GRPO_ARGS=(
    # milder, bounded JSD). Keeps forward-KL mass-covering while the JSD term is far
    # less mode-seeking than a raw reverse KL, so it distills hard without collapsing
    # entropy as fast. (reverse_kl | forward_kl | jsd | jeffrey | jeffrey_jsd)
-   --sdpo-divergence jeffrey_jsd
+   --sdpo-divergence jsd
    --sdpo-is-clip 2.0
    --sdpo-kd-loss
    --sdpo-kd-coef 1.0
@@ -214,7 +214,7 @@ SGLANG_ARGS=(
    # each GPU; colocate onloads/offloads around each phase. Raise cautiously if
    # rollout underutilizes memory; drop if the logits_processor OOMs on a long batch.
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.85
+   --sglang-mem-fraction-static 0.8
    --sglang-router-policy round_robin
 )
 

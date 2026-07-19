@@ -36,11 +36,18 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMAGE="${IMAGE:-radixark/miles:dev-cu12-202607040446}"
 ENROOT_NVME="${ENROOT_NVME:-/opt/dlami/nvme/miles-enroot}"
 SQSH="${SQSH:-$ENROOT_NVME/miles-0704.sqsh}"
+
+# The system enroot.conf points ENROOT_CACHE_PATH at /fsx/enroot, but /fsx itself
+# is NOT a Lustre mount here — it lives on the tiny (97G, OS-filled) root disk.
+# Left alone, `enroot import` downloads image layers onto root and dies with
+# "zstd: No space left on device". Force the layer cache onto NVMe like every
+# other enroot path. (export so the enroot subprocess inherits it.)
+export ENROOT_CACHE_PATH="${ENROOT_CACHE_PATH:-$ENROOT_NVME/cache}"
 CONTAINER="${CONTAINER:-miles-0704}"
 ASSETS="${ASSETS:-/opt/dlami/nvme/miles-assets}"
 CACHES="${CACHES:-$ASSETS/caches}"
 
-mkdir -p "$ENROOT_NVME" "$ASSETS" "$ASSETS/hf_cache" \
+mkdir -p "$ENROOT_NVME" "$ENROOT_CACHE_PATH" "$ASSETS" "$ASSETS/hf_cache" \
     "$CACHES/triton" "$CACHES/inductor" "$CACHES/torch_extensions" "$CACHES/nv"
 
 # --- 1. import image -> squashfs on NVMe (skip if already imported) ----------
@@ -64,7 +71,8 @@ enroot start --rw \
     --mount "$ASSETS/hf_cache":/root/hf_cache \
     --mount "$CACHES":/root/caches \
     --env PREP_ONLY="${PREP_ONLY:-0}" \
-    --env SDPO_MODEL="${SDPO_MODEL:-olmo3-sci}" \
+    --env SDPO_MODEL="${SDPO_MODEL:-olmo3-math-colocate}" \
+    --env MILES_NEMOTRONH_KEEP_MTP="${MILES_NEMOTRONH_KEEP_MTP:-}" \
     --env HF_HOME=/root/hf_cache \
     --env TRITON_CACHE_DIR=/root/caches/triton \
     --env TORCHINDUCTOR_CACHE_DIR=/root/caches/inductor \
@@ -77,8 +85,13 @@ enroot start --rw \
     bash -euxc '
         cd /root/miles
 
-        # Pick model by $SDPO_MODEL (qwen3 | olmo3 | olmo3-sci): local dir name, HF
-        # repo id, megatron model-arg script, and the SDPO run script.
+        # Pick model by $SDPO_MODEL
+        # (qwen3 | olmo3 | olmo3-sci | olmo3-sci-colocate | olmo3-math-colocate |
+        #  nemo-sci | nemo-sci-colocate):
+        # local dir name, HF repo id, megatron model-arg script, and the SDPO run
+        # script. USE_BRIDGE=1 marks models loaded via AutoBridge straight from the
+        # HF checkpoint (no offline _torch_dist conversion needed); default 0.
+        USE_BRIDGE=0
         case "${SDPO_MODEL}" in
             olmo3)
                 MODEL_DIR=Olmo-3-7B-Instruct
@@ -89,11 +102,60 @@ enroot start --rw \
                 ;;
             olmo3-sci)
                 # Olmo3 on the SciKnowEval (MCQ) task instead of DAPO math.
+                # DISAGGREGATED 4+4 (4 train GPUs, 4 SGLang rollout GPUs).
                 MODEL_DIR=Olmo-3-7B-Instruct
                 HF_REPO=allenai/Olmo-3-7B-Instruct
                 MODEL_SH=scripts/models/olmo3-7B.sh
                 RUN_SH=examples/SDPO/run-olmo3-7B-sdpo-sci.sh
                 DATA_KIND=sci
+                ;;
+            olmo3-sci-colocate)
+                # Same model/task/SDPO config as olmo3-sci, but COLOCATE: all 8 GPUs
+                # run both the actor and the SGLang engines (time-shared via
+                # offload/onload). The serial generate->train loop leaves half the
+                # node idle under 4+4; colocate uses all 8 in both phases -> ~2x
+                # rollout throughput. SDPO logic is unchanged (teacher weight swaps
+                # are training-side, decoupled from the rollout transport).
+                MODEL_DIR=Olmo-3-7B-Instruct
+                HF_REPO=allenai/Olmo-3-7B-Instruct
+                MODEL_SH=scripts/models/olmo3-7B.sh
+                RUN_SH=examples/SDPO/run-olmo3-7B-sdpo-sci-colocate.sh
+                DATA_KIND=sci
+                ;;
+            olmo3-math-colocate)
+                # Same colocate / SDPO / skill / pitfall config as olmo3-sci-colocate,
+                # but on the DAPO math task (dapo grader, AIME-2025 + Minerva eval).
+                MODEL_DIR=Olmo-3-7B-Instruct
+                HF_REPO=allenai/Olmo-3-7B-Instruct
+                MODEL_SH=scripts/models/olmo3-7B.sh
+                RUN_SH=examples/SDPO/run-olmo3-7B-sdpo-math-colocate.sh
+                DATA_KIND=dapo
+                ;;
+            nemo-sci)
+                # Nemotron-3-Nano-4B (DENSE nemotron_h = hybrid Mamba+Attention) on
+                # the SciKnowEval (MCQ) task. Loads via AutoBridge (the run script
+                # passes --megatron-to-hf-mode bridge), so NO _torch_dist conversion.
+                # DISAGGREGATED 4+4 (4 train GPUs, 4 SGLang rollout GPUs).
+                MODEL_DIR=NVIDIA-Nemotron-3-Nano-4B-BF16
+                HF_REPO=nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+                MODEL_SH=scripts/models/nemotron-3-nano-4b.sh
+                RUN_SH=examples/SDPO/run-nemotron3-4b-sdpo-sci.sh
+                DATA_KIND=sci
+                USE_BRIDGE=1
+                ;;
+            nemo-sci-colocate)
+                # Same model/task/SDPO config as nemo-sci, but COLOCATE: all 8 GPUs
+                # run both the actor and the SGLang engines (time-shared via
+                # offload/onload). The serial generate->train loop leaves half the
+                # node idle under 4+4; colocate uses all 8 in both phases, so a 4B
+                # model gets ~2x rollout throughput. SDPO logic is unchanged (teacher
+                # weight swaps are training-side, decoupled from the rollout transport).
+                MODEL_DIR=NVIDIA-Nemotron-3-Nano-4B-BF16
+                HF_REPO=nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+                MODEL_SH=scripts/models/nemotron-3-nano-4b.sh
+                RUN_SH=examples/SDPO/run-nemotron3-4b-sdpo-sci-colocate.sh
+                DATA_KIND=sci
+                USE_BRIDGE=1
                 ;;
             *)
                 MODEL_DIR=Qwen3-8B
@@ -129,7 +191,10 @@ enroot start --rw \
                 python examples/SDPO/build_sci_dataset.py --out-dir /root/sci --val-ratio 0.1
         fi
 
-        if [ -z "$(ls -A /root/${MODEL_DIR}_torch_dist 2>/dev/null)" ]; then
+        # AutoBridge models (USE_BRIDGE=1, e.g. nemotron3-4b) build the Megatron
+        # provider from HF config.json at load time, so they skip this offline
+        # HF -> torch_dist conversion and ref-load the HF checkpoint directly.
+        if [ "$USE_BRIDGE" != "1" ] && [ -z "$(ls -A /root/${MODEL_DIR}_torch_dist 2>/dev/null)" ]; then
             source "$MODEL_SH"
             PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
                 "${MODEL_ARGS[@]}" \

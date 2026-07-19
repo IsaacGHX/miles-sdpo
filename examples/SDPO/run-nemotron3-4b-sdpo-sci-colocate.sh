@@ -1,11 +1,8 @@
 #!/bin/bash
 
-# SDPO — Olmo-3-7B-Instruct on SciKnowEval, single 8x H200 (141GB) node,
-# COLOCATE variant of run-olmo3-7B-sdpo-sci.sh.
-# usage: bash examples/SDPO/run-olmo3-7B-sdpo-sci-colocate.sh
-#
-# Build the dataset first with:
-#   python examples/SDPO/build_sci_dataset.py --out-dir /root/sci --val-ratio 0.1
+# SDPO — NVIDIA-Nemotron-3-Nano-4B-BF16 on SciKnowEval, single 8x H200 node,
+# COLOCATE variant of run-nemotron3-4b-sdpo-sci.sh.
+# usage: bash examples/SDPO/run-nemotron3-4b-sdpo-sci-colocate.sh
 #
 # WHY THIS VARIANT — the sibling (disaggregated) script splits the node 4+4: 4
 # GPUs train, 4 serve SGLang. The main loop (train.py) is strictly serial
@@ -14,15 +11,21 @@
 # rollout engines on all 8 GPUs and time-shares them via offload/onload:
 #   - rollout uses 8 engines instead of 4  -> ~2x generation throughput
 #   - training uses 8 GPUs instead of 4    -> faster actor step
-# The per-step offload/onload cost (7B weights) is small relative to the step, so
+# For a 4B model the per-step offload/onload cost (weights ~8GB) is small, so
 # total step time should drop. Compare wall-clock/step against the 4+4 script.
 #
 # SDPO CORRECTNESS IS UNCHANGED vs the disaggregated script: the EMA teacher,
 # self-teacher and teacher forward are all TRAINING-side in-place CPU<->GPU weight
 # swaps (TensorBackuper, snapshots live in CPU pinned RAM), fully decoupled from
 # how weights reach the rollout engines. Only the parallelism / colocate / memory
-# block and the ray launch differ from run-olmo3-7B-sdpo-sci.sh; every
+# block and the ray launch differ from run-nemotron3-4b-sdpo-sci.sh; every
 # SDPO/GRPO/skill/eval knob below is copied verbatim.
+#
+# MODEL NOTE — Nemotron-3-Nano-4B is DENSE (`nemotron_h` = hybrid Mamba + Attention,
+# NO MoE). It loads via AutoBridge (--megatron-to-hf-mode bridge); colocate's
+# UpdateWeightFromTensor already uses the AutoBridge HF iterator, so the nemotron_h
+# Megatron->HF conversion works out of the box (the hand-written-converter gap that
+# only ever affected the distributed transports is irrelevant here).
 
 set -exf
 
@@ -32,17 +35,20 @@ NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then HAS_NVLINK=1; else HAS_NVLINK=0; fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/miles/scripts/models/olmo3-7B.sh"
+source "/root/miles/scripts/models/nemotron-3-nano-4b.sh"
 
-SDPO_EXP="${SDPO_EXP:-olmo3-7B-sdpo-sci-colocate_$(date +%Y%m%d_%H%M%S)}"
+SDPO_EXP="${SDPO_EXP:-nemotron3-4b-sdpo-sci-colocate_$(date +%Y%m%d_%H%M%S)}"
 DUMP_DIR="/root/miles/sdpo_dumps/${SDPO_EXP}"
 echo "SDPO dump dir: ${DUMP_DIR}"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Olmo-3-7B-Instruct
-   --ref-load /root/Olmo-3-7B-Instruct_torch_dist
-   --load /root/Olmo-3-7B-Instruct_miles/
-   --save /root/Olmo-3-7B-Instruct_miles/
+   # AutoBridge builds the full nemotron_h Megatron provider (incl. all Mamba
+   # fields) from HF config.json at load time, so ref-load reads the SAME HF
+   # checkpoint directly — there is no separate _torch_dist conversion like Olmo3.
+   --hf-checkpoint /root/NVIDIA-Nemotron-3-Nano-4B-BF16
+   --ref-load /root/NVIDIA-Nemotron-3-Nano-4B-BF16
+   --save /root/NVIDIA-Nemotron-3-Nano-4B-BF16_miles/
+   --megatron-to-hf-mode bridge
    --save-interval 50
    --dump-details "${DUMP_DIR}"
    # skip the heavy per-token train_data/*.pt and policy_loss_debug/*.pt dumps;
@@ -67,6 +73,17 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1
    --global-batch-size 256
    --balance-data
+   # SDPO dynamic sampling (DAPO-style): oversample groups and DROP any with < 2
+   # correct traces, then re-sample, so every kept group can give EVERY trace a
+   # correct-peer prefix (no dead teacher==student, zero-KD samples reaching the
+   # batch). check_sdpo_group_has_prefix reads sdpo_correct set by the group RM.
+   # over-sampling-batch-size 64 = 2x rollout-batch-size: gives headroom to discard
+   # low-correct groups. If the model is too weak early on (few groups reach 2
+   # correct), the rollout loop can stall filling the batch — raise oversampling,
+   # lower --sdpo-dynamic-filter-min-correct to 1, or warm up without the filter.
+   # --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_sdpo_group_has_prefix
+   # --sdpo-dynamic-filter-min-correct 2
+   # --over-sampling-batch-size 64
 )
 
 RM_ARGS=(
@@ -74,60 +91,22 @@ RM_ARGS=(
    --custom-rm-path examples.SDPO.sdpo.sdpo_group_reward
    # SciKnowEval is well-formed L3 multiple-choice: the label is the answer LETTER,
    # graded by a case-insensitive letter match on the extracted <answer> ('mcq').
-   # (The math script uses 'dapo' for integer boxed answers instead.)
    --sdpo-grader mcq
-   # Self-generated skill (SkillOpt, on-policy): the CURRENT policy writes the skill
-   # during rollout from a trace's own response. On-policy + trainable (unlike the
-   # external --sdpo-trace-condense). Used by skill-KD below and, via
-   # --sdpo-response-prefix skill, as the response teacher prefix.
-   --sdpo-self-skill
-   # 1024 (was 512): the skill is now an instance-grounded 6-10 step solution
-   # roadmap (key quantities + intermediate results, stops one step before the
-   # answer), ~3-5x longer than the old 3-bullet skill. 512 truncated the tail
-   # steps — which is exactly the discriminating info the teacher needs — so give
-   # it room to finish. See _SKILL_SYSTEM_PROMPT in examples/SDPO/sdpo.py.
-   --sdpo-skill-max-new-tokens 1024
-   # Which traces get a skill: correct | incorrect | env_feedback (placeholder) | all.
-   #  correct  : correct traces -> instance-grounded solution roadmap (the response
-   #             teacher prefix, via --sdpo-response-prefix skill).
-   #  incorrect: failed traces -> PITFALL warnings only (mistakes to avoid, never a
-   #             solution — a model that failed cannot be trusted to rewrite one).
-   #  all      : both -> correct traces give the roadmap prefix AND failed traces feed
-   #             the failure-pitfall pipeline below.
-   --sdpo-skill-source all
-   # Failure-pitfall pipeline (active because skill-source covers incorrect):
-   #  1. each failed trace distils its OWN pitfalls, tagged by WHY it failed
-   #     (truncated | format | wrong) — see _failure_kind in sdpo.py.
-   #  2. the group's per-trace pitfalls are synthesized into ONE short shared
-   #     "common mistakes" list by this backend (self = current policy | external =
-   #     the --sdpo-condense-* OpenAI endpoint).
-   #  That shared list is spliced ONLY into the FAILED traces' teacher prefix (after
-   #  the correct-peer roadmap); correct traces keep a clean roadmap-only prefix.
-   --sdpo-pitfall-summary-backend self
-   # Second SDPO objective on the skill's own tokens (independent coef). Modes:
-   #  self-success    : correct traces; teacher hint = the sample's OWN correct trace.
-   #  problem-only     : any trace; teacher = skill-gen prompt, no hint.
-   #  pitfall-condense : FAILED traces (needs skill-source incorrect|all); student =
-   #                     predict pitfalls from the PROBLEM ONLY, teacher = same prompt
-   #                     + the group's per-trace failure pitfalls as privileged info.
-   # --sdpo-skill-kd
-   --sdpo-skill-kd-coef 1.0
-   --sdpo-skill-kd-mode self-success
-   # Response-SDPO teacher prefix = the correct peer's SKILL (not its full trace).
-   # Needs --sdpo-self-skill + --sdpo-skill-source covering correct peers (it does).
-   # Falls back to the trace if a peer has no skill.
-   --sdpo-response-prefix skill
-   # (see examples/SDPO/DESIGN_self_skill.md)
+   # -------------------------------------------------------------------------
+   # SKILL MECHANISM DISABLED -> base SDPO. (Kept identical to the disaggregated
+   # script; re-enable the block below to turn the self-skill setup back on.)
+     --sdpo-self-skill
+     --sdpo-skill-max-new-tokens 1024
+     --sdpo-skill-source correct
+   #   --sdpo-skill-kd-coef 1.0
+   #   --sdpo-skill-kd-mode self-success
+     --sdpo-response-prefix skill
+   # -------------------------------------------------------------------------
 )
 
 EVAL_ARGS=(
    --eval-interval 10
-   --skip-eval-before-train
-   # All four SciKnowEval domains as name/path pairs in ONE --eval-prompt-data
-   # (nargs='+', parsed as consecutive name path name path ...; repeating the flag
-   # would overwrite, not append). eval_rollout runs the datasets concurrently
-   # (asyncio.gather), so total time grows sublinearly, not 4x. Graded by the same
-   # MCQ letter-match rule as the group RM, via sdpo_eval_reward.
+   # All four SciKnowEval domains as name/path pairs in ONE --eval-prompt-data.
    --eval-prompt-data
       sci_chem /root/sci/val_chemistry.jsonl
       sci_bio  /root/sci/val_biology.jsonl
@@ -135,9 +114,6 @@ EVAL_ARGS=(
       sci_mat  /root/sci/val_material.jsonl
    --n-samples-per-eval-prompt 8
    --log-passrate
-   # Full 16k eval length (double the 8K rollout cap). This no longer OOMs: eval
-   # skips the OPD top-k logprob request (see generate()'s `evaluation` gate),
-   # which was the real cause of the earlier crash — not the sequence length.
    --eval-max-response-len 16384
    --eval-top-p 1
    # SDPO trains with a group RM, which cannot score eval samples (no group step in
@@ -147,12 +123,12 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   # TP=1 (colocate -> DP=8): Olmo3's QK-norm spans the FULL q/k dim
-   # (num_heads*head_dim), so it cannot be split across TP ranks without a cross-TP
-   # allreduce of the RMS (TP would normalize over only the local head shard ->
-   # wrong). TP=1 keeps each RMSNorm over the full dim. Under colocate all 8 GPUs
-   # host the actor (DP8 x TP1); a 7B model fits comfortably on one H200 at TP=1.
+   # Nemotron-3-Nano-4B is a Mamba+Attention hybrid. TP=1 (matches the disaggregated
+   # script and scripts/run-nemotron-3-nano-4b.sh, the known-working smoke test);
+   # the Mamba mixer is handled by the bridge provider. Under colocate all 8 GPUs
+   # host the actor (DP=8, TP=1). Dense -> expert parallelism is N/A.
    --tensor-model-parallel-size 1
+   --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -161,7 +137,12 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 24576
+   # 16384 (was 49152): TP=1 means each GPU holds the full 4B model + Adam state
+   # (~80GB); colocate offloads the rollout engine during training, so the training
+   # activation budget is the same as the disaggregated script — 49152 tokens/
+   # microbatch OOMed the Mamba SSM forward there, so match its 16384. Raise toward
+   # 24576 if memory sits idle.
+   --max-tokens-per-gpu 16384
 )
 
 GRPO_ARGS=(
@@ -169,6 +150,8 @@ GRPO_ARGS=(
    --use-opd
    --opd-type sglang
    --opd-kl-coef 0.0
+   # Megatron self-teacher. First use on the Mamba hybrid — if the teacher forward
+   # errors or drifts, switch to `--sdpo-teacher-backend sglang`.
    --sdpo-teacher-backend megatron
    --sdpo-ema-teacher
    --sdpo-ema-teacher-rate 0.05
@@ -181,6 +164,15 @@ GRPO_ARGS=(
    --sdpo-kd-max-tokens 8192
    --sdpo-self-teacher
    --sdpo-pure-distill
+   # Nemotron-3-Nano-4B is a thinking model: its chat template defaults to
+   # enable_thinking=True and ends the prompt with '<|im_start|>assistant\n<think>\n',
+   # so every rollout response carries a <think>...</think> chain before the
+   # requested <reasoning>/<answer> format. Strip it from the peer solution before
+   # it becomes the teacher prefix — otherwise the prefix balloons and the teacher
+   # teaches the student to echo the reasoning verbatim. Same reason as the Qwen3
+   # script; REQUIRED for thinking models. (Grading strips <think> unconditionally,
+   # so this only affects the teacher prefix, not scoring.)
+   --sdpo-remove-thinking-from-demonstration
    --sdpo-answer-tag answer
    --entropy-coef 0.00
    --observe-training-entropy
@@ -200,18 +192,19 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project miles-sdpo
-   --wandb-group olmo3-7B-sdpo-sci
+   --wandb-group nemotron3-4b-sdpo-sci
    --wandb-key "${WANDB_API_KEY}"
 )
 
 SGLANG_ARGS=(
    # Colocate: one engine per GPU (TP1), all 8 GPUs. mem-fraction 0.7 (was 0.9 in
    # the disaggregated script) because the actor + optimizer + KV cache now share
-   # each GPU; colocate onloads/offloads around each phase. Raise cautiously if
+   # each GPU; colocate onloads/offloads around each phase, and 0.7 is the value
+   # the other 4B colocate examples use (retool/search-r1). Raise cautiously if
    # rollout underutilizes memory; drop if the logits_processor OOMs on a long batch.
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.9
-   --sglang-chunked-prefill-size 8192
+   --sglang-mem-fraction-static 0.85
+   --sglang-chunked-prefill-size 10240
    --sglang-router-policy round_robin
 )
 
