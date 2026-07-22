@@ -1,0 +1,30 @@
+# --eval-config for SDPO_ReAct's AIME24 eval.
+#
+# Eval gets MORE tool-call turns than training (20 vs the training
+# --generate-max-turns 5, per the user's "multi turn 可以先训练设置 5 steps，推理
+# 20 steps" spec): metadata_overrides injects generate_max_turns into each eval
+# sample's metadata, and miles.rollout.generate_hub.multi_turn.generate reads a
+# per-sample metadata override before falling back to the global
+# --generate-max-turns (see the override added there) -- so one job can run
+# train and eval at different turn budgets without a second global arg.
+# SDPO_REACT_EVAL_MAX_TURNS / SDPO_REACT_EVAL_N_SAMPLES env vars let a new
+# task swap the eval turn budget / sample count without editing this file --
+# same "override via env, not by editing the example" flexibility as
+# examples/EPO/enroot-run-epo.sh's EPO_MODEL switch. oc.env alone always
+# yields a STRING (even when the env var is unset and the fallback fires);
+# EvalDatasetConfig's fields are plain dataclass attrs with no runtime
+# coercion, so an unwrapped oc.env here would silently hand a str to code
+# that does e.g. `range(n_samples_per_eval_prompt)` and crash far from this
+# file. oc.decode re-parses that string as YAML (int/float/bool), matching
+# the dataclass's declared `int` type.
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 1.0
+  datasets:
+    - name: aime24
+      path: /root/math_eval/aime24.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}

@@ -1619,9 +1619,40 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Which rollout traces get a self-generated skill (and, if eligible, skill-KD). "
                     "Does NOT change the response-SDPO teacher prefix (always a correct peer). "
                     "'correct': only traces the sample answered correctly. 'incorrect': only wrong "
-                    "traces. 'env_feedback': PLACEHOLDER for future env-feedback traces (no-op until "
-                    "that pipeline exists). 'all': every trace. The skill is generated from the "
-                    "trace's own response as the worked solution."
+                    "traces. 'env_feedback': only wrong traces that have a populated "
+                    "sample.metadata['tool_trace'] (a rollout that called a tool, e.g. "
+                    "examples/SDPO_ReAct's code_interpreter) -- the pitfall skill is grounded in "
+                    "that trace's actual tool calls/results (see --sdpo-env-feedback-max-chars), "
+                    "the direct analogue of lasgroup/SDPO's environment-feedback reprompt. 'all': "
+                    "every trace. The skill is generated from the trace's own response as the "
+                    "worked solution."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-env-feedback-max-chars",
+                type=int,
+                default=2000,
+                help=(
+                    "Truncation budget (characters, keeping the TAIL) for the rendered tool-"
+                    "execution trace spliced into the --sdpo-skill-source env_feedback pitfall "
+                    "prompt. Analogous to lasgroup/SDPO's max_reprompt_len/reprompt_truncation."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-prefer-tool-use-peer",
+                action="store_true",
+                default=False,
+                help=(
+                    "When picking a trace's correct-peer teacher prefix, prefer a correct peer "
+                    "whose sample.metadata['tool_call_count'] > 0 (falls back to uniform random "
+                    "among ALL correct peers if none used a tool). For agentic examples where "
+                    "tool use is optional (e.g. examples/SDPO_ReAct), uniform random selection "
+                    "creates a feedback loop: no-tool traces are often correct more often (less "
+                    "risk of a mid-trace tool error), so the KD teacher prefix drifts toward "
+                    "no-tool text over training, which then teaches the student to skip the tool "
+                    "even more -- observed as a rising rollout/agentic/zero_tool_call_frac despite "
+                    "task reward never penalizing tool use. No effect when no sample in the group "
+                    "carries a tool_call_count key (e.g. non-agentic examples)."
                 ),
             )
             parser.add_argument(

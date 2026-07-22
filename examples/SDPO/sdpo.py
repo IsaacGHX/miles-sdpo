@@ -154,6 +154,26 @@ def _strip_response_eos(text: str) -> str:
     return out
 
 
+def _choose_peer(args: Namespace, group: list[Sample], peers: list[int]) -> int:
+    """Pick one correct peer (already self-excluded by the caller) to serve as
+    the teacher prefix. Uniform random by default; with --sdpo-prefer-tool-use-
+    peer, prefer a peer that actually called a tool (sample.metadata
+    ["tool_call_count"] > 0), falling back to uniform random over ALL peers
+    when none did (or when no sample in the group carries that key at all --
+    i.e. this is a no-op for non-agentic examples). See that flag's help text
+    for why: uniform-random selection lets a no-tool-correct-trace majority
+    silently become the KD teacher, teaching the student away from tool use
+    over training even though task reward never penalizes it."""
+    if not getattr(args, "sdpo_prefer_tool_use_peer", False):
+        return random.choice(peers)
+    tool_using_peers = [
+        j
+        for j in peers
+        if isinstance(group[j].metadata, dict) and (group[j].metadata.get("tool_call_count") or 0) > 0
+    ]
+    return random.choice(tool_using_peers) if tool_using_peers else random.choice(peers)
+
+
 def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_response: str, remove_thinking: bool = False, pitfalls: str = "") -> str:
     """Insert the correct-peer solution + instruction into the USER turn of the
     student's (already chat-templated) prompt, before the assistant generation
@@ -260,10 +280,28 @@ def _is_correct(sample: Sample, args: Namespace | None = None) -> bool:
         label = (sample.label or "").strip()
         if not label:
             return False
+        # is_correct_strict_box (see math_dapo_utils.py) scans the response's
+        # last 100 chars for the LAST \boxed{...} occurrence -- correct for
+        # examples that teach the model to write \boxed{} directly (e.g. raw
+        # DAPO data), but wrong for examples like SDPO_ReAct whose prompt
+        # contracts <answer>...</answer> as the ONLY final-answer marker and
+        # never mentions \boxed{} at all. For those, a stray \boxed{} left
+        # over from intermediate reasoning prose (or one omitted entirely
+        # from inside a `<answer>N</answer>` with no \boxed{} wrapper) makes
+        # grading depend on incidental formatting instead of the tag the
+        # model was actually told to use -- observed as "sometimes \boxed{}
+        # counts, sometimes the <answer> tag counts" inconsistency. When the
+        # tag is present, grade ONLY its content (wrapped in \boxed{} so it
+        # still flows through DAPO's own normalization/matching logic) --
+        # this is a no-op for prompts that never use the tag (extracted is
+        # None -> falls through to the raw-response path unchanged).
+        tag = getattr(args, "sdpo_answer_tag", "answer")
+        extracted = _extract_tagged_answer(sample.response, tag)
+        graded_text = f"\\boxed{{{extracted}}}" if extracted is not None else (sample.response or "")
         try:
-            return bool(_dapo_compute_score(sample.response or "", label, strict_box_verify=True)["acc"])
+            return bool(_dapo_compute_score(graded_text, label, strict_box_verify=True)["acc"])
         except Exception:
-            return bool(grade_answer_verl(sample.response or "", label))
+            return bool(grade_answer_verl(graded_text, label))
 
     tag = getattr(args, "sdpo_answer_tag", "answer") if args is not None else "answer"
     extracted = _extract_tagged_answer(sample.response, tag)
@@ -647,17 +685,30 @@ _FAILURE_NOTE = {
 }
 
 
-def _skill_user_prompt_incorrect(problem: str, attempt: str, ground_truth: str, failure_kind: str = "wrong") -> str:
+def _skill_user_prompt_incorrect(
+    problem: str, attempt: str, ground_truth: str, failure_kind: str = "wrong", env_feedback: str = ""
+) -> str:
     """User prompt for the incorrect-trace skill: the attempt is wrong; give the
     ground-truth answer ONLY so the model can localize the mistake, then emit
     pitfall warnings (never a solution, never the answer). failure_kind tailors the
-    diagnosis (truncated | format | wrong)."""
+    diagnosis (truncated | format | wrong).
+
+    env_feedback (optional): the trace's own tool-execution trace (code run +
+    stdout/error seen during rollout, see --sdpo-skill-source env_feedback and
+    examples/SDPO_ReAct/sdpo_react.py's tool_trace extraction), rendered as an
+    extra section. This is the direct analogue of lasgroup/SDPO's
+    "environment feedback (e.g. test errors)" reprompt mechanism: grounding the
+    pitfall diagnosis in what the tools ACTUALLY returned, not just the final
+    wrong answer.
+    """
     gt = (ground_truth or "").strip()
     note = _FAILURE_NOTE.get(failure_kind, _FAILURE_NOTE["wrong"])
+    env_section = f"TOOL EXECUTION FEEDBACK FROM THIS ATTEMPT:\n{env_feedback.strip()}\n\n" if env_feedback.strip() else ""
     return (
         f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
         f"FAILED ATTEMPT (wrong, do not echo):\n{attempt}\n\n"
         f"GROUND-TRUTH ANSWER (for locating the mistake only, do NOT put it in the output):\n{gt}\n\n"
+        f"{env_section}"
         f"{note}\n\n"
         "Identify the specific mistakes and write the pitfall warnings (2-5 numbered "
         "'Avoid ...'/'Do not ...' bullets; no solution, no answer)."
@@ -774,7 +825,15 @@ async def _condense_solutions(args: Namespace, pairs: list[tuple[str, str]]) -> 
 
 
 def _skill_gen_prompt_ids(
-    args, tok, problem: str, solution: str, *, correct: bool = True, ground_truth: str = "", failure_kind: str = "wrong"
+    args,
+    tok,
+    problem: str,
+    solution: str,
+    *,
+    correct: bool = True,
+    ground_truth: str = "",
+    failure_kind: str = "wrong",
+    env_feedback: str = "",
 ) -> list[int]:
     """Chat-templated skill-generation prompt (system=SKILL prompt, user=problem+
     solution + distill instruction), tokenized, with the assistant generation
@@ -783,7 +842,9 @@ def _skill_gen_prompt_ids(
     correct=False switches to the incorrect-trace framing: the attempt is wrong,
     the ground truth is supplied, and the model distills a pitfall-prevention skill
     instead of distilling know-how from a flawed solution. failure_kind (truncated |
-    format | wrong) tailors the pitfall diagnosis.
+    format | wrong) tailors the pitfall diagnosis. env_feedback (incorrect-trace
+    only) is the trace's own tool-execution trace, see --sdpo-skill-source
+    env_feedback and _skill_user_prompt_incorrect.
     """
     solution = _strip_response_eos(solution)
     if correct:
@@ -791,7 +852,9 @@ def _skill_gen_prompt_ids(
         user = _skill_user_prompt(problem, solution)
     else:
         system = _SKILL_SYSTEM_PROMPT_INCORRECT
-        user = _skill_user_prompt_incorrect(problem, solution, ground_truth, failure_kind=failure_kind)
+        user = _skill_user_prompt_incorrect(
+            problem, solution, ground_truth, failure_kind=failure_kind, env_feedback=env_feedback
+        )
     text = tok.apply_chat_template(
         [
             {"role": "system", "content": system},
@@ -1295,7 +1358,7 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 else:
                     sample.metadata["sdpo_teacher_prompt_tokens"] = []
                 continue
-            peer_j = random.choice(peers)
+            peer_j = _choose_peer(args, group, peers)
             peer_by_idx[i] = peer_j
             prefix_text_by_idx[i] = group[peer_j].response
 
@@ -1313,8 +1376,11 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 p = group[j].prompt
                 return p if isinstance(p, str) else str(p)
 
+            def _has_env_feedback(i: int) -> bool:
+                md = group[i].metadata if isinstance(group[i].metadata, dict) else {}
+                return bool(md.get("tool_trace"))
+
             def _skill_eligible(i: int) -> bool:
-                # env_feedback is a placeholder for a future env-feedback pipeline.
                 if group[i].response_length == 0:
                     return False
                 self_ok = bool(correctness[i]) if i < len(correctness) else False
@@ -1323,10 +1389,34 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 if skill_source == "incorrect":
                     return not self_ok
                 if skill_source == "env_feedback":
-                    return False  # no env-feedback traces yet
+                    # Grounded pitfall generation from the trace's OWN tool-execution
+                    # trace (see examples/SDPO_ReAct/sdpo_react.py, which stashes
+                    # sample.metadata["tool_trace"] = [{"tool_call":..., "observation":...}, ...]
+                    # before calling into this group RM). Only meaningful for a FAILED
+                    # trace that actually called a tool -- lasgroup/SDPO's "environment
+                    # feedback (e.g. test errors)" reprompt idea, restricted to traces
+                    # where such feedback exists.
+                    return (not self_ok) and _has_env_feedback(i)
                 return True  # "all"
 
             skill_idxs = [i for i in range(len(group)) if isinstance(group[i].metadata, dict) and _skill_eligible(i)]
+
+            def _render_env_feedback(i: int) -> str:
+                """Render trace i's tool_trace (see sdpo_react.py::_extract_tool_trace)
+                as plain text for the pitfall prompt, truncated to
+                --sdpo-env-feedback-max-chars (analogous to lasgroup/SDPO's
+                max_reprompt_len/reprompt_truncation budget on the reprompt text).
+                Returns "" when the trace has no tool_trace (e.g. non-tool rollouts) --
+                _skill_user_prompt_incorrect treats "" as a no-op, so this never changes
+                behavior for rollouts that never call a tool."""
+                md = group[i].metadata if isinstance(group[i].metadata, dict) else {}
+                trace = md.get("tool_trace") or []
+                if not trace:
+                    return ""
+                max_chars = int(getattr(args, "sdpo_env_feedback_max_chars", 2000))
+                parts = [f"[call {j + 1}] {t['tool_call']}\n[result {j + 1}] {t['observation']}" for j, t in enumerate(trace)]
+                text = "\n\n".join(parts)
+                return text if len(text) <= max_chars else text[-max_chars:]
 
             async def _gen_one(i: int):
                 # Distill the trace's OWN response into a skill. For a correct trace
@@ -1334,6 +1424,9 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 # it flips to "diagnose the error -> pitfall warnings", tailored by WHY
                 # it failed (truncated | format | wrong). The ground-truth answer is
                 # passed so the model can localize where the attempt went wrong.
+                # env_feedback grounds that diagnosis in the trace's actual tool calls
+                # (see --sdpo-skill-source env_feedback above); it is "" for rollouts
+                # that never call a tool, which is a no-op for the prompt.
                 problem = _problem_of(i)
                 self_ok = bool(correctness[i]) if i < len(correctness) else False
                 fkind = "wrong" if self_ok else _failure_kind(args, group[i])
@@ -1345,6 +1438,7 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                     correct=self_ok,
                     ground_truth=(group[i].label or "") if not self_ok else "",
                     failure_kind=fkind,
+                    env_feedback=_render_env_feedback(i) if not self_ok else "",
                 )
                 res = await _self_generate_skill(args, gen_prompt_ids)
                 return i, gen_prompt_ids, res
@@ -1577,7 +1671,7 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         if n == 0 or not enable_kl:
             return torch.zeros((n,), dtype=torch.float32)
         peers = [j for j in correct_indices if j != i]
-        prefix_sample = group[random.choice(peers)]
+        prefix_sample = group[_choose_peer(args, group, peers)]
         return await _compute_kl_for_sample(args, sample, prefix_sample, logprob_mode, divergence_mode)
 
     global _sdpo_calls
@@ -1606,6 +1700,23 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         )
 
     return rewards
+
+
+async def plain_grpo_reward(args: Namespace, sample: Sample, **kwargs: Any) -> float:
+    """Single-sample reward for a plain-GRPO baseline (--custom-rm-path, NO
+    --group-rm) -- the "no SDPO at all" arm of an ablation against
+    sdpo_group_reward. Reuses _is_correct directly rather than --rm-type dapo/
+    boxed_dapo: async_rm's "dapo" rm_type calls math_dapo_utils.compute_score
+    with strict_box_verify defaulting to False (Minerva "Answer: X" line-
+    matching), which fails on a bare \\boxed{...} response with no such line;
+    the "boxed_" rm_type prefix pre-extracts the boxed answer but then feeds
+    JUST that bare string back into the same Minerva-pattern grader, which
+    also fails (there is no "Answer:" line left to match). _is_correct's own
+    --sdpo-grader dapo branch is the only path that actually calls
+    math_dapo_utils.compute_score with strict_box_verify=True (scans for the
+    LAST \\boxed{...} occurrence directly) -- the same grading criterion every
+    other arm's group reward uses, so a plain-GRPO baseline stays comparable."""
+    return 1.0 if _is_correct(sample, args) else 0.0
 
 
 async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> float:
