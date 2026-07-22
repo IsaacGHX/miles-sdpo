@@ -192,7 +192,11 @@ class InferenceRolloutFn:
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
         from miles.rollout.inference_rollout.inference_rollout_eval import eval_rollout_single_dataset
 
-        assert not self.state.args.group_rm, "Group RM is not supported for eval rollout"
+        # See eval_rollout_single_dataset's matching assert for why
+        # --eval-custom-rm-path lifts this restriction.
+        assert (
+            not self.state.args.group_rm or self.state.args.eval_custom_rm_path is not None
+        ), "Group RM is not supported for eval rollout; set --eval-custom-rm-path to grade eval samples per-sample."
 
         coros = []
         for dataset_cfg in getattr(self.state.args, "eval_datasets", []) or []:

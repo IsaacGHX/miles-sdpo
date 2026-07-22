@@ -113,6 +113,13 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
+        # The current train/eval rollout_id, stamped by generate_rollout_async
+        # / eval_rollout_single_dataset below so custom generate functions
+        # (via GenerateState(args), the same singleton) and custom group RMs
+        # can tag sample.metadata with the real step id instead of inventing
+        # their own private call counter -- see examples/SDPO_ReAct/
+        # generate_with_tools.py and sdpo_react.py for the consumer.
+        self.rollout_id: int | None = None
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -415,6 +422,7 @@ async def generate_rollout_async(
     await dumper_utils.configure_sglang(args)
 
     state = GenerateState(args)
+    state.rollout_id = rollout_id
 
     # instantiate data filters
     dynamic_filter = (
@@ -509,6 +517,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
         not args.group_rm or args.eval_custom_rm_path is not None
     ), "Group RM is not supported for eval rollout; set --eval-custom-rm-path to grade eval samples per-sample."
 
+    GenerateState(args).rollout_id = rollout_id
     coros = []
     for dataset_cfg in getattr(args, "eval_datasets", []) or []:
         coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))

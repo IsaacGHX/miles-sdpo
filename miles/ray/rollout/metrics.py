@@ -160,6 +160,8 @@ def _compute_metrics_from_samples(args, samples):
     if rp_skill:
         log_dict["skill/response_prefix_is_skill_frac"] = float(np.mean(rp_skill))
 
+    log_dict |= _compute_agentic_tool_metrics(args, samples)
+
     tito_vals = [s.metadata.get("tito_session_mismatch") for s in samples]
     tito_vals = [v for v in tito_vals if v is not None]
     if tito_vals:
@@ -272,3 +274,64 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+
+def _compute_agentic_tool_metrics(args, all_samples: list[Sample]):
+    """Fine-grained tool-calling diagnostics for agentic/multi-turn rollout.
+
+    No-op (empty dict) unless a custom generate/reward function populated one
+    of these on sample.metadata -- this is a generic panel, not tied to any
+    one example. round_number is populated for free by
+    ``miles.rollout.generate_hub.multi_turn.generate`` (any run using it gets
+    this panel automatically); tool_call_count/tool_error_count are populated
+    by whichever --custom-rm-path/--custom-generate-function-path chooses to
+    stash them (e.g. examples/SDPO_ReAct/sdpo_react.py).
+
+    Keys, all under the agentic/ panel:
+      - round_number_{mean,max,min}: turns used per trajectory.
+      - hit_max_turns_frac: fraction that used the FULL turn budget (proxy for
+        "ran out of turns before answering" -- distinct from round_number's
+        mean, which a few long outliers can hide).
+      - tool_call_count_{mean,max}: tool calls per trajectory.
+      - zero_tool_call_frac: fraction that never called a tool at all.
+      - tool_error_rate: errors / total tool calls, when the generate/reward
+        function also tags samples with tool_error_count (calls whose
+        observation text signals failure, e.g. a sandbox exception).
+    """
+    round_numbers = [
+        s.metadata["round_number"] for s in all_samples if isinstance(s.metadata, dict) and "round_number" in s.metadata
+    ]
+    tool_call_counts = [
+        s.metadata["tool_call_count"]
+        for s in all_samples
+        if isinstance(s.metadata, dict) and "tool_call_count" in s.metadata
+    ]
+    tool_error_counts = [
+        s.metadata["tool_error_count"]
+        for s in all_samples
+        if isinstance(s.metadata, dict) and "tool_error_count" in s.metadata
+    ]
+
+    if not round_numbers and not tool_call_counts:
+        return {}
+
+    metrics = {}
+    if round_numbers:
+        metrics["agentic/round_number_mean"] = float(np.mean(round_numbers))
+        metrics["agentic/round_number_max"] = float(np.max(round_numbers))
+        metrics["agentic/round_number_min"] = float(np.min(round_numbers))
+        max_turns = getattr(args, "generate_max_turns", None)
+        if max_turns:
+            metrics["agentic/hit_max_turns_frac"] = float(np.mean([r >= max_turns for r in round_numbers]))
+
+    if tool_call_counts:
+        metrics["agentic/tool_call_count_mean"] = float(np.mean(tool_call_counts))
+        metrics["agentic/tool_call_count_max"] = float(np.max(tool_call_counts))
+        metrics["agentic/zero_tool_call_frac"] = float(np.mean([c == 0 for c in tool_call_counts]))
+
+    if tool_error_counts and tool_call_counts and len(tool_error_counts) == len(tool_call_counts):
+        total_calls = sum(tool_call_counts)
+        if total_calls > 0:
+            metrics["agentic/tool_error_rate"] = float(sum(tool_error_counts) / total_calls)
+
+    return metrics

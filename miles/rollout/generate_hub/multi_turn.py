@@ -43,7 +43,18 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
     sample.tokens = prompt_tokens_ids.copy()
 
-    for _turn in range(args.generate_max_turns):
+    # Per-sample override so a single job can run more turns at eval than at
+    # train (e.g. --eval-config's metadata_overrides: {generate_max_turns: 20}
+    # while --generate-max-turns 5 governs training) without a second global
+    # arg. Same pattern as Sample.generate_function_path's per-sample override
+    # of --custom-generate-function-path.
+    if isinstance(sample.metadata, dict):
+        max_turns = sample.metadata.get("generate_max_turns", args.generate_max_turns)
+    else:
+        max_turns = args.generate_max_turns
+
+    rounds_used = 0
+    for _turn in range(max_turns):
         # ----------------------- Call inference endpoint -------------------------
 
         payload, halt_status = compute_request_payload(args, sample.tokens, input.sampling_params)
@@ -58,6 +69,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
         output = await post(url, payload)
         await update_sample_from_response(args, sample, payload=payload, output=output, update_loss_mask=True)
+        rounds_used += 1
 
         if args.generate_multi_samples:
             multi_samples.append(deepcopy(sample))
@@ -73,6 +85,19 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
         tool_messages = await execute_tool_calls(tool_calls, execute_tool_function)
         update_sample_with_tool_responses(sample, tool_messages, tokenizer=tokenizer)
+
+    # Generic multi-turn diagnostic: how many inference rounds this trajectory
+    # took. Feeds --log-multi-turn's existing multi_turn_metric/round_number_*
+    # panel (miles/backends/training_utils/log_utils.py::log_multi_turn_data),
+    # which already reads rollout_data["round_number"] but had no producer for
+    # this generate function -- any --custom-generate-function-path pointed at
+    # miles.rollout.generate_hub.multi_turn.generate now populates it for free.
+    if args.generate_multi_samples:
+        for i, s in enumerate(multi_samples):
+            if isinstance(s.metadata, dict):
+                s.metadata["round_number"] = i + 1
+    elif isinstance(sample.metadata, dict):
+        sample.metadata["round_number"] = rounds_used
 
     return GenerateFnOutput(samples=multi_samples if args.generate_multi_samples else sample)
 
