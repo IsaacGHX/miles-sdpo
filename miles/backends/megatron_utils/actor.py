@@ -228,13 +228,16 @@ class MegatronTrainRayActor(TrainRayActor):
             if args.update_weights_interval == 1:
                 self.weights_backuper.backup("rollout_actor")
 
-        # SDPO EMA teacher: initialize a "sdpo_teacher" weight snapshot = current
-        # (initial) actor weights. Each train step it is EMA-blended toward the
-        # student (see _update_sdpo_ema_teacher), and the SDPO teacher forward runs
-        # against this slow copy instead of the live policy. _enable_weight_backup
-        # is True whenever sdpo_ema_teacher is set (see the property), so this works
+        # SDPO/EPO EMA teacher: initialize a "sdpo_teacher" weight snapshot =
+        # current (initial) actor weights. Each train step it is EMA-blended toward
+        # the student (see _update_sdpo_ema_teacher), and the SDPO/EPO teacher
+        # forward runs against this slow copy instead of the live policy.
+        # _enable_weight_backup is True whenever sdpo_ema_teacher is set together
+        # with either KD-loss or EPO's credit_t (see the property), so this works
         # even with KL off (no ref model).
-        if getattr(self.args, "sdpo_ema_teacher", False) and getattr(self.args, "sdpo_kd_loss", False):
+        if getattr(self.args, "sdpo_ema_teacher", False) and (
+            getattr(self.args, "sdpo_kd_loss", False) or getattr(self.args, "epo_credit_loss", False)
+        ):
             assert self._enable_weight_backup, (
                 "--sdpo-ema-teacher needs the weight backuper active (it should be, via the "
                 "_enable_weight_backup property)."
@@ -325,9 +328,13 @@ class MegatronTrainRayActor(TrainRayActor):
             or self.with_opd_teacher
             or self.args.keep_old_actor
             or self.args.colocate
-            # SDPO EMA teacher keeps a separate weight snapshot that must be swapped
-            # in for the teacher forward, so it needs the backuper even without a ref.
-            or (getattr(self.args, "sdpo_ema_teacher", False) and getattr(self.args, "sdpo_kd_loss", False))
+            # SDPO/EPO EMA teacher keeps a separate weight snapshot that must be
+            # swapped in for the teacher forward, so it needs the backuper even
+            # without a ref. EPO's credit_t forward reuses this same snapshot.
+            or (
+                getattr(self.args, "sdpo_ema_teacher", False)
+                and (getattr(self.args, "sdpo_kd_loss", False) or getattr(self.args, "epo_credit_loss", False))
+            )
         )
 
     def _switch_model(self, target_tag: str) -> None:
@@ -498,7 +505,10 @@ class MegatronTrainRayActor(TrainRayActor):
                                 logger.warning(f"[SDPO-EMA-DIAG] failed: {e!r}")
                         self._set_replay_stage("fallthrough")
                         self._switch_model("sdpo_teacher")
-                    self._compute_sdpo_teacher_log_probs(rollout_data)
+                    if getattr(self.args, "epo_credit_loss", False):
+                        self._compute_epo_credit(rollout_data)
+                    else:
+                        self._compute_sdpo_teacher_log_probs(rollout_data)
                     if use_ema:
                         self._switch_model("actor")
 
@@ -687,6 +697,194 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         rollout_data["opd_reverse_kl"] = reverse_kls
         del s_out, t_out
+        torch.cuda.empty_cache()
+
+    def _compute_epo_credit_abs_logp_diff(
+        self, rollout_data: RolloutBatch, teacher_rollout_data: RolloutBatch, has_prefix: list[bool]
+    ) -> list[torch.Tensor]:
+        """credit_t = |logp(y_t|x,f,y_<t>) - logp(y_t|x,y_<t>)| on the SAMPLED
+        token only (--epo-credit-mode abs_logp_diff, default): one compute_log_prob
+        forward per side. Cheap; the literal pointwise-log-likelihood-ratio
+        reading of the PMI definition."""
+        response_lengths = rollout_data["response_lengths"]
+
+        teacher_iter, teacher_nmb = get_data_iterator(self.args, self.model, teacher_rollout_data)
+        plus_out = self.compute_log_prob(teacher_iter, teacher_nmb, store_prefix="")
+        del teacher_iter
+        torch.cuda.empty_cache()
+
+        plain_iter, plain_nmb = get_data_iterator(self.args, self.model, dict(rollout_data))
+        minus_out = self.compute_log_prob(plain_iter, plain_nmb, store_prefix="")
+        del plain_iter
+        torch.cuda.empty_cache()
+
+        logp_plus = plus_out["log_probs"]
+        logp_minus = minus_out["log_probs"]
+        clip = float(getattr(self.args, "epo_credit_clip", 5.0) or 0.0)
+
+        credits: list[torch.Tensor] = []
+        for i in range(len(logp_minus)):
+            n = int(response_lengths[i])
+            if n == 0 or not has_prefix[i]:
+                credits.append(torch.ones((n,), dtype=torch.float32, device=logp_minus[i].device))
+                continue
+            c = (logp_plus[i].float() - logp_minus[i].float()).abs()
+            if clip > 0:
+                c = c.clamp(max=clip)
+            credits.append(c)
+        del plus_out, minus_out
+        return credits
+
+    def _compute_epo_credit_topk_divergence(
+        self, rollout_data: RolloutBatch, teacher_rollout_data: RolloutBatch, has_prefix: list[bool]
+    ) -> list[torch.Tensor]:
+        """credit_t = D(p(.|x,f,y_<t)) ‖ p(.|x,y_<t))) over the top-k next-token
+        DISTRIBUTION (--epo-credit-mode topk_divergence): reuses SDPO's
+        compute_topk_logprobs + _sdpo_topk_distribution_divergence (same helper
+        as the legacy sdpo_divergence advantage-hook path, actor.py:61-110).
+        Captures how much the WHOLE next-token belief shifts, not just the
+        sampled token, at the cost of a second top-k forward (vs plain
+        compute_log_prob) and the O(R*k) per-sample teacher-id lookup inside
+        _sdpo_topk_distribution_divergence."""
+        response_lengths = rollout_data["response_lengths"]
+        topk = int(getattr(self.args, "opd_log_prob_top_k", 128) or 128)
+        divergence_mode = getattr(self.args, "epo_credit_divergence", "jsd")
+
+        teacher_iter, teacher_nmb = get_data_iterator(self.args, self.model, teacher_rollout_data)
+        t_out = self.compute_topk_logprobs(teacher_iter, teacher_nmb, topk=topk)
+        del teacher_iter
+        torch.cuda.empty_cache()
+
+        plain_iter, plain_nmb = get_data_iterator(self.args, self.model, dict(rollout_data))
+        s_out = self.compute_topk_logprobs(plain_iter, plain_nmb, topk=topk)
+        del plain_iter
+        torch.cuda.empty_cache()
+
+        t_lp, t_ids = t_out["sdpo_topk_logprobs"], t_out["sdpo_topk_ids"]
+        s_lp, s_ids = s_out["sdpo_topk_logprobs"], s_out["sdpo_topk_ids"]
+        clip = float(getattr(self.args, "epo_credit_clip", 5.0) or 0.0)
+
+        credits: list[torch.Tensor] = []
+        for i in range(len(s_lp)):
+            n = int(response_lengths[i])
+            if n == 0 or not has_prefix[i]:
+                credits.append(torch.ones((n,), dtype=torch.float32))
+                continue
+            c = _sdpo_topk_distribution_divergence(s_lp[i], s_ids[i], t_lp[i], t_ids[i], divergence_mode)
+            if clip > 0:
+                c = c.clamp(max=clip)
+            credits.append(c)
+        del t_out, s_out
+        return credits
+
+    def _compute_epo_credit_category_metrics(
+        self, rollout_data: RolloutBatch, credits: list[torch.Tensor], has_prefix: list[bool]
+    ) -> dict[str, float]:
+        """Diagnostic (plan): split credit_t by a cheap regex-based token
+        category (epistemic/strategy/compute/format/other, see
+        miles.utils.token_category) and report the per-category mean credit —
+        "does epistemic-token credit collapse first?" (diagnosis experiment 1.1)
+        becomes a free-riding wandb panel instead of a separate offline script.
+        Local to THIS rollout batch only (not tracked across checkpoints/steps
+        beyond whatever wandb keeps), gated by --epo-credit-token-diagnostics
+        since classify_response_tokens costs one convert_ids_to_tokens call per
+        sample (cheap, but non-zero — skip it when not actively diagnosing).
+        """
+        from miles.utils.token_category import CATEGORIES, classify_response_tokens
+
+        tokens_list = rollout_data["tokens"]
+        response_lengths = rollout_data["response_lengths"]
+        sums = {cat: 0.0 for cat in CATEGORIES}
+        counts = {cat: 0 for cat in CATEGORIES}
+
+        for i, (credit, hp) in enumerate(zip(credits, has_prefix, strict=True)):
+            if not hp or credit.numel() == 0:
+                continue
+            n = int(response_lengths[i])
+            t = tokens_list[i]
+            tok_ids = t.tolist() if torch.is_tensor(t) else list(t)
+            resp_ids = tok_ids[len(tok_ids) - n :]
+            categories = classify_response_tokens(self.tokenizer, resp_ids)
+            credit_cpu = credit.detach().float().cpu()
+            for cat, val in zip(categories, credit_cpu.tolist(), strict=True):
+                sums[cat] += val
+                counts[cat] += 1
+
+        return {
+            f"epo_credit_{cat}_mean": (sums[cat] / counts[cat] if counts[cat] > 0 else 0.0) for cat in CATEGORIES
+        }
+
+    def _compute_epo_credit(self, rollout_data: RolloutBatch) -> None:
+        """EPO: per-token PMI credit_t, both forwards under the SAME teacher
+        weights (the EMA snapshot if --sdpo-ema-teacher, else the live self-
+        teacher weights already active when this is called — see the use_ema
+        switch in train_actor). `f` is the correct-peer prefix (full trace, or
+        with --epo-credit-skill the peer's self-generated skill) stashed by
+        epo_group_reward on sdpo_teacher_prompt_tokens (reuses SDPO's Megatron
+        teacher plumbing: _build_sdpo_teacher_rollout_data keeps the response at
+        the tail so per-position outputs stay aligned with the plain student
+        sequence). --epo-credit-mode selects the credit formula:
+        'abs_logp_diff' (default) or 'topk_divergence' (see
+        _compute_epo_credit_{abs_logp_diff,topk_divergence} above).
+
+        Writes rollout_data["epo_credit"] (one [R] tensor per sample, R =
+        response_length; 1 — a NEUTRAL weight, not 0 — for samples with no
+        privileged-context peer, e.g. the sole correct trace in a group, so
+        those traces fall back to plain GRPO instead of losing their reward
+        signal entirely), fused into the GRPO advantages by
+        compute_advantages_and_returns (loss.py) when --epo-credit-loss is set.
+        Also writes a broadcast "epo_credit_cv" scalar (coefficient of variation
+        over active tokens) so it surfaces at rollout/epo_credit_cv via
+        log_rollout_data's generic numeric-list path, with no extra logging
+        plumbing. Reuses SDPO's _dump_sdpo_prompts so --dump-details produces
+        the SAME sdpo_prompts/ (student vs. teacher/privileged-context text)
+        and skill/ (when --epo-credit-skill is on) dumps SDPO already writes.
+        """
+        teacher_rollout_data, has_prefix = self._build_sdpo_teacher_rollout_data(rollout_data)
+
+        mode = getattr(self.args, "epo_credit_mode", "abs_logp_diff")
+        if mode == "topk_divergence":
+            credits = self._compute_epo_credit_topk_divergence(rollout_data, teacher_rollout_data, has_prefix)
+        else:
+            credits = self._compute_epo_credit_abs_logp_diff(rollout_data, teacher_rollout_data, has_prefix)
+        del teacher_rollout_data
+        torch.cuda.empty_cache()
+
+        normalize = getattr(self.args, "epo_credit_normalize", True)
+        active = [c for c, hp in zip(credits, has_prefix, strict=True) if hp and c.numel() > 0]
+        cv = 0.0
+        if active:
+            flat = torch.cat([c.to(active[0].device) for c in active])
+            mean = flat.mean().clamp(min=1e-8)
+            cv = (flat.std() / mean).item()
+            if normalize:
+                credits = [c / mean.to(c.device) if hp else c for c, hp in zip(credits, has_prefix, strict=True)]
+
+        rollout_data["epo_credit"] = [c.to(dtype=torch.float32) for c in credits]
+        rollout_data["epo_credit_cv"] = [cv] * len(credits)
+
+        if getattr(self.args, "epo_credit_token_diagnostics", False):
+            # NOTE: must run on EVERY DP rank (each on its own local shard, not
+            # redundantly), NOT main-rank-only. log_rollout_data's
+            # gather_log_data does a cross-DP-rank dist.gather_object keyed by
+            # whatever keys are in log_dict — every rank's rollout_data needs
+            # the SAME key set or the post-gather `d[key]` lookup KeyErrors on
+            # ranks that skipped this block. Best-effort: a diagnostic panel,
+            # not a training-critical value, so a failure here must never
+            # break training (mirrors _dump_sdpo_prompts's own try/except
+            # policy for the same reason) -- but ALL ranks must at least agree
+            # to fall back to the same (empty) key set on failure.
+            try:
+                cat_metrics = self._compute_epo_credit_category_metrics(rollout_data, credits, has_prefix)
+            except Exception as e:
+                logger.warning(f"[EPO] credit token-category diagnostics failed (non-fatal): {e!r}")
+                from miles.utils.token_category import CATEGORIES
+
+                cat_metrics = {f"epo_credit_{cat}_mean": 0.0 for cat in CATEGORIES}
+            for key, val in cat_metrics.items():
+                rollout_data[key] = [val] * len(credits)
+
+        self._dump_sdpo_prompts(rollout_data, has_prefix)
         torch.cuda.empty_cache()
 
     def _dump_sdpo_prompts(self, rollout_data: RolloutBatch, has_prefix: list[bool]) -> None:

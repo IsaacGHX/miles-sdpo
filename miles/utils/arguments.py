@@ -1668,6 +1668,115 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "be the distilled skill rather than the worked solution."
                 ),
             )
+            # ---- EPO: PMI-credit self-distillation (examples/EPO/epo.py) --------
+            # EPO decouples SDPO's teacher-vs-student divergence into a CREDIT weight
+            # (|logp_with_privileged_context - logp_without|, i.e. the pointwise
+            # mutual information a response token carries about the ground-truth
+            # solution) and a DIRECTION that comes from the task outcome reward
+            # instead of the teacher's KL direction. Reuses the SAME teacher
+            # plumbing as SDPO (--sdpo-ema-teacher / --sdpo-teacher-backend /
+            # sdpo_teacher_prompt_tokens) and the SAME GRPO advantage estimator; the
+            # only new mechanism is the credit weight fused into the advantages.
+            parser.add_argument(
+                "--epo-credit-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable EPO: compute per-token PMI credit_t = "
+                    "|logp(y_t | x, f, y_<t>) - logp(y_t | x, y_<t>)| under the SDPO "
+                    "teacher weights (EMA teacher if --sdpo-ema-teacher, else the live "
+                    "self-teacher), and multiply it elementwise into the GRPO "
+                    "advantages (reward - baseline) computed by "
+                    "--advantage-estimator grpo. Requires "
+                    "--custom-rm-path examples.EPO.epo.epo_group_reward (or an "
+                    "equivalent reward fn that stashes sdpo_teacher_prompt_tokens) so "
+                    "a correct-peer/ground-truth prefix is available for the "
+                    "privileged-context forward pass."
+                ),
+            )
+            parser.add_argument(
+                "--epo-credit-clip",
+                type=float,
+                default=5.0,
+                help="Clamp credit_t to this max value before normalization/fusion (0 = no clamp).",
+            )
+            parser.add_argument(
+                "--epo-credit-normalize",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Normalize credit_t to a local (per-DP-rank rollout) mean of 1 over "
+                    "active response tokens before fusing into advantages, so the "
+                    "credit weight only reshapes WHERE the gradient lands within a "
+                    "trace, not the overall reward scale. --no-epo-credit-normalize "
+                    "uses the raw (clamped) credit value."
+                ),
+            )
+            parser.add_argument(
+                "--epo-credit-mode",
+                type=str,
+                choices=["abs_logp_diff", "topk_divergence"],
+                default="abs_logp_diff",
+                help=(
+                    "How credit_t is computed from the two (with/without privileged-"
+                    "context) forwards. 'abs_logp_diff' (default, cheap): "
+                    "|logp_plus - logp_minus| on the SAMPLED token only -- the literal "
+                    "pointwise-log-likelihood-ratio reading of the PMI definition. "
+                    "'topk_divergence': a distribution-level divergence (see "
+                    "--epo-credit-divergence) between the with- and without-context "
+                    "top-k next-token distributions, reusing SDPO's "
+                    "_sdpo_topk_distribution_divergence -- captures how much the WHOLE "
+                    "next-token belief shifts, not just the sampled token, at the cost "
+                    "of a second top-k forward (compute_topk_logprobs instead of "
+                    "compute_log_prob) and an extra --opd-log-prob-top-k top-k gather."
+                ),
+            )
+            parser.add_argument(
+                "--epo-credit-divergence",
+                type=str,
+                choices=["reverse_kl", "forward_kl", "jeffrey", "jsd"],
+                default="jsd",
+                help=(
+                    "Divergence used when --epo-credit-mode topk_divergence: matches "
+                    "_sdpo_topk_distribution_divergence's mode strings (any value other "
+                    "than reverse_kl/forward_kl/jeffrey falls through to jsd). Only "
+                    "read when --epo-credit-mode is topk_divergence."
+                ),
+            )
+            parser.add_argument(
+                "--epo-credit-skill",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use the peer's SELF-GENERATED SKILL (a condensed solution roadmap, "
+                    "same mechanism as SDPO's --sdpo-self-skill / --sdpo-response-prefix "
+                    "skill) as the privileged context f, instead of the peer's full raw "
+                    "trace. The skill is generated on the fly from the correct peer's "
+                    "own response via _self_generate_skill (an extra rollout-engine "
+                    "generation call per correct trace), then spliced in exactly like "
+                    "the full-trace prefix. A peer with no successfully-generated skill "
+                    "falls back to its full trace. Purely a diagnostic/ablation toggle -- "
+                    "does not touch SDPO's --sdpo-skill-kd (no second KD objective on "
+                    "the skill's own tokens; EPO has no KD-loss term to begin with)."
+                ),
+            )
+            parser.add_argument(
+                "--epo-credit-token-diagnostics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Split credit_t by a cheap regex-based token category "
+                    "(epistemic/strategy/compute/format/other -- see "
+                    "miles.utils.token_category.classify_response_tokens) and log the "
+                    "per-category mean credit as rollout/epo_credit_{category}_mean. "
+                    "Answers 'does epistemic-token credit collapse first?' "
+                    "(diagnosis plan experiment 1.1) as a free training-time panel "
+                    "instead of a separate offline script. Costs one "
+                    "convert_ids_to_tokens call per sample per rollout (cheap vocab "
+                    "lookup, not detokenization) -- off by default since it is a "
+                    "diagnostic, not needed for training."
+                ),
+            )
             return parser
 
         def add_lora_arguments(parser):

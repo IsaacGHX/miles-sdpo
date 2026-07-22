@@ -77,6 +77,24 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         values=values,
     )
 
+    # EPO: fuse the per-token PMI credit weight into the GRPO advantages
+    # (A(t) = credit_t * (R - baseline)), computed by
+    # MegatronTrainRayActor._compute_epo_credit and written to
+    # rollout_data["epo_credit"] (one [R] tensor per sample, aligned with
+    # `advantages`). This rides the existing advantages pipe with no new
+    # plumbing into policy_loss_function; orthogonal to (applied before) OPD/
+    # whitening, exactly like the direction (reward-baseline) is untouched.
+    if getattr(args, "epo_credit_loss", False):
+        epo_credit = rollout_data.get("epo_credit")
+        if epo_credit is not None:
+            assert len(epo_credit) == len(advantages), (
+                f"EPO credit length mismatch: epo_credit={len(epo_credit)}, advantages={len(advantages)}."
+            )
+            advantages = [
+                adv * credit.to(device=adv.device, dtype=adv.dtype)
+                for adv, credit in zip(advantages, epo_credit, strict=True)
+            ]
+
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
     if args.use_opd:
         apply_opd_kl_to_advantages(
