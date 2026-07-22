@@ -72,6 +72,7 @@ enroot start --rw \
     --mount "$CACHES":/root/caches \
     --env PREP_ONLY="${PREP_ONLY:-0}" \
     --env SDPO_MODEL="${SDPO_MODEL:-olmo3-math-colocate}" \
+    --env SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:-}" \
     --env MILES_NEMOTRONH_KEEP_MTP="${MILES_NEMOTRONH_KEEP_MTP:-}" \
     --env HF_HOME=/root/hf_cache \
     --env TRITON_CACHE_DIR=/root/caches/triton \
@@ -156,6 +157,20 @@ enroot start --rw \
                 RUN_SH=examples/SDPO/run-nemotron3-4b-sdpo-sci-colocate.sh
                 DATA_KIND=sci
                 USE_BRIDGE=1
+                ;;
+            qwen3-4b-math-ablation)
+                # Qwen3-4B (thinking model) on DAPO math, COLOCATE -- the 6-arm
+                # SDPO ablation series (plain GRPO / SDPO baseline / skill-source
+                # correct|incorrect|all / skill-source all + skill-KD). Requires
+                # $SDPO_ABLATION_ARM to pick which of the 6 legs to run; see the
+                # module docstring in run-qwen3-4B-sdpo-math-colocate.sh for the
+                # exact per-arm flags. Exploratory only: --num-rollout 100,
+                # no checkpointing.
+                MODEL_DIR=Qwen3-4B
+                HF_REPO=Qwen/Qwen3-4B
+                MODEL_SH=scripts/models/qwen3-4B.sh
+                RUN_SH=examples/SDPO/run-qwen3-4B-sdpo-math-colocate.sh
+                DATA_KIND=dapo
                 ;;
             *)
                 MODEL_DIR=Qwen3-8B

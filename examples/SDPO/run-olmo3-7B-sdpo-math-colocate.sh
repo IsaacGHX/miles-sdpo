@@ -161,7 +161,10 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 14042
+   # 40960 OOM'd during backward on rollout 2->3 (7B weights+grad+Adam states
+   # already ~99GB; a long-sequence microbatch pushed backward activations past
+   # the remaining headroom). Match the sci-colocate script's budget.
+   --max-tokens-per-gpu 24576
 )
 
 GRPO_ARGS=(
@@ -214,7 +217,7 @@ SGLANG_ARGS=(
    # each GPU; colocate onloads/offloads around each phase. Raise cautiously if
    # rollout underutilizes memory; drop if the logits_processor OOMs on a long batch.
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.8
+   --sglang-mem-fraction-static 0.85
    --sglang-router-policy round_robin
 )
 
