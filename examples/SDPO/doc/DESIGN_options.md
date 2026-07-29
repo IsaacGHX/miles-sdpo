@@ -54,7 +54,8 @@ field per record (the distilled skill spliced into `teacher_prompt_text`).
 ## Self-generated skill + skill-SDPO
 
 The policy self-generates the skill on-policy (trainable), and optionally runs a
-second SDPO objective on the skill tokens. Full design: `DESIGN_self_skill.md`.
+second SDPO objective on the skill tokens. Full design: `DESIGN_self_skill.md`
+(same directory).
 
 | Flag | Default | Meaning |
 |---|---|---|

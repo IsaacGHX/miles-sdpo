@@ -1418,6 +1418,51 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sdpo-reframe-multiturn-prefix",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "For NATIVE multi-turn tool-calling peer traces, reframe the ChatML "
+                    "<|im_start|>/<|im_end|> turn boundaries into short NLP markers "
+                    "('Round N reasoning and tool call:' / 'Observation:') before splicing "
+                    "the trace into the teacher prefix. Keeps <think>/<tool_call>/"
+                    "<tool_response> content verbatim -- only the control-token boundaries "
+                    "are rewritten. Without this, a multi-turn trace leaks raw "
+                    "<|im_end|><|im_start|>role tokens into the teacher's user turn "
+                    "(_strip_response_eos only removes the trailing one), teaching the "
+                    "student to emit control-token garbage. No-op for single-turn traces. "
+                    "Default False."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-tool-grammar",
+                type=str,
+                default="qwen25",
+                choices=["qwen25", "qwen3_coder"],
+                help=(
+                    "Tool-call GRAMMAR the teacher prefix / skill renders tool calls in, so "
+                    "the distilled text byte-matches what the student model emits. "
+                    "'qwen25' (Qwen3-4B): JSON object inside <tool_call> tags. "
+                    "'qwen3_coder' (Qwen3.5-4B): XML <function=NAME><parameter=P>value tags. "
+                    "MUST match --generate-tool-call-parser. Default qwen25."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-code-require-tool",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "For code-domain samples (metadata['domain']=='code'): grade the code the "
+                    "model actually RAN through code_interpreter (metadata['tool_trace']'s last "
+                    "call), NOT a text ```python fence. Makes the tool MANDATORY -- a trace that "
+                    "never executes its solution has no gradable candidate and is scored wrong, so "
+                    "the only path to a correct grade is running the solution via the tool. This "
+                    "counters Qwen3-4B's habit of one-shotting a code fence as its final answer "
+                    "(observed: 0/512 code traces used the tool). Set --no-sdpo-code-require-tool "
+                    "to grade the response fence instead. Default True."
+                ),
+            )
+            parser.add_argument(
                 "--sdpo-dynamic-filter-min-correct",
                 type=int,
                 default=0,
@@ -1545,7 +1590,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Max concurrent skill-condenser requests (bounds gateway load).",
             )
             # ---- Self-generated skill + skill-SDPO (examples/SDPO/sdpo.py) ------
-            # See DESIGN_self_skill.md.
+            # See examples/SDPO/doc/DESIGN_self_skill.md.
             parser.add_argument(
                 "--sdpo-self-skill",
                 action="store_true",
@@ -1636,6 +1681,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Truncation budget (characters, keeping the TAIL) for the rendered tool-"
                     "execution trace spliced into the --sdpo-skill-source env_feedback pitfall "
                     "prompt. Analogous to lasgroup/SDPO's max_reprompt_len/reprompt_truncation."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-max-prefix-chars",
+                type=int,
+                default=20000,
+                help=(
+                    "Truncation budget (characters, keeping the TAIL) for a multi-turn peer "
+                    "trace's reframed prose (_reframe_messages_to_prose) before it is spliced "
+                    "into the teacher prompt as the correct-peer prefix. Without this, one "
+                    "pathologically long peer trace (e.g. a code-domain trace with a long "
+                    "debugging loop) becomes the teacher prefix for every OTHER sample in its "
+                    "group, and a single such sample can't be split across dynamic-batch-size "
+                    "microbatches -- it OOMs the vocab-parallel forward alone. 0 = no cap."
                 ),
             )
             parser.add_argument(

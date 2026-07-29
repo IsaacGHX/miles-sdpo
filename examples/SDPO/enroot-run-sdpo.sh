@@ -87,8 +87,7 @@ enroot start --rw \
         cd /root/miles
 
         # Pick model by $SDPO_MODEL
-        # (qwen3 | olmo3 | olmo3-sci | olmo3-sci-colocate | olmo3-math-colocate |
-        #  nemo-sci | nemo-sci-colocate):
+        # (qwen3 | olmo3 | olmo3-sci | olmo3-sci-colocate | olmo3-math-colocate):
         # local dir name, HF repo id, megatron model-arg script, and the SDPO run
         # script. USE_BRIDGE=1 marks models loaded via AutoBridge straight from the
         # HF checkpoint (no offline _torch_dist conversion needed); default 0.
@@ -131,32 +130,6 @@ enroot start --rw \
                 MODEL_SH=scripts/models/olmo3-7B.sh
                 RUN_SH=examples/SDPO/run-olmo3-7B-sdpo-math-colocate.sh
                 DATA_KIND=dapo
-                ;;
-            nemo-sci)
-                # Nemotron-3-Nano-4B (DENSE nemotron_h = hybrid Mamba+Attention) on
-                # the SciKnowEval (MCQ) task. Loads via AutoBridge (the run script
-                # passes --megatron-to-hf-mode bridge), so NO _torch_dist conversion.
-                # DISAGGREGATED 4+4 (4 train GPUs, 4 SGLang rollout GPUs).
-                MODEL_DIR=NVIDIA-Nemotron-3-Nano-4B-BF16
-                HF_REPO=nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
-                MODEL_SH=scripts/models/nemotron-3-nano-4b.sh
-                RUN_SH=examples/SDPO/run-nemotron3-4b-sdpo-sci.sh
-                DATA_KIND=sci
-                USE_BRIDGE=1
-                ;;
-            nemo-sci-colocate)
-                # Same model/task/SDPO config as nemo-sci, but COLOCATE: all 8 GPUs
-                # run both the actor and the SGLang engines (time-shared via
-                # offload/onload). The serial generate->train loop leaves half the
-                # node idle under 4+4; colocate uses all 8 in both phases, so a 4B
-                # model gets ~2x rollout throughput. SDPO logic is unchanged (teacher
-                # weight swaps are training-side, decoupled from the rollout transport).
-                MODEL_DIR=NVIDIA-Nemotron-3-Nano-4B-BF16
-                HF_REPO=nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
-                MODEL_SH=scripts/models/nemotron-3-nano-4b.sh
-                RUN_SH=examples/SDPO/run-nemotron3-4b-sdpo-sci-colocate.sh
-                DATA_KIND=sci
-                USE_BRIDGE=1
                 ;;
             qwen3-4b-math-ablation)
                 # Qwen3-4B (thinking model) on DAPO math, COLOCATE -- the 6-arm

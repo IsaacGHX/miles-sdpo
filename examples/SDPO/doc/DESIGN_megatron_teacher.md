@@ -1,5 +1,25 @@
 # 设计方案：SDPO teacher 打分从 SGLang 挪到 Megatron 训练前向
 
+> **状态：已实现。** 通过 `--sdpo-teacher-backend megatron` 开启（默认仍是
+> `sglang`，见 `examples/SDPO/sdpo.py:1673`）。下面每个阶段后面标出了对应的
+> 实际代码位置。
+>
+> - `--sdpo-teacher-backend`：`miles/utils/arguments.py:1331`
+> - 阶段 A（rollout 侧只选 prefix，存 teacher prompt tokens）：
+>   `examples/SDPO/sdpo.py:1673` 起的 `sdpo_group_reward` megatron 分支，
+>   写入 `sample.metadata["sdpo_teacher_prompt_tokens"]` 见 `:2093`
+> - 阶段 B（数据透传）：`miles/ray/rollout/train_data_conversion.py:104-107`
+>   （写入 `train_data["sdpo_teacher_prompt_tokens"]`）
+> - 阶段 C（训练侧用 actor 权重对 prefix 序列 forward）：
+>   `miles/backends/megatron_utils/actor.py:609` `_compute_sdpo_teacher_log_probs`，
+>   序列构造见 `:1040` `_build_sdpo_teacher_rollout_data`
+> - 阶段 D（KL 复用 opd.py）：sampled 模式见 actor.py `:634-643`，写
+>   `rollout_data["teacher_log_probs"]`，`miles/backends/training_utils/loss_hub/opd.py`
+>   消费；**阶段 E（top-k 分布级 KD，非退化为 sampled-token）也已实现**——见
+>   `_compute_sdpo_teacher_log_probs` 里 `sdpo_kd_loss` 分支（actor.py:647-667）
+>   和 `DESIGN_kd_loss.md`（同目录）的完整链路，取代了本文档当时"若要 top-k
+>   需阶段 E"的开放问题。
+
 ## 目标 / 动机
 
 当前 SDPO（`--opd-type sglang` + self-teacher）把 teacher 打分外包给 SGLang HTTP。
@@ -35,7 +55,7 @@
 
 ## 方案（分阶段）
 
-### 阶段 A：rollout 侧只选 prefix，不打分（轻量）
+### 阶段 A：rollout 侧只选 prefix，不打分（轻量）— 实现：`examples/SDPO/sdpo.py:1673` 起
 
 改 `examples/SDPO/sdpo.py`：
 - `sdpo_group_reward` 保留 `_is_correct` 选 correct peer 的逻辑，但**不再调 `_teacher_score`（HTTP）**。
@@ -43,13 +63,13 @@
   （render + tokenize prefix，一次性，很轻）。correct=0/1 诊断保留。
 - 不再写 `sample.opd_reverse_kl`（改由训练侧算）。返回 reward（纯蒸馏=0）。
 
-### 阶段 B：数据流透传 prefix tokens
+### 阶段 B：数据流透传 prefix tokens — 实现：`miles/ray/rollout/train_data_conversion.py:104-107,209`
 
 改 `train_data_conversion.py`：
 - `convert_samples_to_train_data` 增加 `sdpo_prefix_tokens` key（每 sample 的 prefix token 列表）。
 - `split_train_data_by_dp` 的透传 key 列表加入 `sdpo_prefix_tokens`（随 partition 切分）。
 
-### 阶段 C：训练侧 teacher forward 走 actor 权重 + prefix 序列（核心）
+### 阶段 C：训练侧 teacher forward 走 actor 权重 + prefix 序列（核心）— 实现：`miles/backends/megatron_utils/actor.py:609` (`_compute_sdpo_teacher_log_probs`) + `:1040` (`_build_sdpo_teacher_rollout_data`)
 
 改 `miles/backends/megatron_utils/actor.py`：
 - 新增分支：当 `args.opd_type == "sglang"` 且 SDPO self-teacher 且有 `sdpo_prefix_tokens` 时，
@@ -62,7 +82,7 @@
 - 关键对齐：teacher 序列尾部的 response 段和 student 的 response 段**逐 token 一一对应**
   （因为 response 在尾部，prefix 只加在中间）。位置数 = response_length，与 student logprob 同形状。
 
-### 阶段 D：训练侧 KL 计算复用现有 opd.py
+### 阶段 D：训练侧 KL 计算复用现有 opd.py — sampled 路径实现：`miles/backends/megatron_utils/actor.py:634-643`
 
 - `opd.py` 的 sampled 路径已支持 `teacher_log_probs`，直接复用：
   `reverse_kl = student_log_probs - teacher_log_probs`。

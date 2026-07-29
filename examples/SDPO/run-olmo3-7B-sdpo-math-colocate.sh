@@ -118,7 +118,7 @@ RM_ARGS=(
    # Needs --sdpo-self-skill + --sdpo-skill-source covering correct peers (it does).
    # Falls back to the trace if a peer has no skill.
    --sdpo-response-prefix skill
-   # (see examples/SDPO/DESIGN_self_skill.md)
+   # (see examples/SDPO/doc/DESIGN_self_skill.md)
 )
 
 EVAL_ARGS=(

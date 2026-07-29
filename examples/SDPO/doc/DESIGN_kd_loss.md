@@ -1,5 +1,18 @@
 # 设计方案：SDPO 分布级 KD Loss（对齐原版 full_logit_distillation）
 
+> **状态：已实现。** 本文档是实现前的设计记录，保留供了解决策动机与权衡；
+> 下面每个改动点后面标出了对应的实际代码位置。
+>
+> - `--sdpo-kd-loss` / `--sdpo-kd-coef`：`miles/utils/arguments.py:1346-1364`
+> - teacher top-k target 生产：`miles/backends/megatron_utils/actor.py:609`
+>   `_compute_sdpo_teacher_log_probs`（`sdpo_kd_loss` 分支见第 647-667 行），写入
+>   `rollout_data["sdpo_teacher_topk_logprobs"/"sdpo_teacher_topk_ids"]`
+> - KD loss 本体：`miles/backends/training_utils/loss_hub/losses.py:49`
+>   `_sdpo_kd_loss_per_token`，在 `policy_loss_function`（同文件 `:224`）里于
+>   `:518-519` 调用、`:556`/`:560` 累加进总 loss
+> - 数据透传：`miles/backends/megatron_utils/actor.py:1214,1233-1236,1292-1323`
+>   （microbatch 切分/占位对齐）
+
 ## 问题
 
 当前 SDPO 把分布散度 `D(student‖teacher)` 当作 GRPO advantage 走 REINFORCE：
@@ -35,14 +48,14 @@ loss_kd = sdpo_kd_coef × mean_over_response_tokens( D( P_student ‖ P_teacher 
 
 ## 改动分解（5 处）
 
-### A. teacher target 生产（actor.py `_compute_sdpo_teacher_log_probs`）
+### A. teacher target 生产（actor.py `_compute_sdpo_teacher_log_probs`）— 实现：`miles/backends/megatron_utils/actor.py:609-667`
 - 保留 prefix 序列构造 + teacher forward，但**只算 teacher top-k**（detached），
   存 `rollout_data["sdpo_teacher_topk_logprobs"]`（[R,k]）、`["sdpo_teacher_topk_ids"]`（[R,k]）。
 - **不再**算 student top-k、**不再**写 `opd_reverse_kl`/`teacher_log_probs`。
 - 无 prefix 的样本：teacher target 置空（该样本 kd loss = 0）。
 - CPU 张量存储（[R,k] 小），随 rollout_data 走。
 
-### B. 数据透传
+### B. 数据透传 — 实现：`miles/backends/megatron_utils/actor.py:1214,1233-1236,1292-1323`
 - `train_data_conversion.py`：新增 `sdpo_teacher_topk_logprobs`/`_ids` 已在 rollout_data 里
   （actor 直接写 rollout_data，训练同进程，无需跨 ray 序列化）——确认 actor 写入点在
   `get_batch` 取 batch 之前。实际上 actor 在 train_actor 内先算 teacher target 再 forward_backward，
@@ -50,7 +63,7 @@ loss_kd = sdpo_kd_coef × mean_over_response_tokens( D( P_student ‖ P_teacher 
   按 microbatch 切分后放进 `batch`，供 `policy_loss_function` 读取。
 - 若 get_batch 只透传固定 key 列表 → 把两个新 key 加入。
 
-### C. KD loss（losses.py `policy_loss_function`）
+### C. KD loss（losses.py `policy_loss_function`）— 实现：`miles/backends/training_utils/loss_hub/losses.py:49` (`_sdpo_kd_loss_per_token`), 调用点 `:518-519`, 累加进 loss `:556`/`:560`
 - 新增分支：`if getattr(args, "sdpo_kd_loss", False) and "sdpo_teacher_topk_ids" in batch:`
   1. 对每个样本，用 grad-enabled `logits` 经 `get_responses` 取 response 段 logits chunk
   2. `_gather_true_on_policy_full_logits` → `log_softmax`（grad）
@@ -60,13 +73,13 @@ loss_kd = sdpo_kd_coef × mean_over_response_tokens( D( P_student ‖ P_teacher 
   6. `loss = sdpo_kd_coef × kd_loss`（+ entropy/kl_loss 观测项，纯蒸馏下 pg_loss 不参与或置 0）
 - 复用 losses.py 已有的 `sum_of_sample_mean`、per-sample reduction。
 
-### D. 关掉 advantage-hook SDPO
+### D. 关掉 advantage-hook SDPO — 落地为独立 KD（run 脚本示例：`examples/SDPO/run-qwen3-4B-sdpo-math-colocate.sh`）
 - run 脚本：去掉走 advantage 的 `--use-opd`（或保留 use_opd 但 opd_kl_coef=0），
   改用新的 `--sdpo-kd-loss --sdpo-kd-coef 1.0`。
 - 或：`--use-opd` 仍用于插桩，但 SDPO KD 独立于 advantage 注入 loss。
   倾向：**独立 KD**，最清晰。pure_distill 仍设 reward=0（advantage=0），KD 提供全部梯度。
 
-### E. 新参数（arguments.py）
+### E. 新参数（arguments.py）— 实现：`miles/utils/arguments.py:1346-1364`
 - `--sdpo-kd-loss`（bool，开启分布 KD loss 模式）
 - `--sdpo-kd-coef`（float，默认 1.0，KD loss 权重）
 

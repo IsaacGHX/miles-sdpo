@@ -49,9 +49,13 @@ Because ``--group-rm`` hands us the whole prompt group at once
 (see ``sglang_rollout.generate_and_rm_group``), we can choose a prefix from
 peer traces. This module only supports ``context_parallel_size == 1``: the
 divergence is computed on the full, un-sharded response token sequence.
+
+Correctness grading (deterministic matching, LLM-as-judge, code/search graders)
+lives in ``reward.py`` next to this file and is imported below.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -65,11 +69,23 @@ from typing import Any
 import numpy as np
 import torch
 
-from miles.rollout.rm_hub.math_dapo_utils import compute_score as _dapo_compute_score
-from miles.rollout.rm_hub.math_utils import extract_answer as extract_boxed_answer
-from miles.rollout.rm_hub.math_utils import grade_answer_verl
 from miles.utils.http_utils import post  # miles' shared HTTP client: retries + shared pool
 from miles.utils.types import Sample
+
+# Correctness / grading subsystem, split out for size -- see reward.py's module
+# docstring. Re-exported here (rather than only used internally) so external
+# call sites that historically did `from examples.SDPO.sdpo import _grade_group`
+# (e.g. examples/EPO/epo.py) keep working unchanged.
+from examples.SDPO.reward import (
+    _extract_answer,
+    _grade_group,
+    _grade_one_code,
+    _grade_one_search,
+    _is_correct,
+    _judge_semaphore,
+    _llm_judge_correct,
+    _sample_domain,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,12 +112,185 @@ PREFIX_INSTRUCTION = "\n\nCorrectly solve the original question.\n\n"
 # with the correct solution.
 PITFALLS_TEMPLATE = "\n\nCommon mistakes to avoid (seen in failed attempts):\n\n{pitfalls}"
 
+# Skill-KD 'self-success' teacher privileged hint. The skill-gen STUDENT prompt
+# already contains the full WORKED SOLUTION (see _skill_user_prompt) -- the
+# teacher's own trace, same text -- so re-splicing SOLUTION_TEMPLATE (the
+# response-SDPO template) here would just repeat it verbatim with zero new
+# information, and PREFIX_INSTRUCTION's "Correctly solve the original question"
+# is flatly wrong for a task whose job is "write a skill", not "answer the
+# math problem". The only genuine privileged signal a self-success teacher has
+# over the student is the CONFIRMATION that this solution is correct -- so hint
+# with just that, not a restated solution.
+SKILL_SELF_SUCCESS_HINT = (
+    "\n\n(This worked solution has been verified CORRECT. Distill the skill with "
+    "full confidence.)\n\n"
+)
+
 
 def _strip_thinking_blocks(text: str) -> str:
     """Remove <think>...</think> blocks from a response (for thinking models like Qwen3).
     Strips leading/trailing whitespace after removal so the peer solution stays clean."""
     stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     return stripped.strip()
+
+
+# --- multi-turn native-trace reframing for the teacher prefix --------------- #
+# A native tool-calling peer trace carries ChatML turn boundaries
+# (<|im_end|><|im_start|>role) between the assistant's tool call and the tool
+# response. Spliced verbatim into the teacher's USER turn, those RAW boundary
+# tokens make the teacher see a malformed nested conversation and partly learn
+# to emit control-token garbage (_strip_response_eos only removes the TRAILING
+# <|im_end|>, not the interior ones).
+#
+# Per the user's spec: ONLY reframe the <|im_start|>/<|im_end|> turn boundaries
+# -- replace each with a short NLP marker at the corresponding position (the
+# assistant turn -> "Round N reasoning and tool call:", the tool/user turn ->
+# "Observation:"). Leave the INNER semantic tags (<think>, <tool_call>,
+# <tool_response>) completely intact -- they are the content, not the control
+# structure. No-op for traces without ChatML boundaries (single-turn), so plain
+# single-turn SDPO is unchanged. Gated by --sdpo-reframe-multiturn-prefix.
+_IM_SPLIT_RE = re.compile(r"<\|im_end\|>\s*<\|im_start\|>\s*(assistant|user|system)\b[ \t]*\n?")
+_IM_ANY_RE = re.compile(r"<\|im_(?:start|end)\|>[ \t]*(?:assistant|user|system)?[ \t]*\n?")
+
+
+def _reframe_multiturn_trace(text: str) -> str:
+    """Replace ChatML <|im_*|> turn boundaries with simple per-round NLP markers,
+    keeping <think>/<tool_call>/<tool_response> content verbatim. Returns text
+    unchanged if it has no ChatML boundaries (single-turn no-op)."""
+    if not text or "<|im_" not in text:
+        return text
+
+    # Split on each "<|im_end|><|im_start|>role" boundary, remembering the role
+    # that OPENS each subsequent segment. The first segment is whatever the trace
+    # started mid-turn on (the assistant's first reasoning/tool-call turn).
+    segments: list[tuple[str, str]] = []  # (opening_role, segment_text)
+    last_end = 0
+    role_for_next = "assistant"  # trace begins inside the assistant's turn
+    for m in _IM_SPLIT_RE.finditer(text):
+        segments.append((role_for_next, text[last_end : m.start()]))
+        role_for_next = m.group(1)
+        last_end = m.end()
+    segments.append((role_for_next, text[last_end:]))
+
+    def _clean(seg: str) -> str:
+        # Only strip stray/standalone <|im_*|> tokens (e.g. leading/trailing);
+        # do NOT touch <think>/<tool_call>/<tool_response>.
+        return _IM_ANY_RE.sub("", seg).strip()
+
+    parts: list[str] = []
+    round_no = 0
+    for role, seg in segments:
+        seg = _clean(seg)
+        if not seg:
+            continue
+        if role == "assistant":
+            round_no += 1
+            parts.append(f"Round {round_no} reasoning and tool call:\n{seg}")
+        else:  # user/tool turn = the observation carrying <tool_response>
+            parts.append(f"Observation:\n{seg}")
+    return "\n\n".join(parts) if parts else _clean(text)
+
+
+def _tool_call_args_str(arguments) -> str:
+    """Normalize a tool call's arguments to a JSON string (native path stores a
+    JSON string; some paths store a dict)."""
+    if isinstance(arguments, str):
+        return arguments
+    try:
+        return json.dumps(arguments, ensure_ascii=False)
+    except Exception:
+        return str(arguments)
+
+
+def _render_tool_call(name: str, arguments, grammar: str = "qwen25") -> str:
+    """Render ONE tool call in the target model's native grammar. The model must
+    LEARN to emit exactly this, so it must byte-match what the rollout produces:
+      - qwen25 (Qwen3-4B): JSON object inside <tool_call> tags.
+      - qwen3_coder (Qwen3.5-4B): XML <function=NAME><parameter=P>value tags.
+    Parameterised so ONE codebase distils either model family."""
+    if grammar == "qwen3_coder":
+        # XML function/parameter form. arguments -> dict of parameters.
+        args_str = _tool_call_args_str(arguments)
+        try:
+            params = json.loads(args_str) if isinstance(args_str, str) else (arguments or {})
+        except Exception:
+            params = {}
+        if not isinstance(params, dict):
+            params = {}
+        lines = [f"<function={name}>"]
+        for k, v in params.items():
+            vs = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+            lines.append(f"<parameter={k}>\n{vs}\n</parameter>")
+        lines.append("</function>")
+        return "<tool_call>\n" + "\n".join(lines) + "\n</tool_call>"
+    # default qwen25: JSON-in-tags
+    call_json = f'{{"name": "{name}", "arguments": {_tool_call_args_str(arguments)}}}'
+    return f"<tool_call>\n{call_json}\n</tool_call>"
+
+
+def _render_tool_response(obs: str, grammar: str = "qwen25") -> str:
+    """Observation grammar. Both qwen families wrap the tool result in
+    <tool_response>...</tool_response>, so this is shared, but kept as a hook in
+    case a future model family differs."""
+    return f"<tool_response>\n{obs}\n</tool_response>"
+
+
+def _reframe_messages_to_prose(messages: list, remove_thinking: bool = False, grammar: str = "qwen25") -> str:
+    """NLP-ize a peer trace from its STRUCTURED message dict (the live record
+    multi_turn.generate keeps on metadata["messages"]) into per-round text:
+
+        Round N reasoning and tool call:
+        <assistant reasoning>
+        <tool_call> ...native tool-call grammar... </tool_call>
+
+        Observation:
+        <tool_response> <tool result> </tool_response>
+
+    CRITICAL: only the ChatML TURN BOUNDARIES (<|im_start|>/<|im_end|>) are
+    NLP-ized into "Round N.../Observation:" markers. The INNER tool grammar --
+    the <tool_call>/<tool_response> blocks -- is rendered in the TARGET MODEL's
+    native syntax (grammar arg: qwen25 JSON-in-tags for Qwen3-4B, qwen3_coder XML
+    for Qwen3.5-4B), because that grammar is exactly what the student must LEARN
+    to emit and it must byte-match the rollout. An earlier version rendered tool
+    calls as prose ("calls web_search({...})"), teaching the student to NARRATE
+    tool use instead of EMIT it -> tool-call rate collapsed 86%->16%. The tool
+    tags are plain text tokens (NOT ChatML control tokens like <|im_start|>), so
+    they splice safely into the teacher's USER turn without breaking student-
+    response token alignment. Dict-native counterpart of _reframe_multiturn_trace."""
+    parts: list[str] = []
+    round_no = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role == "assistant":
+            round_no += 1
+            # multi_turn.generate splits Qwen3/3.5's raw output into
+            # reasoning_content + content (the chat template bakes the OPENING
+            # <think> into the generation prefix, so raw text only has the
+            # closing tag -- see _split_reasoning_content). Re-wrap it here so
+            # remove_thinking / _strip_thinking_blocks behave exactly as they
+            # did when reasoning still lived inline in `content`.
+            reasoning = (m.get("reasoning_content") or "").strip()
+            if reasoning:
+                content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+            if remove_thinking:
+                content = _strip_thinking_blocks(content)
+            seg = content.strip()
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                name = fn.get("name", "tool")
+                seg = (seg + "\n" + _render_tool_call(name, fn.get("arguments", ""), grammar)).strip()
+            if seg:
+                parts.append(f"Round {round_no} reasoning and tool call:\n{seg}")
+        elif role == "tool":
+            obs = content.strip()
+            if obs:
+                parts.append(f"Observation:\n{_render_tool_response(obs, grammar)}")
+        # system/user turns are the shared problem context, not part of the peer
+        # trace prose -- skip (the student prompt already carries them).
+    return "\n\n".join(parts)
 
 
 def _render_prefix(peer_response: str, remove_thinking: bool = False, pitfalls: str = "") -> str:
@@ -115,7 +304,7 @@ def _render_prefix(peer_response: str, remove_thinking: bool = False, pitfalls: 
     return section + PREFIX_INSTRUCTION
 
 
-def _gen_prompt_suffix(tok) -> str:
+def _gen_prompt_suffix(tok, chat_template_kwargs: dict | None = None) -> str:
     """The exact string the chat template appends AFTER the user content when
     add_generation_prompt=True — e.g. '<|im_end|>\\n<|im_start|>assistant\\n' for
     ChatML (Qwen2.5/Qwen3). Derived from the tokenizer so it is template-agnostic.
@@ -127,10 +316,21 @@ def _gen_prompt_suffix(tok) -> str:
     i.e. the solution lives in the user turn, followed by a fresh assistant marker.
     Inserting it after '<|im_start|>assistant' instead (the old bug) pollutes the
     assistant turn and teaches the model to echo a pre-filled answer.
+
+    chat_template_kwargs (e.g. {"enable_thinking": False}) MUST match the run's,
+    because the suffix DIFFERS by thinking mode: Qwen3.5 no-think appends
+    '...assistant\\n<think>\\n\\n</think>\\n\\n', but the default (thinking) appends
+    '...assistant\\n<think>\\n'. The student prompt was rendered with the run's
+    kwargs, so the suffix must be derived the same way or the splice won't find it.
     """
-    sentinel = " SDPO_SENTINEL "
+    # Sentinel with NO surrounding spaces: some templates (Qwen3.5) strip leading/
+    # trailing whitespace from user content, so a space-padded sentinel wouldn't
+    # be found verbatim in the render (observed: " SDPO_SENTINEL " -> "SDPO_SENTINEL",
+    # split returns "", breaking the teacher-prefix splice).
+    sentinel = "SDPO_SENTINEL"
     rendered = tok.apply_chat_template(
-        [{"role": "user", "content": sentinel}], tokenize=False, add_generation_prompt=True
+        [{"role": "user", "content": sentinel}], tokenize=False, add_generation_prompt=True,
+        **(chat_template_kwargs or {}),
     )
     return rendered.split(sentinel, 1)[1] if sentinel in rendered else ""
 
@@ -174,7 +374,7 @@ def _choose_peer(args: Namespace, group: list[Sample], peers: list[int]) -> int:
     return random.choice(tool_using_peers) if tool_using_peers else random.choice(peers)
 
 
-def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_response: str, remove_thinking: bool = False, pitfalls: str = "") -> str:
+def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_response: str, remove_thinking: bool = False, pitfalls: str = "", reframe_multiturn: bool = False, peer_messages: list | None = None, grammar: str = "qwen25", max_prefix_chars: int = 0) -> str:
     """Insert the correct-peer solution + instruction into the USER turn of the
     student's (already chat-templated) prompt, before the assistant generation
     marker. Returns the full teacher prompt string (system + user+solution +
@@ -183,13 +383,61 @@ def _build_teacher_prompt_str(student_prompt: str, gen_suffix: str, peer_respons
     The peer response is stripped of its trailing <|im_end|>/EOS first — it was a
     full generated turn, and leaving that marker in mid-user-turn would close the
     user turn early and corrupt the teacher prompt (the model would then see the
-    solution as a separate malformed turn instead of context)."""
-    solution_section = _render_prefix(_strip_response_eos(peer_response), remove_thinking=remove_thinking, pitfalls=pitfalls)
+    solution as a separate malformed turn instead of context).
+
+    reframe_multiturn (--sdpo-reframe-multiturn-prefix): for NATIVE multi-turn
+    tool-calling peer traces, also strip the MID-trace control tokens
+    (<tool_call>/<tool_response>/<|im_start|>/<|im_end|>) and re-template into
+    clean per-round prose (see _reframe_multiturn_trace) — _strip_response_eos
+    alone only removes the trailing marker, leaving the interior ones to pollute
+    the teacher. No-op for single-turn traces.
+
+    max_prefix_chars (--sdpo-max-prefix-chars, 0=off): cap the reframed prose to
+    its LAST N chars before splicing. A peer trace with a long debugging loop
+    (observed: code-domain traces up to ~65K chars) becomes the teacher prefix
+    for every OTHER sample in its group; one such oversized sample can't be
+    split across a dynamic-batch-size microbatch, so it OOMs the vocab-parallel
+    forward alone. Keeping the TAIL (not head) preserves the final answer/
+    conclusion, which matters more to a teacher-forced KD target than the
+    early exploration."""
+    # Prefer the dict-native prose when the peer's structured messages are
+    # available (multi_turn.generate records them): rendered from the real
+    # tool_calls field, can't mis-split on a stray marker. Fall back to the
+    # raw-text reframe (legacy / when no messages recorded).
+    if peer_messages:
+        cleaned = _reframe_messages_to_prose(peer_messages, remove_thinking=remove_thinking, grammar=grammar)
+    else:
+        cleaned = _strip_response_eos(peer_response)
+        if reframe_multiturn:
+            cleaned = _reframe_multiturn_trace(cleaned)
+    if max_prefix_chars and len(cleaned) > max_prefix_chars:
+        cleaned = cleaned[-max_prefix_chars:]
+    # remove_thinking already applied inside _reframe_messages_to_prose for the
+    # dict path; _render_prefix re-applying it on already-clean prose is a no-op.
+    solution_section = _render_prefix(cleaned, remove_thinking=remove_thinking and not peer_messages, pitfalls=pitfalls)
     if gen_suffix and gen_suffix in student_prompt:
         idx = student_prompt.rfind(gen_suffix)
         return student_prompt[:idx] + solution_section + student_prompt[idx:]
     # Fallback (unknown template): append at the end. Not ideal but never crashes.
     return student_prompt + solution_section
+
+
+def _build_skill_self_success_teacher_prompt_str(student_prompt: str, gen_suffix: str) -> str:
+    """Skill-KD 'self-success' teacher: the skill-gen prompt PLUS a privileged
+    confirm-correct hint, inserted before the assistant marker (same insert
+    point as _build_teacher_prompt_str/_build_failure_teacher_prompt_str).
+
+    Does NOT reuse _build_teacher_prompt_str/_render_prefix (the response-SDPO
+    template): that would re-splice SOLUTION_TEMPLATE's "Correct solution:
+    {trace}" with the SAME worked solution already in the student prompt's own
+    WORKED SOLUTION field (see _skill_user_prompt) -- a verbatim repeat, not
+    new privileged info -- followed by PREFIX_INSTRUCTION's "Correctly solve
+    the original question", which is simply the wrong instruction for a task
+    whose job is "write a skill" (see SKILL_SELF_SUCCESS_HINT's docstring)."""
+    if gen_suffix and gen_suffix in student_prompt:
+        idx = student_prompt.rfind(gen_suffix)
+        return student_prompt[:idx] + SKILL_SELF_SUCCESS_HINT + student_prompt[idx:]
+    return student_prompt + SKILL_SELF_SUCCESS_HINT
 
 
 def _build_failure_teacher_prompt_str(student_prompt: str, gen_suffix: str, failure_info: str) -> str:
@@ -236,228 +484,6 @@ def _response_tokens(sample: Sample) -> list[int]:
     return sample.tokens[_prompt_len(sample) :]
 
 
-def _extract_tagged_answer(text: str, tag: str = "answer") -> str | None:
-    """Extract the content of the LAST <tag>...</tag> block, or None if absent.
-
-    Open-ended SDPO asks the model to wrap its final answer in <answer>...</answer>
-    (see examples/SDPO/build_sci_dataset.py). We take the last occurrence so a
-    model that reasons and revises still yields its final answer. Returns None
-    (not "") when the tag is missing so callers can treat "no answer" as wrong.
-    """
-    if not text:
-        return None
-    matches = re.findall(rf"<{tag}>(.*?)</{tag}>", text, flags=re.DOTALL | re.IGNORECASE)
-    if matches:
-        return matches[-1].strip()
-    # Tolerate an unclosed final tag ("<answer> foo" with no </answer>).
-    m = re.search(rf"<{tag}>(.*)$", text, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
-def _extract_answer(args: Namespace, sample: Sample) -> str | None:
-    """The model's final answer: prefer the <answer> tag, fall back to \\boxed{}."""
-    tag = getattr(args, "sdpo_answer_tag", "answer")
-    tagged = _extract_tagged_answer(sample.response, tag)
-    if tagged is not None:
-        return tagged
-    return extract_boxed_answer(sample.response)
-
-
-def _is_correct(sample: Sample, args: Namespace | None = None) -> bool:
-    """Grade a trace against its label with exact/heuristic matching (no LLM).
-
-    The SciKnowEval dataset (see build_sci_dataset.py) is multiple choice: the
-    label is the answer LETTER and the model outputs the letter inside
-    <answer>...</answer>. We do a case-insensitive letter match on the extracted
-    answer. Non-letter labels (if any) fall back to math-style grading.
-    """
-    # DAPO math dataset: integer answers in \boxed{}. Use DAPO's own grader with
-    # strict_box_verify=True (the default minerva path expects an "Answer: X" line;
-    # the strict-box path extracts the \boxed{} answer, which is what the models emit).
-    if args is not None and getattr(args, "sdpo_grader", "mcq") == "dapo":
-        label = (sample.label or "").strip()
-        if not label:
-            return False
-        # is_correct_strict_box (see math_dapo_utils.py) scans the response's
-        # last 100 chars for the LAST \boxed{...} occurrence -- correct for
-        # examples that teach the model to write \boxed{} directly (e.g. raw
-        # DAPO data), but wrong for examples like SDPO_ReAct whose prompt
-        # contracts <answer>...</answer> as the ONLY final-answer marker and
-        # never mentions \boxed{} at all. For those, a stray \boxed{} left
-        # over from intermediate reasoning prose (or one omitted entirely
-        # from inside a `<answer>N</answer>` with no \boxed{} wrapper) makes
-        # grading depend on incidental formatting instead of the tag the
-        # model was actually told to use -- observed as "sometimes \boxed{}
-        # counts, sometimes the <answer> tag counts" inconsistency. When the
-        # tag is present, grade ONLY its content (wrapped in \boxed{} so it
-        # still flows through DAPO's own normalization/matching logic) --
-        # this is a no-op for prompts that never use the tag (extracted is
-        # None -> falls through to the raw-response path unchanged).
-        tag = getattr(args, "sdpo_answer_tag", "answer")
-        extracted = _extract_tagged_answer(sample.response, tag)
-        graded_text = f"\\boxed{{{extracted}}}" if extracted is not None else (sample.response or "")
-        try:
-            return bool(_dapo_compute_score(graded_text, label, strict_box_verify=True)["acc"])
-        except Exception:
-            return bool(grade_answer_verl(graded_text, label))
-
-    tag = getattr(args, "sdpo_answer_tag", "answer") if args is not None else "answer"
-    extracted = _extract_tagged_answer(sample.response, tag)
-    if extracted is None:
-        extracted = extract_boxed_answer(sample.response)
-    label = (sample.label or "").strip()
-    if not label:
-        return False
-
-    # Legacy single-letter labels (old MCQ dataset): case-insensitive letter match.
-    if len(label) == 1 and label.isalpha():
-        pred = (extracted or "").strip()
-        if len(pred) > 1:  # e.g. "B." or "(B)" -> keep first alpha char
-            pred = next((c for c in pred if c.isalpha()), pred)
-        return pred.upper() == label.upper()
-
-    # Open-ended: exact (normalized) match or math-style grading.
-    pred = (extracted or "").strip()
-    if pred and pred.lower() == label.lower():
-        return True
-    return bool(grade_answer_verl(extracted or sample.response, label))
-
-
-# --------------------------------------------------------------------------- #
-# LLM-as-judge grading  (defeats the MCQ letter-guessing reward hack)
-# --------------------------------------------------------------------------- #
-
-_JUDGE_SYSTEM = (
-    "You are a strict grader for science exam answers. You are given the QUESTION, "
-    "the REFERENCE ANSWER (ground truth), the model's FULL RESPONSE, and the model's "
-    "EXTRACTED ANSWER. Decide whether the model's answer is scientifically correct "
-    "and equivalent to the reference answer.\n\n"
-    "Rules:\n"
-    "- Judge correctness of the ANSWER's meaning, not its wording/format. Accept "
-    "mathematically or chemically equivalent forms (e.g. same SMILES/quantity/name).\n"
-    "- The extracted answer must actually answer the question. A blank, missing, or "
-    "placeholder answer is INCORRECT even if the full response rambles near the topic.\n"
-    "- Do NOT give credit for a guess with no supporting reasoning if it does not match "
-    "the reference answer.\n"
-    "Reply with EXACTLY one word on the final line: CORRECT or INCORRECT."
-)
-
-
-def _build_judge_prompt(args: Namespace, sample: Sample) -> tuple[str, str]:
-    """Return (system, user) messages for the judge. Includes BOTH the full response
-    and the extracted answer, per the requirement to give the judge both."""
-    meta = sample.metadata if isinstance(sample.metadata, dict) else {}
-    question = meta.get("question") or (sample.prompt if isinstance(sample.prompt, str) else "")
-    reference = (sample.label or "").strip()
-    extracted = _extract_answer(args, sample)
-    full = sample.response or ""
-    # Cap the full response so the judge prompt stays bounded on very long traces.
-    if len(full) > 8000:
-        full = full[:4000] + "\n...[truncated]...\n" + full[-3000:]
-    user = (
-        f"QUESTION:\n{question}\n\n"
-        f"REFERENCE ANSWER:\n{reference}\n\n"
-        f"MODEL FULL RESPONSE:\n{full}\n\n"
-        f"MODEL EXTRACTED ANSWER:\n{extracted if extracted is not None else '(none — no <answer> tag found)'}\n\n"
-        "Is the model's answer correct? Reply CORRECT or INCORRECT."
-    )
-    return _JUDGE_SYSTEM, user
-
-
-# GLOBAL judge concurrency limiter. Each rollout spawns one generate_and_rm_group
-# task PER GROUP (rollout_batch_size groups) and they all run concurrently, so a
-# per-call semaphore would only bound the ~n_samples_per_prompt traces within one
-# group — the real cap must be process-wide. This single semaphore is shared by
-# every group's judge calls, so --sdpo-judge-max-concurrency bounds TOTAL in-flight
-# judge requests to the gateway (else 32 groups x 8 traces = 256 at once).
-_JUDGE_SEM: "asyncio.Semaphore | None" = None
-_JUDGE_SEM_LIMIT: int | None = None
-
-
-def _judge_semaphore(args: Namespace) -> asyncio.Semaphore:
-    global _JUDGE_SEM, _JUDGE_SEM_LIMIT
-    limit = int(getattr(args, "sdpo_judge_max_concurrency", 32))
-    # Recreate if the limit changed (or first use). Safe: single event loop.
-    if _JUDGE_SEM is None or _JUDGE_SEM_LIMIT != limit:
-        _JUDGE_SEM = asyncio.Semaphore(limit)
-        _JUDGE_SEM_LIMIT = limit
-    return _JUDGE_SEM
-
-
-def _parse_judge_verdict(text: str) -> bool:
-    """Parse the judge's reply into a bool. Looks for the last CORRECT/INCORRECT."""
-    if not text:
-        return False
-    up = text.upper()
-    # INCORRECT contains CORRECT, so search for whole-word tokens and take the last.
-    hits = re.findall(r"\b(INCORRECT|CORRECT)\b", up)
-    if not hits:
-        return False
-    return hits[-1] == "CORRECT"
-
-
-async def _llm_judge_correct(args: Namespace, sample: Sample) -> bool:
-    """Grade one trace via the OpenAI-compatible LLM judge (SFR gateway).
-
-    Falls back to deterministic _is_correct on any judge failure so a flaky
-    gateway never stalls or crashes training.
-    """
-    system, user = _build_judge_prompt(args, sample)
-    base_url = getattr(args, "sdpo_judge_base_url", "https://api.openai.com/v1").rstrip("/")
-    model = getattr(args, "sdpo_judge_model", "gpt-5.4-mini")
-    api_key = os.environ.get(getattr(args, "sdpo_judge_api_key_env", "OPENAI_API_KEY"), "") or "EMPTY"
-    max_tokens = int(getattr(args, "sdpo_judge_max_tokens", 2048))
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    # gpt-5*/o-series are reasoning models: use max_completion_tokens, ignore temperature.
-    if model.startswith(("gpt-5", "o1", "o3", "o4")):
-        payload["max_completion_tokens"] = max_tokens
-    else:
-        payload["max_completion_tokens"] = max_tokens
-        payload["temperature"] = 0.0
-    headers = {"Content-Type": "application/json"}
-    if api_key and api_key != "EMPTY":
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    try:
-        # Low retry count: the judge is best-effort, fall back fast on failure.
-        out = await post(f"{base_url}/chat/completions", payload, max_retries=3, headers=headers)
-        content = out["choices"][0]["message"].get("content") or ""
-        return _parse_judge_verdict(content)
-    except Exception as e:
-        logger.warning(f"LLM judge failed ({e!r}); falling back to deterministic grading.")
-        return _is_correct(sample, args)
-
-
-async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
-    """Correctness for every trace in a group. Uses the LLM judge (bounded
-    concurrency) when --sdpo-judge is set, else deterministic matching."""
-    if not getattr(args, "sdpo_judge", False):
-        return [_is_correct(s, args) for s in group]
-
-    # Process-wide cap (shared across all concurrently-running groups), so the
-    # judge calls are concurrent — both within a group (gather) and across groups
-    # (each group is its own asyncio task) — without overloading the gateway.
-    sem = _judge_semaphore(args)
-
-    async def _one(s: Sample) -> bool:
-        # Skip the judge for empty responses (cheap, obviously wrong).
-        if not (s.response or "").strip():
-            return False
-        async with sem:
-            return await _llm_judge_correct(args, s)
-
-    return list(await asyncio.gather(*(_one(s) for s in group)))
-
-
 # --------------------------------------------------------------------------- #
 # Trace condensation / SkillOpt  (distill the correct peer trace into a SKILL)
 # --------------------------------------------------------------------------- #
@@ -467,20 +493,28 @@ async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
 # lasgroup/SDPO trace_condense (verl/trainer/ppo/trace_condense.py).
 
 _SKILL_SYSTEM_PROMPT = (
-    "You distill a worked solution into a SKILL: a concrete solution ROADMAP that a "
-    "capable solver could follow to reach the correct answer to THIS problem on their "
-    "own. It is grounded in this specific problem — name the key quantities, the "
-    "governing relation/theorem to apply, the decisive facts or comparisons that "
-    "discriminate the right choice from the wrong ones, and the key intermediate "
-    "results along the way — but it stops one step short of the final answer.\n\n"
+    "You are given a CORRECT worked solution. Distill the transferable KNOW-HOW it "
+    "used into a list of tiny, self-contained SKILLS — each a reusable knowledge/rule "
+    "unit, NOT a step-by-step roadmap of this specific problem. Use this EXACT "
+    "structured format, one block per distinct skill (1-3 blocks):\n\n"
+    "[Knowledge/Rule]\n"
+    "<a general principle / identity / method / theorem the solution relied on — "
+    "transferable, concrete, not vague>\n"
+    "[Details/Examples]\n"
+    "<a tiny concrete worked instance of the rule (small numbers / short snippet), "
+    "NOT this problem's final answer>\n\n"
+    "Good (specific):\n"
+    "[Knowledge/Rule]\nExpanding a^2+b^2 keeps the cross term: a^2+b^2 = (a+b)^2 - 2ab.\n"
+    "[Details/Examples]\nIf u+v=6 and uv=4 then u^2+v^2 = 36 - 8 = 28.\n\n"
+    "Bad (vague / problem-specific roadmap, do NOT do this): 'First read the problem, "
+    "then set up equations, then solve' / 'Be careful with algebra'.\n\n"
     "Hard constraints:\n"
-    "- Be a clear numbered roadmap: 6-10 short steps, each an imperative instruction.\n"
-    "- Instance-grounded: DO reference this problem's specific quantities, setup, and "
-    "the critical intermediate values/comparisons needed to get the answer right.\n"
-    "- Do NOT state the final answer itself (no final letter/number/name, no "
-    "'the answer is ...'). Stop at the last step BEFORE committing to the answer, so "
-    "the reader must still perform the final selection/computation themselves.\n"
-    "- Output ONLY the numbered steps, nothing else."
+    "- Use the literal [Knowledge/Rule]/[Details/Examples] headers for every block.\n"
+    "- Each skill must be a TRANSFERABLE unit usable on OTHER problems, not a recipe "
+    "specific to this one; the [Details/Examples] a self-contained mini instance.\n"
+    "- Do NOT state this problem's final answer (no final letter/number/name, no "
+    "'the answer is ...').\n"
+    "- Output ONLY the [Knowledge/Rule]/[Details/Examples] blocks, nothing else."
 )
 
 # Incorrect-trace variant: the attempt is WRONG. A model that failed this problem
@@ -493,19 +527,30 @@ _SKILL_SYSTEM_PROMPT = (
 # a solution and never the answer.
 _SKILL_SYSTEM_PROMPT_INCORRECT = (
     "You are given a FAILED attempt at a problem and the ground-truth answer. The "
-    "attempt is WRONG. Do NOT try to solve the problem or write a correct solution — "
-    "you only have a failed attempt to learn from. Instead, identify the SPECIFIC "
-    "mistakes the attempt made and turn each into a concrete PITFALL WARNING: a "
-    "'do not do X / watch out for Y' note grounded in this problem's setup, so a "
-    "solver would avoid that same error on this kind of problem.\n\n"
+    "attempt is WRONG. Do NOT solve the problem or write a correct solution — you "
+    "only learn from the failure. Extract the SPECIFIC mistake(s) as concrete, "
+    "reusable lessons in this EXACT structured format (one block per distinct "
+    "mistake, 1-3 blocks total):\n\n"
+    "[Error]\n"
+    "<the specific wrong step/assumption the attempt made — concrete, not vague>\n"
+    "[Rule]\n"
+    "<the general principle/identity/method that would have avoided it>\n"
+    "[Example]\n"
+    "<a tiny concrete worked instance of the rule (small numbers / short snippet), "
+    "NOT this problem's answer>\n\n"
+    "Good (specific):\n"
+    "[Error]\nDropped the coefficient 2 when expanding the identity.\n"
+    "[Rule]\na^2+b^2 = (a+b)^2 - 2ab.\n"
+    "[Example]\nIf u+v=6 and uv=4 then u^2+v^2 = 36 - 8 = 28.\n\n"
+    "Bad (vague, do NOT do this): 'Be careful with the algebra' / 'Avoid mistakes "
+    "in expansion'.\n\n"
     "Hard constraints:\n"
-    "- Output 2-5 numbered pitfall bullets, each an imperative 'Avoid ...' / "
-    "'Do not ...' / 'Watch out that ...' warning naming the concrete mistake.\n"
-    "- Diagnose from the attempt; reference this problem's specific quantities/setup "
-    "where it sharpens the warning. Do NOT provide the correct steps or method.\n"
-    "- Never state the final/ground-truth answer (no letter/number/name, no "
-    "'the answer is ...') and never give a worked solution.\n"
-    "- Output ONLY the numbered pitfall warnings, nothing else."
+    "- Use the literal [Error]/[Rule]/[Example] headers for every block.\n"
+    "- Each field must be SPECIFIC and concrete; the [Rule] must be a transferable "
+    "principle, the [Example] a self-contained mini worked instance.\n"
+    "- Never state this problem's final/ground-truth answer and never give its full "
+    "worked solution.\n"
+    "- Output ONLY the [Error]/[Rule]/[Example] blocks, nothing else."
 )
 
 # Second-stage aggregation: given the pitfalls distilled from EVERY failed trace in
@@ -515,17 +560,19 @@ _SKILL_SYSTEM_PROMPT_INCORRECT = (
 # into the failed traces' teacher prefix, so the teacher sees a tight "here's how
 # this group tends to fail" summary rather than a long noisy dump.
 _PITFALL_SUMMARY_SYSTEM = (
-    "You are given several sets of PITFALL WARNINGS, each distilled from a different "
-    "failed attempt at the SAME problem. Synthesize the COMMON, recurring mistakes "
-    "into one short shared list of pitfalls to avoid on this problem. Merge duplicates, "
-    "keep only the mistakes that matter most, and drop one-off noise.\n\n"
+    "You are given several sets of PITFALL LESSONS (each a list of [Error]/[Rule]/"
+    "[Example] blocks) distilled from different failed attempts at the SAME problem. "
+    "Synthesize the COMMON, recurring mistakes into one short shared list, merging "
+    "duplicates and dropping one-off noise, KEEPING the same structured format.\n\n"
+    "Output 1-3 blocks, each EXACTLY:\n"
+    "[Error]\n<the specific recurring mistake>\n"
+    "[Rule]\n<the general principle/identity/method that avoids it>\n"
+    "[Example]\n<a tiny concrete worked instance, NOT this problem's answer>\n\n"
     "Hard constraints:\n"
-    "- Output 2-4 numbered pitfall bullets, each an imperative 'Avoid ...' / "
-    "'Do not ...' / 'Watch out that ...' warning.\n"
-    "- Be concise and general enough to cover the recurring errors; still grounded in "
-    "this problem's setup where it sharpens the warning.\n"
+    "- Use the literal [Error]/[Rule]/[Example] headers; keep each field SPECIFIC "
+    "(no vague 'be careful' warnings).\n"
     "- Never state the final/ground-truth answer and never give a worked solution.\n"
-    "- Output ONLY the numbered pitfall warnings, nothing else."
+    "- Output ONLY the [Error]/[Rule]/[Example] blocks, nothing else."
 )
 
 
@@ -534,8 +581,8 @@ def _pitfall_summary_user_prompt(problem: str, pitfall_sets: list[str]) -> str:
     return (
         f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
         f"{blocks}\n\n"
-        "Synthesize the common recurring pitfalls (2-4 numbered 'Avoid ...' bullets; "
-        "no solution, no answer)."
+        "Synthesize the common recurring pitfalls into 1-3 [Error]/[Rule]/[Example] "
+        "blocks (merge duplicates, drop one-off noise; no solution, no answer)."
     )
 
 
@@ -547,14 +594,19 @@ def _pitfall_summary_user_prompt(problem: str, pitfall_sets: list[str]) -> str:
 # wrong. KD pulls the problem-only student toward the failure-informed teacher.
 _PITFALL_PREDICT_SYSTEM = (
     "Given a problem (and NOTHING else — no attempt, no answer), predict the pitfalls "
-    "a solver is most likely to fall into on this kind of problem, as concrete "
-    "warnings to avoid.\n\n"
+    "a solver is most likely to fall into on this kind of problem. Output them as tiny "
+    "self-contained skills in this EXACT format, one block per distinct pitfall "
+    "(1-3 blocks):\n\n"
+    "[Error]\n<the specific trap a solver is likely to fall into here — concrete>\n"
+    "[Rule]\n<the general principle/method that avoids it>\n"
+    "[Example]\n<a tiny concrete worked instance of the rule, NOT this problem's answer>\n\n"
     "Hard constraints:\n"
-    "- Output 2-5 numbered pitfall bullets, each an imperative 'Avoid ...' / "
-    "'Do not ...' / 'Watch out that ...' warning grounded in this problem's setup.\n"
-    "- Do NOT solve the problem or give the method/steps; only the traps to avoid.\n"
+    "- Use the literal [Error]/[Rule]/[Example] headers for every block; keep each "
+    "field SPECIFIC (no vague 'be careful' warnings).\n"
+    "- Do NOT solve the problem or give its full method; only the traps + the rule "
+    "that avoids each.\n"
     "- Never state a final answer.\n"
-    "- Output ONLY the numbered pitfall warnings, nothing else."
+    "- Output ONLY the [Error]/[Rule]/[Example] blocks, nothing else."
 )
 
 # Label for the privileged failure info spliced into the pitfall-condense TEACHER
@@ -567,8 +619,8 @@ FAILURES_TEMPLATE = "\n\nObserved failed-attempt pitfalls (privileged, do not re
 def _pitfall_predict_user_prompt(problem: str) -> str:
     return (
         f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
-        "Predict the pitfalls to avoid (2-5 numbered 'Avoid ...' bullets; no solution, "
-        "no answer)."
+        "Predict the pitfalls to avoid as 1-3 [Error]/[Rule]/[Example] tiny-skill "
+        "blocks (no solution, no answer)."
     )
 
 
@@ -641,8 +693,9 @@ def _skill_user_prompt(problem: str, solution: str) -> str:
     return (
         f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
         f"WORKED SOLUTION (reference, do not echo):\n{solution}\n\n"
-        "Write the solution roadmap (6-10 numbered steps, instance-grounded, "
-        "stop one step before the final answer)."
+        "Distill the transferable know-how into 1-3 [Knowledge/Rule]/[Details/Examples] "
+        "tiny-skill blocks (each reusable on OTHER problems; do not state this "
+        "problem's final answer)."
     )
 
 
@@ -710,8 +763,9 @@ def _skill_user_prompt_incorrect(
         f"GROUND-TRUTH ANSWER (for locating the mistake only, do NOT put it in the output):\n{gt}\n\n"
         f"{env_section}"
         f"{note}\n\n"
-        "Identify the specific mistakes and write the pitfall warnings (2-5 numbered "
-        "'Avoid ...'/'Do not ...' bullets; no solution, no answer)."
+        "Identify the specific mistake(s) and write them as [Error]/[Rule]/[Example] "
+        "blocks (1-3 blocks, using the literal headers; specific and concrete; no "
+        "solution, no answer)."
     )
 
 
@@ -793,6 +847,7 @@ async def _generate_skill_text(args: Namespace, system: str, user: str, backend:
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         tokenize=False,
         add_generation_prompt=True,
+        **_skill_gen_template_kwargs(),
     )
     prompt_ids = tok.encode(text, add_special_tokens=False)
     res = await _self_generate_skill(args, prompt_ids)
@@ -862,8 +917,20 @@ def _skill_gen_prompt_ids(
         ],
         tokenize=False,
         add_generation_prompt=True,
+        **_skill_gen_template_kwargs(),
     )
     return tok.encode(text, add_special_tokens=False)
+
+
+def _skill_gen_template_kwargs() -> dict:
+    """Chat-template kwargs for SKILL GENERATION. Force enable_thinking=False so a
+    thinking model (Qwen3) does NOT spend its skill budget on a <think> chain that
+    then dominates / leaks into the skill text used as the KD prefix (observed: the
+    self-gen skill was mostly thinking prose, and the condensed skill became a
+    tool-free reasoning roadmap that collapsed tool use). No-think makes the whole
+    budget produce the actual skill directly. Harmless for non-thinking models
+    whose template ignores the kwarg."""
+    return {"enable_thinking": False}
 
 
 def _strip_think_tokens(tok, tokens: list[int], logprobs: list[float]) -> tuple[list[int], list[float]]:
@@ -1304,8 +1371,10 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # CUDA-graph'd forward, ~50x faster than SGLang eager full-seq-logprob
         # scoring. opd_reverse_kl is computed on the training side (opd.py).
         tok = _tokenizer(args)
-        gen_suffix = _gen_prompt_suffix(tok)
+        gen_suffix = _gen_prompt_suffix(tok, getattr(args, "apply_chat_template_kwargs", None))
         remove_thinking = getattr(args, "sdpo_remove_thinking_from_demonstration", False)
+        reframe_multiturn = getattr(args, "sdpo_reframe_multiturn_prefix", False)
+        tool_grammar = getattr(args, "sdpo_tool_grammar", "qwen25")  # qwen25 JSON | qwen3_coder XML
         condense = getattr(args, "sdpo_trace_condense", False)
         self_skill = getattr(args, "sdpo_self_skill", False)
         skill_kd = self_skill and getattr(args, "sdpo_skill_kd", False)
@@ -1332,6 +1401,17 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # teacher prefix (and a failed trace with no correct peer still gets a prefix
         # made of just those lessons).
         pitfall_active = self_skill and skill_source in ("incorrect", "all")
+        # enable_kl (above) gates the whole group on "at least 1 correct trace", which
+        # was written for base SDPO (a correct-peer prefix needs a correct peer to
+        # exist). Under pitfall injection a FAILED trace's prefix is built from OTHER
+        # failed traces' pitfalls, not a correct peer, so an ALL-WRONG group (0 correct
+        # traces) should still get pitfall-only prefixes for every failed trace --
+        # enable_kl=False was skipping the per-sample loop below entirely before it
+        # ever reached the pitfall_active branch, silently dropping the KD signal for
+        # every sample in such groups (confirmed live: 10/32 groups, 80/256 samples in
+        # one rollout had has_prefix=False despite --sdpo-skill-source incorrect).
+        if pitfall_active:
+            enable_kl = True
 
         # Pass 1: pick each trace's correct peer (self-excluded). prefix_text is the
         # peer's solution — either the full response, or (with --sdpo-trace-condense)
@@ -1340,6 +1420,11 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # pitfall injection, FAILED traces that have no correct peer still enter
         # prefix_text_by_idx (empty base) so the shared pitfalls can be spliced in.
         prefix_text_by_idx: dict[int, str] = {}
+        # Peer's STRUCTURED message dict (metadata["messages"] from
+        # multi_turn.generate), when present -- the dict-native prefix source.
+        # Preferred over the raw-text reframe: rendered from the real tool_calls
+        # field, never mis-splits on a stray marker. See _reframe_messages_to_prose.
+        prefix_messages_by_idx: dict[int, list] = {}
         peer_by_idx: dict[int, int] = {}
         for i, sample in enumerate(group):
             if not isinstance(sample.metadata, dict):
@@ -1361,6 +1446,10 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
             peer_j = _choose_peer(args, group, peers)
             peer_by_idx[i] = peer_j
             prefix_text_by_idx[i] = group[peer_j].response
+            peer_md = group[peer_j].metadata if isinstance(group[peer_j].metadata, dict) else {}
+            peer_msgs = peer_md.get("messages")
+            if peer_msgs:
+                prefix_messages_by_idx[i] = peer_msgs
 
         # Optional: the CURRENT policy self-generates a skill during rollout from a
         # trace's OWN response, and (for skill-KD) we run a second SDPO on the skill
@@ -1430,11 +1519,19 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 problem = _problem_of(i)
                 self_ok = bool(correctness[i]) if i < len(correctness) else False
                 fkind = "wrong" if self_ok else _failure_kind(args, group[i])
+                # Skill is distilled from the trace. Prefer the dict-native prose
+                # (from metadata["messages"]) over the raw ChatML response: the
+                # skill generator then reads clean per-round "Round N.../
+                # Observation:..." prose (tool calls from the real tool_calls
+                # field) instead of scraping <tool_call>/<|im_*|> markers.
+                _md_i = group[i].metadata if isinstance(group[i].metadata, dict) else {}
+                _msgs_i = _md_i.get("messages")
+                solution_i = _reframe_messages_to_prose(_msgs_i, grammar=tool_grammar) if _msgs_i else group[i].response
                 gen_prompt_ids = _skill_gen_prompt_ids(
                     args,
                     tok,
                     problem,
-                    group[i].response,
+                    solution_i,
                     correct=self_ok,
                     ground_truth=(group[i].label or "") if not self_ok else "",
                     failure_kind=fkind,
@@ -1475,7 +1572,7 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 md["sdpo_skill_tokens"] = skill_tokens
                 md["sdpo_skill_prompt_tokens"] = gen_prompt_ids
                 md["sdpo_skill_rollout_logprobs"] = skill_logprobs
-                # Skill-KD teacher hint (see DESIGN_self_skill.md), KD-only:
+                # Skill-KD teacher hint (see doc/DESIGN_self_skill.md), KD-only:
                 #  self-success: teacher = skill-gen prompt + the sample's OWN trace
                 #                as hint. (skill-source already restricts to correct.)
                 #  problem-only: teacher = skill-gen prompt, NO hint.
@@ -1488,9 +1585,7 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 if skill_kd and (use_self_success or skill_kd_mode == "problem-only"):
                     if use_self_success:
                         gen_prompt_str = tok.decode(gen_prompt_ids)
-                        skill_teacher_str = _build_teacher_prompt_str(
-                            gen_prompt_str, gen_suffix, group[i].response, remove_thinking=remove_thinking
-                        )
+                        skill_teacher_str = _build_skill_self_success_teacher_prompt_str(gen_prompt_str, gen_suffix)
                         md["sdpo_skill_teacher_prompt_tokens"] = tok.encode(
                             skill_teacher_str, add_special_tokens=False
                         )
@@ -1521,6 +1616,15 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 )
 
                 async def _gen_predict(i: int):
+                    # **_skill_gen_template_kwargs() (enable_thinking=False) to match
+                    # every OTHER skill-generation call site (_generate_skill_text,
+                    # _skill_gen_prompt_ids) -- without it this student render falls
+                    # through to the run's real --apply-chat-template-kwargs (thinking
+                    # ON for Qwen3), so the problem-only pitfall-prediction student
+                    # would think freely while its sibling skill generations (self-
+                    # success skill, per-trace pitfall, pitfall-summary) are all forced
+                    # no-think, reproducing exactly the collapse _skill_gen_template_
+                    # kwargs was added to prevent (see that function's docstring).
                     stu_text = tok.apply_chat_template(
                         [
                             {"role": "system", "content": _PITFALL_PREDICT_SYSTEM},
@@ -1528,6 +1632,7 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                         ],
                         tokenize=False,
                         add_generation_prompt=True,
+                        **_skill_gen_template_kwargs(),
                     )
                     stu_ids = tok.encode(stu_text, add_special_tokens=False)
                     res2 = await _self_generate_skill(args, stu_ids)
@@ -1582,8 +1687,15 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # --sdpo-response-prefix skill: swap the response teacher prefix from the
         # peer's full trace to that peer's self-generated skill (fall back to the
         # trace if the peer has no skill). Requires self_skill (peers' skills exist).
+        # Skip FAILED traces when pitfall_active: their prefix is about to be wiped
+        # and replaced by the group pitfall summary below (see that block), so
+        # swapping in a peer skill here would be discarded work, and recording
+        # sdpo_response_prefix_is_skill for them would misreport what the final
+        # prefix actually contains.
         if response_prefix == "skill" and self_skill:
             for i in list(prefix_text_by_idx.keys()):
+                if pitfall_active and not (bool(correctness[i]) if i < len(correctness) else False):
+                    continue
                 peer_j = peer_by_idx.get(i)
                 peer_md = group[peer_j].metadata if (peer_j is not None and isinstance(group[peer_j].metadata, dict)) else {}
                 peer_skill = peer_md.get("sdpo_skill")
@@ -1643,6 +1755,24 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 )
                 group_pitfalls = summary.strip() if summary and summary.strip() else "\n\n".join(per_trace_pitfalls)
 
+        # FAILED traces under pitfall injection get ONLY the group-summarized
+        # pitfall skill as their response-SDPO prefix -- NOT the correct peer's
+        # raw trace/skill with pitfalls appended after it. A trace that failed
+        # cannot be trusted to imitate a correct peer's solution (that teaches
+        # copying the peer, not learning from this group's actual failure mode);
+        # it should only see "here is what tends to go wrong on this problem",
+        # identical for every failed trace in the group since group_pitfalls is
+        # one shared value. Drop whatever prefix_text_by_idx/prefix_messages_by_idx
+        # accumulated for these traces above (the correct peer's raw trace from
+        # pass 1, a peer skill from --sdpo-response-prefix skill, or a condensed
+        # skill) so pass 2's PITFALLS_TEMPLATE splice becomes the ONLY content.
+        if pitfall_active:
+            for i in list(prefix_text_by_idx.keys()):
+                self_ok_i = bool(correctness[i]) if i < len(correctness) else False
+                if not self_ok_i:
+                    prefix_text_by_idx[i] = ""
+                    prefix_messages_by_idx.pop(i, None)
+
         # Pass 2: build the teacher prompt (peer solution/skill spliced into the USER
         # turn, before the assistant marker) and tokenize. The shared pitfalls go ONLY
         # into failed traces' prefix; correct traces keep the clean correct-peer prefix.
@@ -1654,7 +1784,9 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
             student_prompt = sample.prompt if isinstance(sample.prompt, str) else ""
             teacher_prompt_str = _build_teacher_prompt_str(
                 student_prompt, gen_suffix, prefix_text_by_idx[i], remove_thinking=remove_thinking,
-                pitfalls=pitfalls_for_i,
+                pitfalls=pitfalls_for_i, reframe_multiturn=reframe_multiturn,
+                peer_messages=prefix_messages_by_idx.get(i), grammar=tool_grammar,
+                max_prefix_chars=getattr(args, "sdpo_max_prefix_chars", 0),
             )
             teacher_prompt_ids = tok.encode(teacher_prompt_str, add_special_tokens=False)
             # Training side builds teacher seq = teacher_prompt_ids + response_ids,
@@ -1726,17 +1858,32 @@ async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> fl
     the task reward. Uses the same grading as the group RM: the LLM judge when
     --sdpo-judge is set (open-ended answers), else deterministic matching.
     """
-    if getattr(args, "sdpo_judge", False) and (sample.response or "").strip():
+    if _sample_domain(sample) == "code":
+        # Code eval: run the program against its test cases (same judge as
+        # training). Bounded by the shared concurrency cap like the LLM judge.
+        async with _judge_semaphore(args):
+            ok = await _grade_one_code(sample, args)
+    elif _sample_domain(sample) == "search":
+        # Search/QA eval: EM against golden answers (same as training).
+        ok = _grade_one_search(sample, args)
+    elif getattr(args, "sdpo_judge", False) and (sample.response or "").strip():
         # Eval fans out one sdpo_eval_reward coroutine per sample via asyncio.gather
         # upstream, so honor the SAME global concurrency cap to avoid flooding the
         # gateway during large evals.
         async with _judge_semaphore(args):
             ok = await _llm_judge_correct(args, sample)
     elif getattr(args, "sdpo_grader", "mcq") == "dapo":
-        # Math eval (AIME-2025 = integers, Minerva Math = LaTeX). Use the general
-        # math grader, which handles both, rather than the integer-only DAPO grader
-        # used for training-trace correctness (Minerva answers are not integers).
-        ok = bool(grade_answer_verl(sample.response or "", (sample.label or "").strip()))
+        # Math eval (AIME = integers, Minerva Math = LaTeX). Delegate to the SAME
+        # grader the training side uses (_is_correct's dapo path): it EXTRACTS the
+        # <answer> tag, wraps it in \boxed{}, and runs DAPO's scorer.
+        # BUG FIX (2026-07-25): the old path called
+        # grade_answer_verl(sample.response, label) on the WHOLE multi-turn
+        # response with NO tag extraction and NO \boxed{} wrapping. grade_answer_verl
+        # only matches when the prediction is \boxed{}-wrapped -- so even
+        # <answer>73</answer> vs label 73 scored 0. Observed 143/552 AIME rows
+        # correct-but-graded-0: the "math eval regression" was a grading artifact.
+        # _is_correct(dapo) fixes both (tag extraction + \boxed{} wrap).
+        ok = _is_correct(sample, args)
     else:
         ok = _is_correct(sample, args)
     return 1.0 if ok else 0.0

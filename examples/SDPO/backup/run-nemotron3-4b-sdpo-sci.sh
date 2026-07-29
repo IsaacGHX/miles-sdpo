@@ -100,7 +100,7 @@ RM_ARGS=(
    #     'trace', so the response-SDPO teacher prefix is the correct peer's FULL
    #     solution trace (base SDPO), not a distilled skill.
    # To re-enable the self-skill setup, restore the block below (see
-   # examples/SDPO/DESIGN_self_skill.md and run-olmo3-7B-sdpo-sci.sh):
+   # examples/SDPO/doc/DESIGN_self_skill.md and run-olmo3-7B-sdpo-sci.sh):
    #   --sdpo-self-skill
    #   --sdpo-skill-max-new-tokens 1024
    #   --sdpo-skill-source correct

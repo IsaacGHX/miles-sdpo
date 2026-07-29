@@ -23,8 +23,27 @@
 #                          runs, so the GRPO advantage is exactly 0 and the
 #                          entire training signal is the JSD divergence loss
 #                          alone: no reward, no advantage, purely KD.
+#   SDPO_ABLATION_ARM=1.2  IDENTICAL config to 1.1 -- re-run after fixing a
+#                          grading bug in examples/SDPO/sdpo.py::_is_correct's
+#                          dapo path (strict \boxed{} exact-string match was
+#                          the ONLY grader; Minerva Math's LaTeX answers
+#                          routinely differ cosmetically from the label --
+#                          '\frac{dx}{dt} = kx - a' vs label '\frac{d x}{d
+#                          t}=k x-a' -- so strict-box alone scored a real
+#                          checkpoint's Minerva accuracy at 15.6% when the
+#                          true rate, confirmed via grade_answer_verl's mathd/
+#                          sympy-normalized fallback on the SAME eval dump,
+#                          was 38.6% -- combined AIME+Minerva pass@1 28.2%
+#                          -> 45.0%, matching this run's expected ~45%). The
+#                          fix now tries strict-box first (fast path for
+#                          AIME's plain integers) and falls back to
+#                          grade_answer_verl. 1.1's own eval numbers on wandb
+#                          are an UNDER-estimate from before this fix; 1.2 is
+#                          the same run with correct grading, not a new
+#                          ablation leg. Separate arm number (not a rerun of
+#                          1.1 in place) so both stay visible on wandb for
+#                          comparison.
 #   SDPO_ABLATION_ARM=2    + self-skill, skill-source correct only, NO skill-KD
-#   SDPO_ABLATION_ARM=3    + self-skill, skill-source incorrect only, NO skill-KD
 #   SDPO_ABLATION_ARM=4    + self-skill, skill-source all, NO skill-KD
 #   SDPO_ABLATION_ARM=5    + self-skill, skill-source all, WITH skill-KD (mode=both)
 #
@@ -77,12 +96,13 @@
 # usage:
 #   SDPO_ABLATION_ARM=1   bash examples/SDPO/run-qwen3-4B-sdpo-math-colocate.sh
 #   SDPO_ABLATION_ARM=1.1 bash examples/SDPO/run-qwen3-4B-sdpo-math-colocate.sh
+#   SDPO_ABLATION_ARM=1.2 bash examples/SDPO/run-qwen3-4B-sdpo-math-colocate.sh
 #   ... etc for 2, 3, 4, 5
 
 set -exf
 
 export PYTHONBUFFERED=16
-SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:?Set SDPO_ABLATION_ARM to one of: 1 1.1 2 3 4 5}"
+SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:?Set SDPO_ABLATION_ARM to one of: 1 1.1 1.2 2 3 4 5}"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then HAS_NVLINK=1; else HAS_NVLINK=0; fi
@@ -163,7 +183,7 @@ case "${SDPO_ABLATION_ARM}" in
             # and miles/utils/arguments.py's argparse defaults, not assumed.
         )
         ;;
-    1.1)
+    1.1 | 1.2)
         # SDPO baseline: group-rm + real KD loss (jsd divergence), self-teacher,
         # EMA teacher -- PURE distillation (--sdpo-pure-distill is the DEFAULT,
         # left unset here rather than passed explicitly, matching every other
@@ -238,6 +258,23 @@ case "${SDPO_ABLATION_ARM}" in
     3)
         # + self-skill, skill-source incorrect ONLY (pitfall warnings from
         # failed traces), no skill-KD.
+        # NO --sdpo-response-prefix skill here (unlike arms 2/4/5): the response-
+        # SDPO teacher prefix's peer is ALWAYS drawn from correct_indices
+        # (sdpo.py's peer-selection pass runs unconditionally, before/independent
+        # of --sdpo-skill-source). Under skill-source=incorrect, only FAILED
+        # traces ever get a self-generated skill (_skill_eligible returns
+        # `not self_ok`) -- a correct peer NEVER has an sdpo_skill. So
+        # --sdpo-response-prefix skill's lookup (peer_md.get("sdpo_skill")) would
+        # be None for every sample and silently fall back to the peer's full raw
+        # trace every single time (see doc/DESIGN_self_skill.md's own warning: "the
+        # peers are correct traces, so --sdpo-skill-source must include them
+        # (correct or all) or every prefix silently falls back to the trace").
+        # That made this arm's response-KD axis behave exactly like arm 1.1's
+        # (trace prefix) while still paying the self-skill generation cost for a
+        # skill that was ONLY ever used via pitfall injection below -- not what
+        # "skill-source incorrect ONLY" was meant to isolate. Dropping the flag
+        # makes the arm test exactly what its comment says: trace prefix +
+        # pitfall-injection-from-failures, no skill-KD.
         RM_ARGS=(
             --group-rm
             --custom-rm-path examples.SDPO.sdpo.sdpo_group_reward
@@ -263,7 +300,6 @@ case "${SDPO_ABLATION_ARM}" in
             --sdpo-skill-source incorrect
             --sdpo-skill-max-new-tokens 1024
             --sdpo-pitfall-summary-backend self
-            --sdpo-response-prefix skill
             --entropy-coef 0.00
             --observe-training-entropy
             --calculate-per-token-loss
@@ -345,7 +381,7 @@ case "${SDPO_ABLATION_ARM}" in
         )
         ;;
     *)
-        echo "Unknown SDPO_ABLATION_ARM='${SDPO_ABLATION_ARM}' (expected one of: 1 1.1 2 3 4 5)" >&2
+        echo "Unknown SDPO_ABLATION_ARM='${SDPO_ABLATION_ARM}' (expected one of: 1 1.1 1.2 2 3 4 5)" >&2
         exit 1
         ;;
 esac
@@ -406,9 +442,18 @@ WANDB_ARGS=(
    --wandb-key "${WANDB_API_KEY}"
 )
 
+# --sglang-mem-fraction-static 0.85 (copied from run-olmo3-7B-sdpo-math-colocate.sh,
+# never separately tuned for Qwen3-4B) OOM'd arm 1's rollout engine: KV cache usage
+# sat at 0.95-1.00 under this arm's 32*8=256-request rollout batch with 8192-token
+# responses, leaving only ~2.7GB free when a non-cuda-graph chunked-prefill batch
+# needed a one-off ~4.6GB logits-processor scratch allocation (outside the KV cache
+# pool's own reservation) -- "torch.OutOfMemoryError: CUDA out of memory. Tried to
+# allocate 4.60 GiB ... 2.69 GiB is free", which killed the engine and cascaded into
+# the router's connection-retry exhaustion / flush_cache timeout that took down the
+# whole job. 0.75 leaves ~14GB more headroom for exactly this kind of scratch spike.
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.85
+   --sglang-mem-fraction-static 0.75
    --sglang-router-policy round_robin
 )
 
