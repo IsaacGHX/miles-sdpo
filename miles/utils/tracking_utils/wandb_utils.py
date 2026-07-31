@@ -180,7 +180,16 @@ def _init_wandb_common():
     wandb.define_metric("skill/response_prefix_is_skill_frac", step_metric="rollout/step")
     wandb.define_metric("skill/entropy", step_metric="train/step")
     wandb.define_metric("skill/kl", step_metric="train/step")
+    # skill/kl split by provenance (correct-trace self-success/blind-correct vs
+    # failed-trace pitfall-condense) -- see losses.py's skill_correct_tok_mask.
+    wandb.define_metric("skill/kl_correct", step_metric="train/step")
+    wandb.define_metric("skill/kl_pitfall", step_metric="train/step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")
+    # domain/* = per-task-type (math/code/search) train breakdown, logged
+    # alongside rollout/* (step_key="rollout/step"). Without this binding it
+    # falls back to wandb's internal _step (increments per wandb.log call,
+    # ~5-7x/rollout) -> jumpy x-axis (1,7,13,19,...). Bind it to rollout/step.
+    wandb.define_metric("domain/*", step_metric="rollout/step")
     wandb.define_metric("passrate/*", step_metric="rollout/step")
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
