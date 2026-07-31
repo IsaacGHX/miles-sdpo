@@ -1622,18 +1622,36 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--sdpo-skill-kd-mode",
                 type=str,
-                choices=["self-success", "problem-only", "pitfall-condense", "both"],
+                choices=[
+                    "self-success",
+                    "problem-only",
+                    "pitfall-condense",
+                    "both",
+                    "blind-correct",
+                    "both-blind",
+                ],
                 default="self-success",
                 help=(
                     "Which skills get skill-KD and what the teacher hint is. 'self-success': only "
                     "when the sample itself answered correctly; teacher hint = the sample's OWN "
-                    "correct trace. 'problem-only': any sample, teacher = skill-gen prompt with NO "
-                    "hint (regularization toward the EMA teacher's skill, no correct-answer info). "
+                    "correct trace (student prompt already states the solution is correct, so the "
+                    "student/teacher information gap is small -- see 'blind-correct' below). "
+                    "'problem-only': any sample, teacher = skill-gen prompt with NO hint "
+                    "(regularization toward the EMA teacher's skill, no correct-answer info). "
                     "'pitfall-condense': for FAILED traces (skill-source incorrect|all); teacher = "
                     "the problem-solving prompt with the trace's own generated pitfalls as the "
                     "privileged hint, distilling the group's per-trace pitfalls. 'both' (requires "
                     "skill-source all): correct traces use the self-success solution-skill KD AND "
-                    "failed traces use the pitfall-condense KD, so both skill flavors are trained."
+                    "failed traces use the pitfall-condense KD, so both skill flavors are trained. "
+                    "'blind-correct': symmetric counterpart to pitfall-condense for CORRECT traces "
+                    "(requires skill-source correct|all) -- student regenerates a knowledge "
+                    "prediction from the PROBLEM ONLY (no solution, no attempt), teacher = same "
+                    "problem-only prompt + the trace's own correct solution as privileged info, "
+                    "giving a genuine (not one-sentence) information gap like pitfall-condense's. "
+                    "'both-blind' (requires skill-source all): blind-correct on correct traces AND "
+                    "pitfall-condense on failed traces -- the fully-symmetric version of 'both', "
+                    "isolating whether self-success's weak KD signal (vs pitfall-condense's strong "
+                    "one) explains an observed correct-vs-pitfall skill-KD contribution imbalance."
                 ),
             )
             parser.add_argument(

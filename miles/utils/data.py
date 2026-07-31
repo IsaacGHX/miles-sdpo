@@ -283,4 +283,17 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     Timer().seq_lens = total_lengths
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
+    # sdpo_correct (like raw_reward) is deliberately left GLOBAL/unpartitioned in
+    # train_data_conversion.py::split_train_data_by_dp -- log_passrate needs the
+    # full rollout_batch_size x n_samples_per_prompt shape to compute pass@k, so
+    # we must NOT reorder rollout_data["sdpo_correct"] itself. But per-sample dump
+    # code (e.g. MegatronTrainRayActor._dump_sdpo_prompts) indexes rollout_data
+    # with THIS rank's LOCAL index (0..len(tokens)-1, same as tokens/sdpo_skill/
+    # sdpo_trace_pitfall/sdpo_group_pitfalls, which ARE partitioned here). Stash a
+    # local-order copy under a separate key (partition is popped above and would
+    # otherwise be unavailable to those call sites) so such code can align
+    # correctness to the right sample without touching log_passrate's input.
+    if "sdpo_correct" in rollout_data:
+        rollout_data["sdpo_correct_local"] = [rollout_data["sdpo_correct"][i] for i in partition]
+
     return rollout_data

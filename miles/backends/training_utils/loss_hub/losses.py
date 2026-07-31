@@ -441,6 +441,19 @@ def policy_loss_function(
             [pg_loss.new_full((int(_rl[j]),), 1.0 if bool(_is_skill[j]) else 0.0) for j in range(len(_rl))]
         ).bool()
 
+    # Per-response-token "was this skill distilled from a CORRECT trace" mask
+    # (self-success/blind-correct) vs a FAILED one (pitfall-condense) -- see
+    # actor.py::_append_sdpo_skill_samples's sdpo_skill_is_correct. Only
+    # meaningful where skill_tok_mask is True; lets skill/kl split below tell
+    # apart which half of skill-KD is contributing (motivating question behind
+    # --sdpo-skill-kd-mode blind-correct/both-blind).
+    _skill_correct = batch.get("sdpo_skill_is_correct")
+    skill_correct_tok_mask = None
+    if skill_tok_mask is not None and _skill_correct is not None and len(_skill_correct) == len(_rl):
+        skill_correct_tok_mask = torch.cat(
+            [pg_loss.new_full((int(_rl[j]),), 1.0 if bool(_skill_correct[j]) else 0.0) for j in range(len(_rl))]
+        ).bool()
+
     entropy_loss = pg_loss.new_zeros(())
     skill_entropy = pg_loss.new_zeros(())
     # Per-key denominator override for train/entropy_loss. train/entropy_loss must
@@ -514,6 +527,8 @@ def policy_loss_function(
     # advantage-hook path that fed the divergence into REINFORCE.
     sdpo_kd_loss = pg_loss.new_zeros(())
     sdpo_skill_kd_loss = pg_loss.new_zeros(())
+    sdpo_skill_kd_loss_correct = pg_loss.new_zeros(())
+    sdpo_skill_kd_loss_pitfall = pg_loss.new_zeros(())
     sdpo_kd_clip_cov_frac = pg_loss.new_zeros(())
     # Skill-KD is orthogonal to how the RESPONSE teacher signal is consumed
     # (additive KD loss here vs. --sdpo-rlsd's advantage reweighting in
@@ -565,6 +580,18 @@ def policy_loss_function(
                 sdpo_skill_kd_loss = sum_of_sample_mean(skill_kd)
                 loss = loss + getattr(args, "sdpo_kd_coef", 1.0) * sdpo_kd_loss
                 loss = loss + getattr(args, "sdpo_skill_kd_coef", 1.0) * sdpo_skill_kd_loss
+                # Further split skill_kd by provenance (correct trace -> self-success/
+                # blind-correct vs failed trace -> pitfall-condense), diagnostic only
+                # (not separate loss terms -- both already summed into
+                # sdpo_skill_kd_loss above with the SAME coefficient; this just tells
+                # you which half is contributing). See skill_correct_tok_mask's setup.
+                if skill_correct_tok_mask is not None:
+                    correct_kd = torch.where(skill_correct_tok_mask, skill_kd, skill_kd.new_zeros(()))
+                    pitfall_kd = torch.where(
+                        skill_tok_mask & ~skill_correct_tok_mask, skill_kd, skill_kd.new_zeros(())
+                    )
+                    sdpo_skill_kd_loss_correct = sum_of_sample_mean(correct_kd)
+                    sdpo_skill_kd_loss_pitfall = sum_of_sample_mean(pitfall_kd)
             else:
                 sdpo_kd_loss = sum_of_sample_mean(kd)
                 loss = loss + getattr(args, "sdpo_kd_coef", 1.0) * sdpo_kd_loss
@@ -641,6 +668,15 @@ def policy_loss_function(
         reported_loss["skill/entropy"] = (
             skill_entropy.clone().detach() if isinstance(skill_entropy, torch.Tensor) else skill_entropy
         )
+        # skill/kl split by provenance: correct-trace (self-success/blind-correct)
+        # vs failed-trace (pitfall-condense) contribution to skill/kl above.
+        # Emitted unconditionally whenever skill-KD runs (a run-level condition,
+        # same as the block above) so the reported_loss key set stays IDENTICAL
+        # across every microbatch of a run -- microbatches with no correct-trace
+        # (or no failed-trace) skill samples this step just report 0 for that
+        # half, mirroring entropy_denom's own "stable key set" reasoning above.
+        reported_loss["skill/kl_correct"] = sdpo_skill_kd_loss_correct.clone().detach()
+        reported_loss["skill/kl_pitfall"] = sdpo_skill_kd_loss_pitfall.clone().detach()
 
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.

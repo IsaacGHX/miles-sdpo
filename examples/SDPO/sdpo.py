@@ -624,6 +624,70 @@ def _pitfall_predict_user_prompt(problem: str) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# "blind-correct" skill-KD (--sdpo-skill-kd-mode blind-correct / both-blind):
+# symmetric counterpart to pitfall-condense for CORRECT traces. self-success's
+# student/teacher prompts differ by only one hint sentence (see
+# SKILL_SELF_SUCCESS_HINT above) because the student prompt already contains
+# the WORKED SOLUTION in its "You are given a CORRECT worked solution" framing
+# -- there is barely any information asymmetry left for the KD divergence to
+# measure. blind-correct instead regenerates the student from the PROBLEM
+# ONLY (no solution, no attempt -- exactly like pitfall-condense's student),
+# so the teacher's privileged info (this trace's actual correct solution) is a
+# genuine, large information gap, matching pitfall-condense's asymmetry.
+# --------------------------------------------------------------------------- #
+
+_BLIND_PREDICT_SYSTEM = (
+    "Given a problem (and NOTHING else — no solution, no answer), predict the "
+    "general KNOWLEDGE/RULES a solver would need to solve this kind of problem. "
+    "Output them as tiny self-contained skills in this EXACT format, one block "
+    "per distinct skill (1-3 blocks):\n\n"
+    "[Knowledge/Rule]\n<a general principle / identity / method / theorem likely "
+    "needed here — transferable, concrete, not vague>\n"
+    "[Details/Examples]\n<a tiny concrete worked instance of the rule (small "
+    "numbers / short snippet), NOT this problem's answer>\n\n"
+    "Hard constraints:\n"
+    "- Use the literal [Knowledge/Rule]/[Details/Examples] headers for every block.\n"
+    "- Each skill must be a TRANSFERABLE unit usable on OTHER problems, not a "
+    "recipe specific to this one.\n"
+    "- Do NOT solve the problem or give its full method; only the general "
+    "knowledge it likely draws on.\n"
+    "- Never state a final answer.\n"
+    "- Output ONLY the [Knowledge/Rule]/[Details/Examples] blocks, nothing else."
+)
+
+# Label for the privileged correct-solution info spliced into the blind-correct
+# TEACHER turn -- distinct from FAILURES_TEMPLATE/PITFALLS_TEMPLATE (these are a
+# CORRECT solution, not observed mistakes). Reuses {successful_previous_attempt}
+# for _render_prefix compatibility.
+CORRECT_INFO_TEMPLATE = (
+    "\n\nObserved correct solution (privileged, do not reveal):\n\n{successful_previous_attempt}"
+)
+
+
+def _blind_predict_user_prompt(problem: str) -> str:
+    return (
+        f"PROBLEM:\n{_clean_problem_for_skill(problem)}\n\n"
+        "Predict the general knowledge/rules needed as 1-3 [Knowledge/Rule]/"
+        "[Details/Examples] tiny-skill blocks (no solution, no answer)."
+    )
+
+
+def _build_blind_correct_teacher_prompt_str(student_prompt: str, gen_suffix: str, correct_info: str) -> str:
+    """Splice the trace's own correct solution into the USER turn of a
+    problem-only knowledge-prediction prompt as PRIVILEGED info (blind-correct
+    skill-KD teacher). Empty correct_info -> teacher == student (no privileged
+    info, KD signal 0 for that sample). Mirrors _build_failure_teacher_prompt_str's
+    insert point (blind-correct's pitfall-condense analogue)."""
+    if not (correct_info and correct_info.strip()):
+        return student_prompt
+    section = CORRECT_INFO_TEMPLATE.format(successful_previous_attempt=correct_info.strip())
+    if gen_suffix and gen_suffix in student_prompt:
+        idx = student_prompt.rfind(gen_suffix)
+        return student_prompt[:idx] + section + student_prompt[idx:]
+    return student_prompt + section
+
+
 _CONDENSE_SEM: "asyncio.Semaphore | None" = None
 _CONDENSE_SEM_LIMIT: int | None = None
 
@@ -1386,11 +1450,18 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # pitfall-condense (and the pitfall half of 'both') distils FAILED traces, so
         # skill-source must cover them. 'both' additionally does self-success on correct
         # traces, so it wants BOTH flavors -> require skill-source all.
-        assert not (skill_kd and skill_kd_mode == "pitfall-condense" and skill_source not in ("incorrect", "all")), (
-            "--sdpo-skill-kd-mode pitfall-condense requires --sdpo-skill-source incorrect|all"
-        )
+        assert not (
+            skill_kd and skill_kd_mode in ("pitfall-condense", "both-blind") and skill_source not in ("incorrect", "all")
+        ), "--sdpo-skill-kd-mode pitfall-condense|both-blind requires --sdpo-skill-source incorrect|all"
         assert not (skill_kd and skill_kd_mode == "both" and skill_source != "all"), (
             "--sdpo-skill-kd-mode both trains correct (self-success) AND failed "
+            "(pitfall-condense) traces, so it requires --sdpo-skill-source all"
+        )
+        assert not (
+            skill_kd and skill_kd_mode == "blind-correct" and skill_source not in ("correct", "all")
+        ), "--sdpo-skill-kd-mode blind-correct requires --sdpo-skill-source correct|all"
+        assert not (skill_kd and skill_kd_mode == "both-blind" and skill_source != "all"), (
+            "--sdpo-skill-kd-mode both-blind trains correct (blind-correct) AND failed "
             "(pitfall-condense) traces, so it requires --sdpo-skill-source all"
         )
 
@@ -1601,9 +1672,10 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
             # KD'd tokens match that context (the earlier per-trace pitfalls were
             # generated with the failed attempt in context and are reused only as the
             # teacher's privileged info).
-            if skill_kd and skill_kd_mode in ("pitfall-condense", "both"):
-                # 'both' also runs self-success on correct traces (handled above); here
-                # we only (re)build the FAILED traces' skill-KD via pitfall-condense.
+            if skill_kd and skill_kd_mode in ("pitfall-condense", "both", "both-blind"):
+                # 'both'/'both-blind' also runs a correct-trace KD variant (self-success
+                # or blind-correct, handled above/below); here we only (re)build the
+                # FAILED traces' skill-KD via pitfall-condense.
                 failed_idxs = [
                     i for i in skill_idxs
                     if not (bool(correctness[i]) if i < len(correctness) else False)
@@ -1659,6 +1731,62 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                     teacher_str = _build_failure_teacher_prompt_str(stu_prompt_str, gen_suffix, failure_info)
                     md["sdpo_skill_teacher_prompt_tokens"] = tok.encode(teacher_str, add_special_tokens=False)
 
+            # blind-correct skill-KD: symmetric counterpart to pitfall-condense for
+            # CORRECT traces (see the module-level comment above
+            # _build_blind_correct_teacher_prompt_str for why self-success's KD signal
+            # is weak and this fixes it).
+            #  student = predict general knowledge from the PROBLEM ONLY (no solution,
+            #            no attempt -- exactly mirrors pitfall-condense's student);
+            #  teacher = same problem-only prompt + THIS trace's own correct solution
+            #            as privileged info (per-trace, NOT group-shared -- unlike
+            #            pitfall-condense's group_pitfalls, a correct trace's own
+            #            solution is a self-contained privileged hint, no aggregation
+            #            needed across peers).
+            #  KD target = the student's own problem-only knowledge prediction.
+            if skill_kd and skill_kd_mode in ("blind-correct", "both-blind"):
+                correct_idxs = [
+                    i for i in skill_idxs
+                    if (bool(correctness[i]) if i < len(correctness) else False)
+                ]
+
+                async def _gen_blind(i: int):
+                    stu_text = tok.apply_chat_template(
+                        [
+                            {"role": "system", "content": _BLIND_PREDICT_SYSTEM},
+                            {"role": "user", "content": _blind_predict_user_prompt(_problem_of(i))},
+                        ],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **_skill_gen_template_kwargs(),
+                    )
+                    stu_ids = tok.encode(stu_text, add_special_tokens=False)
+                    res3 = await _self_generate_skill(args, stu_ids)
+                    return i, stu_ids, res3
+
+                blind_results = await asyncio.gather(*(_gen_blind(i) for i in correct_idxs))
+                for i, stu_ids, res3 in blind_results:
+                    if res3 is None:
+                        continue
+                    b_text, b_tokens, b_logprobs = res3
+                    md = group[i].metadata
+                    # Overwrite the skill-KD payload with the problem-only student and
+                    # the correct-solution-informed teacher. The KD student/target is
+                    # now the problem-only knowledge prediction.
+                    md["sdpo_skill"] = b_text
+                    md["sdpo_skill_len"] = float(len(b_tokens))
+                    if b_logprobs:
+                        _nll = -sum(b_logprobs) / len(b_logprobs)
+                        md["sdpo_skill_ppl"] = math.exp(min(_nll, 20.0))
+                    md["sdpo_skill_tokens"] = b_tokens
+                    md["sdpo_skill_prompt_tokens"] = stu_ids
+                    md["sdpo_skill_rollout_logprobs"] = b_logprobs
+                    stu_prompt_str = tok.decode(stu_ids)
+                    # Privileged info = THIS trace's own correct response (per-trace,
+                    # not group-aggregated -- unlike pitfall-condense's failure_info).
+                    correct_info = _strip_response_eos(group[i].response)
+                    teacher_str = _build_blind_correct_teacher_prompt_str(stu_prompt_str, gen_suffix, correct_info)
+                    md["sdpo_skill_teacher_prompt_tokens"] = tok.encode(teacher_str, add_special_tokens=False)
+
         # Optional: distill each chosen peer trace into a transferable SKILL and use
         # that as the prefix instead of the full trace (SkillOpt / trace_condense).
         if condense and prefix_text_by_idx:
@@ -1687,14 +1815,20 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # --sdpo-response-prefix skill: swap the response teacher prefix from the
         # peer's full trace to that peer's self-generated skill (fall back to the
         # trace if the peer has no skill). Requires self_skill (peers' skills exist).
-        # Skip FAILED traces when pitfall_active: their prefix is about to be wiped
-        # and replaced by the group pitfall summary below (see that block), so
-        # swapping in a peer skill here would be discarded work, and recording
-        # sdpo_response_prefix_is_skill for them would misreport what the final
-        # prefix actually contains.
+        # Skip FAILED traces only under skill-source=incorrect: there, the peer
+        # (always a correct_indices trace) never gets a self-generated skill
+        # (_skill_eligible returns `not self_ok`), so the swap would be a silent
+        # no-op anyway, and skill-source=incorrect's failed traces get their
+        # prefix wiped to pitfalls-only right below regardless. Under
+        # skill-source=all, a failed trace's peer IS eligible for a skill (every
+        # trace is), so let the swap apply -- failed traces there keep BOTH the
+        # peer's correct-solution skill AND the group pitfall summary (see the
+        # pass-2 splice below), not pitfalls alone.
         if response_prefix == "skill" and self_skill:
             for i in list(prefix_text_by_idx.keys()):
-                if pitfall_active and not (bool(correctness[i]) if i < len(correctness) else False):
+                if pitfall_active and skill_source == "incorrect" and not (
+                    bool(correctness[i]) if i < len(correctness) else False
+                ):
                     continue
                 peer_j = peer_by_idx.get(i)
                 peer_md = group[peer_j].metadata if (peer_j is not None and isinstance(group[peer_j].metadata, dict)) else {}
@@ -1755,18 +1889,22 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 )
                 group_pitfalls = summary.strip() if summary and summary.strip() else "\n\n".join(per_trace_pitfalls)
 
-        # FAILED traces under pitfall injection get ONLY the group-summarized
-        # pitfall skill as their response-SDPO prefix -- NOT the correct peer's
-        # raw trace/skill with pitfalls appended after it. A trace that failed
-        # cannot be trusted to imitate a correct peer's solution (that teaches
-        # copying the peer, not learning from this group's actual failure mode);
-        # it should only see "here is what tends to go wrong on this problem",
-        # identical for every failed trace in the group since group_pitfalls is
-        # one shared value. Drop whatever prefix_text_by_idx/prefix_messages_by_idx
-        # accumulated for these traces above (the correct peer's raw trace from
-        # pass 1, a peer skill from --sdpo-response-prefix skill, or a condensed
-        # skill) so pass 2's PITFALLS_TEMPLATE splice becomes the ONLY content.
-        if pitfall_active:
+        # FAILED traces under skill-source=incorrect get ONLY the group-
+        # summarized pitfall skill as their response-SDPO prefix -- there is no
+        # correct-peer skill to keep here (skill-source=incorrect never
+        # generates a skill for a correct trace, so the swap above was always a
+        # no-op for these), so drop whatever raw-trace prefix pass 1 picked
+        # (the correct peer's raw trace) and let pass 2's PITFALLS_TEMPLATE
+        # splice become the ONLY content.
+        #
+        # FAILED traces under skill-source=all keep BOTH: the correct peer's
+        # skill (or raw trace, picked in pass 1 / swapped in above) AND the
+        # group pitfall summary -- _build_teacher_prompt_str/_render_prefix
+        # APPENDS pitfalls after the solution section when both are non-empty,
+        # it does not replace it. Only degrades to pitfalls-only when the group
+        # has zero correct traces (prefix_text_by_idx[i] is already "" from
+        # pass 1's "no peers" branch -- nothing to clear).
+        if pitfall_active and skill_source == "incorrect":
             for i in list(prefix_text_by_idx.keys()):
                 self_ok_i = bool(correctness[i]) if i < len(correctness) else False
                 if not self_ok_i:

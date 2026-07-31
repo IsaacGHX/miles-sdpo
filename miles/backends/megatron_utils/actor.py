@@ -947,7 +947,18 @@ class MegatronTrainRayActor(TrainRayActor):
             # label whether each skill is a solution-skill (from a correct trace) or a
             # pitfall (from an incorrect trace) — the two flavors --sdpo-skill-source
             # all/incorrect produce. Absent -> unknown (None).
-            correct_list = rollout_data.get("sdpo_correct")
+            #
+            # rollout_data["sdpo_correct"] is GLOBAL/unpartitioned on purpose
+            # (log_passrate needs the full rollout_batch_size x n_samples_per_prompt
+            # shape), unlike tokens/sdpo_skill/sdpo_trace_pitfall/sdpo_group_pitfalls,
+            # which ARE partitioned to this rank's local slice -- so it can't be
+            # indexed with the LOCAL loop index i below (that silently read a
+            # DIFFERENT sample's correctness, observed as skill_kind='pitfall' next
+            # to a "CORRECT worked solution" skill-gen prompt). Use
+            # "sdpo_correct_local" instead: process_rollout_data (miles/utils/
+            # data.py) stashes a copy already reordered by this rank's partition,
+            # aligned with tokens/response_lengths/etc, specifically for this.
+            correct_list = rollout_data.get("sdpo_correct_local")
             records = []
             skill_records = []
             for i in range(len(tokens_list)):
@@ -1002,6 +1013,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     # Label the skill's provenance: a correct trace yields a
                     # solution-skill, an incorrect one a pitfall (see _gen_one in
                     # examples/SDPO/sdpo.py). None when correctness is unavailable.
+                    # correct_list ("sdpo_correct_local") is already reordered to
+                    # this rank's local partition (see comment above), so it lines
+                    # up with tokens_list/skill_text_list at the same local index i.
                     self_correct = (
                         bool(float(correct_list[i]) > 0.5)
                         if (correct_list is not None and i < len(correct_list) and correct_list[i] is not None)
@@ -1266,6 +1280,13 @@ class MegatronTrainRayActor(TrainRayActor):
         n_resp = len(rollout_data["tokens"])
         # Mark existing (response) samples as non-skill up front.
         is_skill = [False] * n_resp
+        # Per-sample "was this skill distilled from a CORRECT trace" tag (self-success/
+        # blind-correct) vs a FAILED one (pitfall-condense) -- lets losses.py split the
+        # aggregate skill/kl into skill/kl_correct vs skill/kl_pitfall so a run can see
+        # which half of the skill-KD signal is actually doing the work (motivating
+        # question behind --sdpo-skill-kd-mode blind-correct/both-blind). False for
+        # response (non-skill) samples; meaningless there, never read for them.
+        skill_is_correct = [False] * n_resp
         device = torch.cuda.current_device()
         gbs = self._num_local_gbs()
 
@@ -1278,6 +1299,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # (length == num_steps) desyncs and hangs. Participate in the MAX all-reduce
             # with our own count, then pad to the agreed target with inert dummies.
             rollout_data["sdpo_is_skill"] = is_skill
+            rollout_data["sdpo_skill_is_correct"] = skill_is_correct
             self._pad_rollout_to_dp_agreed_count(rollout_data, is_skill, gbs, device, None, None)
             return
 
@@ -1330,6 +1352,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if isinstance(v, list) and len(v) == n_resp and k not in explicit
         ]
 
+        correct_local = rollout_data.get("sdpo_correct_local")
         for j, orig_i in enumerate(skill_idx):
             rl = int(skill_resp[j])
             rollout_data["tokens"].append(skill_toks[j])
@@ -1339,6 +1362,9 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data["sdpo_teacher_topk_logprobs"].append(sk_lp[j])
             rollout_data["sdpo_teacher_topk_ids"].append(sk_ids[j])
             is_skill.append(True)
+            skill_is_correct.append(
+                bool(float(correct_local[orig_i]) > 0.5) if (correct_local is not None and orig_i < len(correct_local)) else False
+            )
             for k in list_keys:
                 if k == "rollout_log_probs":
                     # skill's own rollout logprobs (for the IS ratio); else zeros.
@@ -1369,7 +1395,9 @@ class MegatronTrainRayActor(TrainRayActor):
         # dummies so get_data_iterator accepts it AND every DP rank runs the same
         # number of training steps (see _pad_rollout_to_dp_agreed_count).
         n_pad = self._pad_rollout_to_dp_agreed_count(rollout_data, is_skill, gbs, device, sk_lp, sk_ids)
+        skill_is_correct.extend([False] * n_pad)
         rollout_data["sdpo_is_skill"] = is_skill
+        rollout_data["sdpo_skill_is_correct"] = skill_is_correct
 
         # Interleave response + skill samples across the batch. Steps are carved by
         # get_data_iterator sequentially (step i = samples[i*gbs:(i+1)*gbs]); with

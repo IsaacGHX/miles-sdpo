@@ -422,6 +422,7 @@ def train_one_step(
                 "sdpo_teacher_topk_logprobs",
                 "sdpo_teacher_topk_ids",
                 "sdpo_is_skill",
+                "sdpo_skill_is_correct",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,

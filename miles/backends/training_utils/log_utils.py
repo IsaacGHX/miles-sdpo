@@ -124,6 +124,13 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "dynamic_global_batch_size",
                 "weight_versions",
                 "metadata",
+                # Local-partition-order copy of sdpo_correct (see process_rollout_data
+                # in miles/utils/data.py) used only for aligning dump-side per-sample
+                # labels (MegatronTrainRayActor._dump_sdpo_prompts) -- the real
+                # sdpo_correct (GLOBAL, unpartitioned) already gets its own success-
+                # rate metric via log_passrate; logging this one too would just be a
+                # duplicate (and differently-ordered) mean of the same values.
+                "sdpo_correct_local",
                 # SDPO KD teacher target: per-token [R, k] tensors (ids are Long,
                 # not meaningful as a scalar mean) — not a loggable rollout metric.
                 "sdpo_teacher_topk_logprobs",

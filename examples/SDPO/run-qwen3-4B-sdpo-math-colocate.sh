@@ -44,6 +44,7 @@
 #                          1.1 in place) so both stay visible on wandb for
 #                          comparison.
 #   SDPO_ABLATION_ARM=2    + self-skill, skill-source correct only, NO skill-KD
+#   SDPO_ABLATION_ARM=3    + self-skill, skill-source incorrect only, NO skill-KD
 #   SDPO_ABLATION_ARM=4    + self-skill, skill-source all, NO skill-KD
 #   SDPO_ABLATION_ARM=5    + self-skill, skill-source all, WITH skill-KD (mode=both)
 #
