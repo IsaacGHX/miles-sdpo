@@ -202,54 +202,63 @@ class UpdateWeightFromTensor:
         if rank == 0:
             mode = self.args.pause_generation_mode
             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+        try:
+            if rank == 0:
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+                if not skip_base_sync:
+                    begin_weight_update(self.rollout_engines)
+            dist.barrier(group=get_gloo_group())
+
+            megatron_local_weights = self.weights_getter()
+
             if not skip_base_sync:
-                begin_weight_update(self.rollout_engines)
-        dist.barrier(group=get_gloo_group())
+                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
+                    megatron_local_weights, weight_type="base"
+                ):
+                    refs, long_lived_tensors = self._send_base_params(hf_named_tensors)
+                    results = ray.get(refs)
+                    _check_weight_sync_results(results, is_lora=False)
+                    del long_lived_tensors
 
-        megatron_local_weights = self.weights_getter()
+            if self.is_lora:
+                # SGLang's load_lora_adapter_from_tensors expects the full adapter in
+                # one call; drain the bridge's chunker so --update-weight-buffer-size
+                # only bounds the base path.
+                accumulated_named_tensors: list = []
+                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
+                    megatron_local_weights, weight_type="lora"
+                ):
+                    accumulated_named_tensors.extend(hf_named_tensors)
 
-        if not skip_base_sync:
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
-                megatron_local_weights, weight_type="base"
-            ):
-                refs, long_lived_tensors = self._send_base_params(hf_named_tensors)
+                if not accumulated_named_tensors:
+                    raise RuntimeError(
+                        "LoRA weight sync failed: the weight iterator produced zero chunks. "
+                        "No adapter weights were sent to the rollout engine. This usually means "
+                        "the Megatron-Bridge or SGLang version is incompatible."
+                    )
+
+                refs, long_lived_tensors = self._send_lora_params(accumulated_named_tensors)
                 results = ray.get(refs)
-                _check_weight_sync_results(results, is_lora=False)
+                _check_weight_sync_results(results, is_lora=True)
                 del long_lived_tensors
 
-        if self.is_lora:
-            # SGLang's load_lora_adapter_from_tensors expects the full adapter in
-            # one call; drain the bridge's chunker so --update-weight-buffer-size
-            # only bounds the base path.
-            accumulated_named_tensors: list = []
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
-                megatron_local_weights, weight_type="lora"
-            ):
-                accumulated_named_tensors.extend(hf_named_tensors)
+                if not self._lora_base_synced:
+                    self._lora_base_synced = True
 
-            if not accumulated_named_tensors:
-                raise RuntimeError(
-                    "LoRA weight sync failed: the weight iterator produced zero chunks. "
-                    "No adapter weights were sent to the rollout engine. This usually means "
-                    "the Megatron-Bridge or SGLang version is incompatible."
-                )
+            dist.barrier(group=get_gloo_group())
 
-            refs, long_lived_tensors = self._send_lora_params(accumulated_named_tensors)
-            results = ray.get(refs)
-            _check_weight_sync_results(results, is_lora=True)
-            del long_lived_tensors
-
-            if not self._lora_base_synced:
-                self._lora_base_synced = True
-
-        dist.barrier(group=get_gloo_group())
-
-        if rank == 0:
-            # Skip when no fresh base bytes landed (skip_base_sync).
-            if not skip_base_sync:
-                end_weight_update(self.rollout_engines)
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            if rank == 0:
+                # Skip when no fresh base bytes landed (skip_base_sync).
+                if not skip_base_sync:
+                    end_weight_update(self.rollout_engines)
+        finally:
+            # Always resume the rollout engines, even if weight sync raised above --
+            # otherwise a mid-update exception permanently strands every engine in
+            # the paused state (cur_batch=None), which also hides them from SGLang's
+            # own scheduler watchdog (it only checks for stalls while cur_batch is
+            # not None).
+            if rank == 0:
+                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
     def _send_base_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
