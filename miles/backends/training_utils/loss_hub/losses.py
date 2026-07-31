@@ -515,7 +515,17 @@ def policy_loss_function(
     sdpo_kd_loss = pg_loss.new_zeros(())
     sdpo_skill_kd_loss = pg_loss.new_zeros(())
     sdpo_kd_clip_cov_frac = pg_loss.new_zeros(())
-    if getattr(args, "sdpo_kd_loss", False):
+    # Skill-KD is orthogonal to how the RESPONSE teacher signal is consumed
+    # (additive KD loss here vs. --sdpo-rlsd's advantage reweighting in
+    # loss_hub/rlsd.py): it always runs on the appended skill-tagged samples'
+    # own top-k target when --sdpo-skill-kd is set, even under --sdpo-rlsd
+    # (which never populates sdpo_teacher_topk_* for the response span --
+    # actor.py seeds empty response entries so this divergence call still
+    # produces a real skill-span target, response contributing 0).
+    run_kd = getattr(args, "sdpo_kd_loss", False) or (
+        getattr(args, "sdpo_skill_kd", False) and skill_tok_mask is not None
+    )
+    if run_kd:
         kd = _sdpo_kd_loss_per_token(args, logits, batch)
         if kd is not None:
             kd = torch.where(
@@ -616,13 +626,21 @@ def policy_loss_function(
                 if isinstance(sdpo_kd_clip_cov_frac, torch.Tensor)
                 else sdpo_kd_clip_cov_frac
             )
-        if getattr(args, "sdpo_skill_kd", False):
-            reported_loss["sdpo_skill_kd_loss"] = sdpo_skill_kd_loss.clone().detach()
-            # dedicated skill/ panel: skill KD (= skill "kl") and skill-token entropy.
-            reported_loss["skill/kl"] = sdpo_skill_kd_loss.clone().detach()
-            reported_loss["skill/entropy"] = (
-                skill_entropy.clone().detach() if isinstance(skill_entropy, torch.Tensor) else skill_entropy
-            )
+    # Skill-KD's own report is gated on run_kd (sdpo_kd_loss OR sdpo_skill_kd),
+    # not sdpo_kd_loss alone -- under --sdpo-rlsd, sdpo_kd_loss is always False
+    # (mutually exclusive, see loss_hub/rlsd.py), but skill-KD still runs (see
+    # run_kd above) and sdpo_skill_kd_loss/skill_entropy are real, non-zero
+    # values that were silently never reaching wandb's skill/ panel before
+    # this fix -- reported_loss's key set only needs to match across
+    # microbatches of the SAME run, and run_kd is already a run-level
+    # (not per-microbatch) condition, so this is safe.
+    if run_kd and getattr(args, "sdpo_skill_kd", False):
+        reported_loss["sdpo_skill_kd_loss"] = sdpo_skill_kd_loss.clone().detach()
+        # dedicated skill/ panel: skill KD (= skill "kl") and skill-token entropy.
+        reported_loss["skill/kl"] = sdpo_skill_kd_loss.clone().detach()
+        reported_loss["skill/entropy"] = (
+            skill_entropy.clone().detach() if isinstance(skill_entropy, torch.Tensor) else skill_entropy
+        )
 
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.

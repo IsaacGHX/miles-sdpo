@@ -145,6 +145,48 @@ enroot start --rw \
                 RUN_SH=examples/SDPO/run-qwen3-4B-sdpo-math-colocate.sh
                 DATA_KIND=dapo
                 ;;
+            qwen25-7b-sci-ablation)
+                # Qwen2.5-7B-Instruct (non-thinking model) on SciKnowEval MCQ,
+                # COLOCATE -- the SAME 6-arm SDPO ablation structure as
+                # qwen3-4b-math-ablation, just swapped to the sci/MCQ domain
+                # (1 / 1.2 / 2 / 3 / 4 / 5, no "1.1" leg here -- see the module
+                # docstring in run-qwen2.5-7B-sdpo-sci-colocate.sh for why).
+                # Requires $SDPO_ABLATION_ARM to pick which leg to run.
+                # Exploratory only: --num-rollout 100, no checkpointing.
+                MODEL_DIR=Qwen2.5-7B-Instruct
+                HF_REPO=Qwen/Qwen2.5-7B-Instruct
+                MODEL_SH=scripts/models/qwen2.5-7B.sh
+                RUN_SH=examples/SDPO/run-qwen2.5-7B-sdpo-sci-colocate.sh
+                DATA_KIND=sci
+                ;;
+            qwen25-7b-sci-rl-ablation)
+                # Sibling of qwen25-7b-sci-ablation: SAME model/domain/skill
+                # config, but the response-KD mechanism is RLSD (arXiv:
+                # 2604.03128, multiplicative advantage reweighting via
+                # --sdpo-rlsd) instead of the additive KD-loss
+                # (--sdpo-kd-loss). Arms 1.1/2/2.2/3/4/5/5.1/5.2 -- see the
+                # module docstring in run-qwen2.5-7B-sdpo-sci-rl-colocate.sh.
+                # Requires $SDPO_ABLATION_ARM.
+                MODEL_DIR=Qwen2.5-7B-Instruct
+                HF_REPO=Qwen/Qwen2.5-7B-Instruct
+                MODEL_SH=scripts/models/qwen2.5-7B.sh
+                RUN_SH=examples/SDPO/run-qwen2.5-7B-sdpo-sci-rl-colocate.sh
+                DATA_KIND=sci
+                ;;
+            qwen3-4b-math-rl-ablation)
+                # Math-domain port of qwen25-7b-sci-rl-ablation: SAME model/
+                # dataset as qwen3-4b-math-ablation (Qwen3-4B, DAPO math,
+                # AIME25+Minerva eval), but the response-KD mechanism is RLSD
+                # (--sdpo-rlsd) instead of the additive KD-loss
+                # (--sdpo-kd-loss). Arms 1/1.1/2/3/4/5.1/5.2 -- see the module
+                # docstring in run-qwen3-4B-sdpo-math-rl-colocate.sh. Requires
+                # $SDPO_ABLATION_ARM.
+                MODEL_DIR=Qwen3-4B
+                HF_REPO=Qwen/Qwen3-4B
+                MODEL_SH=scripts/models/qwen3-4B.sh
+                RUN_SH=examples/SDPO/run-qwen3-4B-sdpo-math-rl-colocate.sh
+                DATA_KIND=dapo
+                ;;
             *)
                 MODEL_DIR=Qwen3-8B
                 HF_REPO=Qwen/Qwen3-8B

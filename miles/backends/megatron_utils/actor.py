@@ -228,15 +228,17 @@ class MegatronTrainRayActor(TrainRayActor):
             if args.update_weights_interval == 1:
                 self.weights_backuper.backup("rollout_actor")
 
-        # SDPO/EPO EMA teacher: initialize a "sdpo_teacher" weight snapshot =
+        # SDPO/EPO/RLSD EMA teacher: initialize a "sdpo_teacher" weight snapshot =
         # current (initial) actor weights. Each train step it is EMA-blended toward
-        # the student (see _update_sdpo_ema_teacher), and the SDPO/EPO teacher
+        # the student (see _update_sdpo_ema_teacher), and the SDPO/EPO/RLSD teacher
         # forward runs against this slow copy instead of the live policy.
         # _enable_weight_backup is True whenever sdpo_ema_teacher is set together
-        # with either KD-loss or EPO's credit_t (see the property), so this works
+        # with KD-loss, EPO's credit_t, or RLSD (see the property), so this works
         # even with KL off (no ref model).
         if getattr(self.args, "sdpo_ema_teacher", False) and (
-            getattr(self.args, "sdpo_kd_loss", False) or getattr(self.args, "epo_credit_loss", False)
+            getattr(self.args, "sdpo_kd_loss", False)
+            or getattr(self.args, "epo_credit_loss", False)
+            or getattr(self.args, "sdpo_rlsd", False)
         ):
             assert self._enable_weight_backup, (
                 "--sdpo-ema-teacher needs the weight backuper active (it should be, via the "
@@ -328,12 +330,17 @@ class MegatronTrainRayActor(TrainRayActor):
             or self.with_opd_teacher
             or self.args.keep_old_actor
             or self.args.colocate
-            # SDPO/EPO EMA teacher keeps a separate weight snapshot that must be
-            # swapped in for the teacher forward, so it needs the backuper even
-            # without a ref. EPO's credit_t forward reuses this same snapshot.
+            # SDPO/EPO/RLSD EMA teacher keeps a separate weight snapshot that must
+            # be swapped in for the teacher forward, so it needs the backuper even
+            # without a ref. EPO's credit_t and RLSD's evidence-ratio forward both
+            # reuse this same snapshot.
             or (
                 getattr(self.args, "sdpo_ema_teacher", False)
-                and (getattr(self.args, "sdpo_kd_loss", False) or getattr(self.args, "epo_credit_loss", False))
+                and (
+                    getattr(self.args, "sdpo_kd_loss", False)
+                    or getattr(self.args, "epo_credit_loss", False)
+                    or getattr(self.args, "sdpo_rlsd", False)
+                )
             )
         )
 
@@ -398,7 +405,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if rollout_id >= self.args.num_critic_only_steps:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
 
-        compute_advantages_and_returns(self.args, rollout_data)
+        compute_advantages_and_returns(self.args, rollout_data, rollout_id=rollout_id)
 
         self.args.loss_type = "value_loss"
         train(
@@ -523,7 +530,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+                compute_advantages_and_returns(self.args, rollout_data, rollout_id=rollout_id)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
@@ -615,8 +622,9 @@ class MegatronTrainRayActor(TrainRayActor):
         this forward returns are token-aligned with the student's (which were
         computed over prompt+response). Samples with an empty prefix get teacher
         log-probs equal to the student's (zero KL). Results are written to
-        rollout_data["teacher_log_probs"], consumed by opd.py exactly like the
-        Megatron-OPD path.
+        rollout_data["teacher_log_probs"], consumed by opd.py (additive KL-in-
+        advantage) or, when --sdpo-rlsd is set, by loss_hub/rlsd.py (multiplicative
+        advantage reweighting) -- exactly like the Megatron-OPD path.
 
         This replaces SGLang HTTP full-sequence-logprob scoring (which forces
         eager prefill) with a single batched, CUDA-graph'd forward — the same
@@ -633,6 +641,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if not distribution_mode:
             # Sampled-token reverse KL: teacher log-prob of the sampled tokens.
+            # Also the path --sdpo-rlsd reads (rollout_data["teacher_log_probs"]) --
+            # RLSD only needs the sampled token's P_T/P_S ratio, not a top-k
+            # distribution, so it shares this cheaper single-forward branch with
+            # the legacy sampled-mode OPD path rather than the KD-loss top-k branch.
             out = self.compute_log_prob(teacher_iter, teacher_nmb, store_prefix="")
             teacher_lp = out["log_probs"]
             if student_log_probs is not None:
@@ -640,6 +652,25 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data["teacher_log_probs"] = teacher_lp
             del teacher_rollout_data, teacher_iter, out
             torch.cuda.empty_cache()
+            self._dump_sdpo_prompts(rollout_data, has_prefix)
+            # Skill-KD (option A) runs independently of how the RESPONSE teacher
+            # signal is consumed (RLSD's advantage reweighting here vs. the
+            # sdpo_kd_loss top-k branch below) -- skill-KD has always been a
+            # top-k distribution match on the skill's OWN tokens, orthogonal to
+            # the response mechanism (per instruction: RLSD only replaces the
+            # non-skill/response part; self-skill/pitfall/skill-KD stay as-is).
+            # Seed inert empty top-k targets for every response sample (kd=0 for
+            # them) so _append_sdpo_skill_samples can extend the list with the
+            # skill's real top-k targets; losses.py's skill_tok_mask split then
+            # isolates the skill span so only the skill-KD loss term fires.
+            if getattr(self.args, "sdpo_skill_kd", False):
+                topk = int(getattr(self.args, "opd_log_prob_top_k", 128) or 128)
+                n_resp = len(rollout_data["tokens"])
+                rollout_data["sdpo_teacher_topk_logprobs"] = [torch.zeros((0, topk)) for _ in range(n_resp)]
+                rollout_data["sdpo_teacher_topk_ids"] = [
+                    torch.zeros((0, topk), dtype=torch.long) for _ in range(n_resp)
+                ]
+                self._append_sdpo_skill_samples(rollout_data, topk)
             return
 
         topk = int(getattr(self.args, "opd_log_prob_top_k", 128) or 128)

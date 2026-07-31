@@ -1727,6 +1727,61 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "be the distilled skill rather than the worked solution."
                 ),
             )
+            # ---- RLSD: RLVR with Self-Distillation (arXiv:2604.03128) ----------
+            # RLSD replaces SDPO's distribution-matching KD loss with a MULTIPLICATIVE
+            # reweighting of the GRPO advantage: direction still comes exclusively from
+            # the environment reward (sign of A), while the self-teacher's evidence
+            # ratio P_T(y_t)/P_S(y_t) only modulates magnitude -- avoiding the KD loss's
+            # privileged-information leakage (a wrong trace can never be pulled toward
+            # tokens the teacher favors). Reuses SDPO's Megatron self-teacher/peer-
+            # prefix plumbing (--sdpo-teacher-backend megatron); needs the SAMPLED-token
+            # teacher log-prob, not a top-k distribution, so pair with
+            # --sdpo-logprob-mode sampled. See miles/backends/training_utils/
+            # loss_hub/rlsd.py.
+            parser.add_argument(
+                "--sdpo-rlsd",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable RLSD: multiplicatively reweight the GRPO advantage by the "
+                    "self-teacher's per-token evidence ratio instead of adding a KD loss "
+                    "(--sdpo-kd-loss) or an additive KL penalty (--use-opd). Requires "
+                    "--sdpo-teacher-backend megatron and --sdpo-logprob-mode sampled "
+                    "(reads rollout_data['teacher_log_probs']); mutually exclusive with "
+                    "--sdpo-kd-loss and --use-opd."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-rlsd-clip-eps",
+                type=float,
+                default=0.2,
+                help=(
+                    "eps_w: clip the per-token evidence weight w_t to [1-eps_w, 1+eps_w] "
+                    "before it reweights the advantage (matches the paper's eps_w=0.2, "
+                    "the trust-region analogue of GRPO's importance-ratio clip)."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-rlsd-lambda-init",
+                type=float,
+                default=0.5,
+                help=(
+                    "Initial mixing coefficient lambda for A_hat_t = A * ((1-lambda) + "
+                    "lambda * clip(w_t, ...)): lambda=0 is plain GRPO (uniform advantage), "
+                    "lambda=1 is fully reweighted. Matches the paper's lambda=0.5 start."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-rlsd-lambda-warmup-steps",
+                type=int,
+                default=50,
+                help=(
+                    "Linearly decay lambda from --sdpo-rlsd-lambda-init to 0 over this "
+                    "many rollouts (matches the paper's 50-step decay), so training "
+                    "settles into plain GRPO rather than an abrupt on/off transition. "
+                    "0 disables decay (lambda stays at its init value)."
+                ),
+            )
             # ---- EPO: PMI-credit self-distillation (examples/EPO/epo.py) --------
             # EPO decouples SDPO's teacher-vs-student divergence into a CREDIT weight
             # (|logp_with_privileged_context - logp_without|, i.e. the pointwise
@@ -2822,6 +2877,25 @@ def miles_validate_args(args):
                 f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
                 "please make sure it is a valid megatron checkpoint directory."
             )
+
+    # Validate RLSD (--sdpo-rlsd): needs the sampled-token self-teacher log-prob
+    # (rollout_data["teacher_log_probs"]), which only the Megatron self-teacher's
+    # "sampled" logprob-mode path writes (see actor.py::_compute_sdpo_teacher_log_probs);
+    # the "topk"/KD-loss path stashes a top-k distribution target instead
+    # (sdpo_teacher_topk_logprobs/ids), which RLSD's advantage-reweighting formula
+    # does not consume. Mutually exclusive with --sdpo-kd-loss/--use-opd: all three
+    # are alternative ways of turning the same teacher-vs-student divergence into a
+    # training signal (additive KD loss / additive KL-in-advantage / multiplicative
+    # advantage-reweighting) and combining them double-counts the same divergence.
+    if args.sdpo_rlsd:
+        if getattr(args, "sdpo_teacher_backend", "sglang") != "megatron":
+            raise ValueError("--sdpo-rlsd requires --sdpo-teacher-backend megatron.")
+        if getattr(args, "sdpo_logprob_mode", "topk") != "sampled":
+            raise ValueError("--sdpo-rlsd requires --sdpo-logprob-mode sampled.")
+        if getattr(args, "sdpo_kd_loss", False):
+            raise ValueError("--sdpo-rlsd and --sdpo-kd-loss are mutually exclusive (alternative KD mechanisms).")
+        if args.use_opd:
+            raise ValueError("--sdpo-rlsd and --use-opd are mutually exclusive (alternative KD mechanisms).")
 
     # Validate on-policy distillation (OPD) arguments
     if args.use_opd:
