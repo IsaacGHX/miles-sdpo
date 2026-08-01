@@ -592,7 +592,20 @@ class SGLangEngine(RayActor):
         return response
 
     def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+        # torch_empty_cache=False: SGLang's continue_generation handler
+        # (scheduler.py) calls torch.cuda.empty_cache() BEFORE clearing
+        # _engine_paused, not after -- the opposite order of pause_generation
+        # (which sets _engine_paused=True first). Under colocate, that
+        # empty_cache() contends with torch_memory_saver's cudaMalloc/cudaFree
+        # flock and can stall indefinitely, permanently stranding every
+        # rollout engine in the paused state (busy-spinning on
+        # `if self._engine_paused: continue`) with the resume HTTP call
+        # already having returned 200 OK. Requesting torch_empty_cache=False
+        # skips that call entirely, avoiding the stall.
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/continue_generation",
+            json={"torch_empty_cache": False},
+        )
         response.raise_for_status()
         return response
 

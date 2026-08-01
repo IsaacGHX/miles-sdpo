@@ -187,6 +187,17 @@ enroot start --rw \
                 RUN_SH=examples/SDPO/run-qwen3-4B-sdpo-math-rl-colocate.sh
                 DATA_KIND=dapo
                 ;;
+            qwen25-7b-math-rl-ablation)
+                # Model-swap sibling of qwen3-4b-math-rl-ablation: IDENTICAL
+                # arm structure/dataset/eval (DAPO math, AIME25+Minerva,
+                # arms 1/1.1/2/3/4/5.1/5.2), but Qwen2.5-7B-Instruct instead
+                # of Qwen3-4B. Requires $SDPO_ABLATION_ARM.
+                MODEL_DIR=Qwen2.5-7B-Instruct
+                HF_REPO=Qwen/Qwen2.5-7B-Instruct
+                MODEL_SH=scripts/models/qwen2.5-7B.sh
+                RUN_SH=examples/SDPO/run-qwen2.5-7B-sdpo-math-rl-colocate.sh
+                DATA_KIND=dapo
+                ;;
             *)
                 MODEL_DIR=Qwen3-8B
                 HF_REPO=Qwen/Qwen3-8B
