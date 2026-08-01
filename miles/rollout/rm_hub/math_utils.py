@@ -4,6 +4,7 @@ Answer checker API that uses sympy to simplify expressions and check for equalit
 
 Call grade_answer(given_answer: str, ground_truth: str).
 """
+import math
 import re
 
 import sympy
@@ -387,6 +388,12 @@ def _numeric_equal_under_sympy(a: str, b: str, rel_tol: float = 1e-6) -> bool:
     if a_val.imag or b_val.imag:
         return False
     a_real, b_real = a_val.real, b_val.real
+    if math.isinf(a_real) or math.isinf(b_real) or math.isnan(a_real) or math.isnan(b_real):
+        # sympy.N()'s default precision overflows huge (but finite, distinct)
+        # magnitudes to the same inf -- e.g. 4**2012 and 2**2012 both evaluate
+        # to inf here even though the former is astronomically larger. Treat
+        # as unequal rather than let inf == inf slip through.
+        return False
     if a_real == b_real:
         return True
     if a_real == 0 or b_real == 0:
