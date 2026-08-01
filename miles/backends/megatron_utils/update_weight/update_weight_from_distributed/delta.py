@@ -242,25 +242,19 @@ class UpdateWeightFromDiskDelta(DistBucketedWeightUpdateMixin):
             _check_weight_sync_results(pulls, is_lora=False)
             mode = self.args.pause_generation_mode
             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
-            try:
-                if mode not in ("in_place"):
-                    ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-                results = ray.get(
-                    [
-                        engine.update_weights_from_disk.remote(
-                            model_path=self.args.update_weight_local_checkpoint_dir,
-                            weight_version=str(self.weight_version),
-                        )
-                        for engine in self.rollout_engines
-                    ]
-                )
-                _check_weight_sync_results(results, is_lora=False)
-            finally:
-                # See update_weight_from_tensor.py's own update_weights() for why this
-                # must always run: a mid-update exception otherwise permanently
-                # strands every engine in the paused state, invisible to SGLang's
-                # own scheduler watchdog.
-                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            if mode not in ("in_place"):
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            results = ray.get(
+                [
+                    engine.update_weights_from_disk.remote(
+                        model_path=self.args.update_weight_local_checkpoint_dir,
+                        weight_version=str(self.weight_version),
+                    )
+                    for engine in self.rollout_engines
+                ]
+            )
+            _check_weight_sync_results(results, is_lora=False)
+            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
     def _encode_delta(self) -> None:

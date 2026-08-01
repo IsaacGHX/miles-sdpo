@@ -363,31 +363,25 @@ class DistBucketedWeightUpdateMixin:
         self._pause_and_prepare_engines()
         dist.barrier(group=get_gloo_group())
 
-        try:
-            with timer("update_weights_implementation"):
-                # Base weight sync model:
-                #   full-param RL: base weights change every step -> always sync.
-                #   LoRA RL: base is frozen -> only sync once, on the first iteration.
-                if not (self.is_lora and self._lora_base_synced):
-                    pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_source else None
+        with timer("update_weights_implementation"):
+            # Base weight sync model:
+            #   full-param RL: base weights change every step -> always sync.
+            #   LoRA RL: base is frozen -> only sync once, on the first iteration.
+            if not (self.is_lora and self._lora_base_synced):
+                pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_source else None
 
-                    self._gather_and_update_non_expert_weights(self._update_weight_implementation, pbar)
-                    dist.barrier(group=get_gloo_group())
-                    self._gather_and_update_expert_weights(self._update_weight_implementation, pbar)
-                    dist.barrier(group=get_gloo_group())
-
-                # LoRA adapter weights: every iteration.
-                if self.is_lora:
-                    self._update_lora_weights()
-                    dist.barrier(group=get_gloo_group())
-                    if not self._lora_base_synced:
-                        self._lora_base_synced = True
-        finally:
-            # Always resume the rollout engines, even if weight sync raised above --
-            # otherwise a mid-update exception permanently strands every engine in
-            # the paused state (cur_batch=None), which also hides them from SGLang's
-            # own scheduler watchdog (it only checks for stalls while cur_batch is
-            # not None).
-            with timer("finalize_and_resume_engines"):
-                self._finalize_and_resume_engines()
+                self._gather_and_update_non_expert_weights(self._update_weight_implementation, pbar)
                 dist.barrier(group=get_gloo_group())
+                self._gather_and_update_expert_weights(self._update_weight_implementation, pbar)
+                dist.barrier(group=get_gloo_group())
+
+            # LoRA adapter weights: every iteration.
+            if self.is_lora:
+                self._update_lora_weights()
+                dist.barrier(group=get_gloo_group())
+                if not self._lora_base_synced:
+                    self._lora_base_synced = True
+
+        with timer("finalize_and_resume_engines"):
+            self._finalize_and_resume_engines()
+            dist.barrier(group=get_gloo_group())

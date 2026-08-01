@@ -469,26 +469,12 @@ SGLANG_ARGS=(
    --sglang-router-policy round_robin
 )
 
-# --pause-generation-mode in_place (was the miles default "retract"): every
-# weight update pauses all rollout engines, syncs weights, then resumes.
-# "retract" moves in-flight requests back to the waiting queue for re-prefill
-# on pause and re-adds them on resume; this ablation repeatedly hung right
-# after a weight update, mid-way through the next rollout-generation batch,
-# with GPUs at 0% and SGLang's own scheduler watchdog never firing (it gates
-# its stall-check on cur_batch is not None, which is always None while
-# paused -- so a wedged resume is invisible to it). The hang reproduced
-# across totally different SDPO configs (plain GRPO / RLSD-baseline /
-# skill-source=correct) AND across models (Qwen3-4B and Qwen2.5-7B-Instruct),
-# ruling out a model/config-specific cause. in_place freezes requests and
-# resumes them on the existing KV cache instead of retracting/re-queueing,
-# avoiding the suspected wedge path.
 MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --pause-generation-mode in_place
 )
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
