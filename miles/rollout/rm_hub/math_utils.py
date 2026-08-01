@@ -377,6 +377,8 @@ def _numeric_equal_under_sympy(a: str, b: str, rel_tol: float = 1e-6) -> bool:
     polynomial form), not because one side is actually non-integer -- the exact
     are_equal_under_sympy(simplified == 0) path already covers real equality when both
     sides parse the same way."""
+    if not (should_allow_eval(a) and should_allow_eval(b)):
+        return False
     try:
         a_val = complex(sympy.N(_sympy_parse(a)))
         b_val = complex(sympy.N(_sympy_parse(b)))
