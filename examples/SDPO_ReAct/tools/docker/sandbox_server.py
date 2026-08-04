@@ -72,6 +72,14 @@ _TOTAL_COUNT = 0
 class ExecuteRequest(BaseModel):
     code: str
     timeout: float | None = None
+    # Piped to the subprocess's real stdin (sys.stdin / input()). Without this,
+    # the model's ONLY way to test stdin-reading code was to hardcode
+    # `sys.stdin = io.StringIO(...)` into the source -- which then also
+    # overwrites the REAL test input the grading harness sets before exec()ing
+    # this same code as the final submission, so every such submission fails
+    # regardless of logic (observed: 23/150 code-domain traces did this, 0/23
+    # correct). Exposing real stdin removes the need for the hack entirely.
+    stdin: str | None = None
 
 
 class ExecuteResponse(BaseModel):
@@ -194,16 +202,18 @@ async def execute(req: ExecuteRequest) -> ExecuteResponse:
             logger.info("execute: %.2fs (%s)", elapsed, outcome)
 
     code = _auto_print_trailing_expr(req.code)
+    stdin_bytes = req.stdin.encode() if req.stdin is not None else None
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-c",
             code,
+            stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(input=stdin_bytes), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
