@@ -211,15 +211,32 @@ def _parse_judge_verdict(text: str) -> bool:
     return hits[-1] == "CORRECT"
 
 
-async def _llm_judge_correct(args: Namespace, sample: Sample) -> bool:
+async def _llm_judge_correct(
+    args: Namespace,
+    sample: Sample,
+    *,
+    system: str | None = None,
+    user: str | None = None,
+    fallback: bool | None = None,
+) -> bool:
     """Grade one trace via the OpenAI-compatible LLM judge (SFR gateway).
 
-    Falls back to deterministic _is_correct on any judge failure so a flaky
-    gateway never stalls or crashes training.
+    system/user default to the science-exam prompt (_build_judge_prompt); pass
+    both to use a different prompt (e.g. _build_search_judge_prompt) against
+    the SAME gateway/model/concurrency config.
+
+    On any judge failure (bad response, timeout, etc.), returns `fallback` if
+    given, else deterministic _is_correct(sample, args) -- so a flaky gateway
+    never stalls or crashes training. The _is_correct default is math/mcq-
+    shaped: callers grading a different domain (e.g. search's EM-miss fallback
+    path) MUST pass an explicit `fallback` (typically False, i.e. "keep
+    whatever cheaper deterministic check already ran"), since _is_correct
+    would otherwise silently mis-grade non-math samples on judge failure.
     """
-    system, user = _build_judge_prompt(args, sample)
+    if system is None or user is None:
+        system, user = _build_judge_prompt(args, sample)
     base_url = getattr(args, "sdpo_judge_base_url", "https://api.openai.com/v1").rstrip("/")
-    model = getattr(args, "sdpo_judge_model", "gpt-5.4-mini")
+    model = getattr(args, "sdpo_judge_model", "gpt-5.6-luna")
     api_key = os.environ.get(getattr(args, "sdpo_judge_api_key_env", "OPENAI_API_KEY"), "") or "EMPTY"
     max_tokens = int(getattr(args, "sdpo_judge_max_tokens", 2048))
 
@@ -246,6 +263,9 @@ async def _llm_judge_correct(args: Namespace, sample: Sample) -> bool:
         content = out["choices"][0]["message"].get("content") or ""
         return _parse_judge_verdict(content)
     except Exception as e:
+        if fallback is not None:
+            logger.warning(f"LLM judge failed ({e!r}); using caller-supplied fallback={fallback}.")
+            return fallback
         logger.warning(f"LLM judge failed ({e!r}); falling back to deterministic grading.")
         return _is_correct(sample, args)
 
@@ -303,7 +323,7 @@ def _code_candidate(sample: Sample, args: Namespace | None = None) -> str:
 
 async def _grade_one_code(sample: Sample, args: Namespace | None = None) -> bool:
     """Grade a code sample by running its candidate program against its test
-    cases in the sandbox (examples/SDPO_ReAct/tools/code_judge.py). Correct =
+    cases in the sandbox (examples/SDPO_ReAct/tools/code/judge.py). Correct =
     ALL tests pass (all-or-nothing, matching math). The candidate is the code
     the model RAN via the tool (see _code_candidate) so the tool is mandatory.
     Imported lazily so examples/SDPO has no hard dependency on SDPO_ReAct."""
@@ -313,7 +333,7 @@ async def _grade_one_code(sample: Sample, args: Namespace | None = None) -> bool
     if not candidate.strip() or not tests:
         return False
     try:
-        from examples.SDPO_ReAct.tools.code_judge import grade_code
+        from examples.SDPO_ReAct.tools.code.judge import grade_code
 
         # candidate is already raw code (not a response) -> grade_code's
         # _extract_code_block is a no-op on plain code, so pass it directly.
@@ -323,8 +343,8 @@ async def _grade_one_code(sample: Sample, args: Namespace | None = None) -> bool
         return False
 
 
-def _grade_one_search(sample: Sample, args: Namespace | None = None) -> bool:
-    """Grade a search/QA sample by EM against golden_answers (multi-hop QA).
+def _em_check_search(sample: Sample, args: Namespace | None = None) -> bool:
+    """EM-grade a search/QA sample against golden_answers (multi-hop QA).
     Extracts the <answer> tag and exact-matches (normalized) against any golden
     answer, reusing examples/search-r1/qa_em_format.py::em_check. golden_answers
     live on metadata['golden_answers']. Lazy import (no hard dep)."""
@@ -350,6 +370,85 @@ def _grade_one_search(sample: Sample, args: Namespace | None = None) -> bool:
     return bool(em_check(pred, golden))
 
 
+def _build_search_judge_prompt(args: Namespace, sample: Sample) -> tuple[str, str]:
+    """Same shape as _build_judge_prompt, but for search/QA: the reference is
+    the FULL golden_answers list (multi-hop QA often has multiple acceptable
+    phrasings, e.g. "USA" vs "United States"), not just sample.label (EM's
+    single golden pick). Question comes from metadata['question'] when the
+    builder recorded it (build_search_data.py); falls back to the rendered
+    prompt string (works, but includes the <tools> block / system prompt --
+    acceptable degradation, this path only runs when EM already said "wrong",
+    a second opinion with extra context in the prompt is still informative)."""
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    question = md.get("question") or (sample.prompt if isinstance(sample.prompt, str) else "")
+    golden = md.get("golden_answers") or ([sample.label] if sample.label else [])
+    reference = "; ".join(str(g) for g in golden)
+    extracted = _extract_answer(args, sample)
+    full = sample.response or ""
+    if len(full) > 8000:
+        full = full[:4000] + "\n...[truncated]...\n" + full[-3000:]
+    user = (
+        f"QUESTION:\n{question}\n\n"
+        f"ACCEPTABLE REFERENCE ANSWER(S):\n{reference}\n\n"
+        f"MODEL FULL RESPONSE:\n{full}\n\n"
+        f"MODEL EXTRACTED ANSWER:\n{extracted if extracted is not None else '(none — no <answer> tag found)'}\n\n"
+        "Is the model's answer correct? Reply CORRECT or INCORRECT."
+    )
+    return _SEARCH_JUDGE_SYSTEM, user
+
+
+_SEARCH_JUDGE_SYSTEM = (
+    "You are a strict grader for multi-hop question-answering. You are given the "
+    "QUESTION, one or more ACCEPTABLE REFERENCE ANSWERS, the model's FULL RESPONSE, "
+    "and the model's EXTRACTED ANSWER. Decide whether the extracted answer is "
+    "correct.\n\n"
+    "Rules:\n"
+    "- Judge correctness of MEANING, not exact wording. Accept equivalent phrasings, "
+    "abbreviations, aliases, or a different but correct level of specificity (e.g. "
+    "'USA' for 'United States', a full name for a name the reference gives partially).\n"
+    "- The extracted answer must actually answer the question. A blank, missing, or "
+    "placeholder answer is INCORRECT.\n"
+    "- Do NOT give credit for a guess with no supporting reasoning if it does not match "
+    "any reference answer's meaning.\n"
+    "First, briefly analyze in 1-3 sentences whether the extracted answer matches any "
+    "reference answer's meaning. Then reply with EXACTLY one word on the FINAL line: "
+    "CORRECT or INCORRECT."
+)
+
+
+async def _grade_one_search(sample: Sample, args: Namespace | None = None) -> bool:
+    """Grade a search/QA sample: EM first (cheap, exact), then -- only when EM
+    says "wrong" and --sdpo-search-judge-fallback is set -- a second opinion
+    from the LLM judge before finalizing "incorrect". EM's normalized string
+    equality has no tolerance for a correct answer phrased differently than the
+    single golden string it happens to compare against (multi-hop QA often has
+    several acceptable phrasings; EM only catches an exact one), so a plain EM
+    miss is not strong evidence of an actually-wrong trace -- this reduces
+    those false negatives without touching an EM HIT (EM correct always short-
+    circuits, no judge call, no double up-weighting of the same trace)."""
+    if _em_check_search(sample, args):
+        return True
+    if not getattr(args, "sdpo_search_judge_fallback", False):
+        return False
+    # No extracted <answer> at all (e.g. a multi-turn trace truncated mid-tool-
+    # use by --generate-max-turns/--rollout-max-response-len before it ever
+    # wrote one -- observed on ~half of a random EM-wrong sample) is
+    # unambiguously wrong; skip the judge call entirely rather than spend a
+    # gateway round-trip confirming the obvious.
+    tag = getattr(args, "sdpo_answer_tag", "answer") if args else "answer"
+    if _extract_tagged_answer(sample.response, tag) is None:
+        return False
+    try:
+        system, user = _build_search_judge_prompt(args, sample)
+        # fallback=False: on a judge/gateway failure, keep EM's "incorrect"
+        # rather than falling through to _llm_judge_correct's own default
+        # fallback (_is_correct, a math/mcq grader -- meaningless for search).
+        return await _llm_judge_correct(args, sample, system=system, user=user, fallback=False)
+    except Exception as e:
+        logger.warning(f"search LLM-judge fallback failed ({e!r}); keeping EM's 'incorrect' verdict.")
+        return False
+
+
 async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
     """Correctness for every trace in a group. Domain-aware: code samples
     (metadata['domain']=='code') run their program against test cases; search
@@ -372,7 +471,13 @@ async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
                 async with sem:
                     return await _grade_one_code(s, args)
             if dom == "search":
-                return _grade_one_search(s, args)  # EM, cheap/sync
+                # EM is cheap/sync and short-circuits on a hit; only take the
+                # semaphore (shared with code/math judge calls) when an EM MISS
+                # will actually fall through to a judge gateway call.
+                if _em_check_search(s, args) or not getattr(args, "sdpo_search_judge_fallback", False):
+                    return await _grade_one_search(s, args)
+                async with sem:
+                    return await _grade_one_search(s, args)
             if getattr(args, "sdpo_judge", False) and (s.response or "").strip():
                 async with sem:
                     return await _llm_judge_correct(args, s)
