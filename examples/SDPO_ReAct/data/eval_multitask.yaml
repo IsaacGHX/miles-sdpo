@@ -1,0 +1,44 @@
+# --eval-config for the MULTITASK domain (shuffled math + code).
+#
+# Evaluates BOTH domains held-out so the multi-task run's per-domain progress is
+# visible: AIME24/25 (math, answer grading) + LiveCodeBench v6 (code, test-case
+# grading via metadata['domain']=='code' -> code_judge). Each dataset's rows
+# carry their own domain in metadata, so sdpo_eval_reward routes grading
+# correctly. tool_key: tools injects the <tools> block for all.
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 1.0
+    tool_key: tools
+    metadata_key: metadata
+  datasets:
+    - name: aime24
+      path: ${oc.env:SDPO_REACT_EVAL_DIR,/root/math_eval/native-default}/aime24_native.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: aime25
+      path: ${oc.env:SDPO_REACT_EVAL_DIR,/root/math_eval/native-default}/aime25_native.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: livecodebench_v6
+      path: /root/data/code_data_v6eval/livecodebench_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: hotpotqa
+      path: /root/data/search_data/hotpotqa_val.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: 2wikimultihopqa
+      path: /root/data/search_data/2wikimultihopqa_val.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}

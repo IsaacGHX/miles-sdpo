@@ -1,0 +1,23 @@
+# --eval-config for the CODE domain (LiveCodeBench).
+#
+# Sibling of eval_native_math.yaml. The eval set (livecodebench_eval.jsonl,
+# built by build_code_data.py) carries per-row metadata {domain:"code",
+# test_cases:[...]}; sdpo_react_eval_reward -> sdpo.py::sdpo_eval_reward routes
+# domain=="code" samples to the test-case judge (code_judge.py). tool_key: tools
+# so the <tools> block is injected exactly as in training.
+#
+# max_response_len higher than math (code solutions + multi-turn debugging are
+# long); same env-overridable turn budget / sample count as the math eval.
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 1.0
+    tool_key: tools
+    metadata_key: metadata
+  datasets:
+    - name: livecodebench_v6
+      path: /root/data/code_data_v6eval/livecodebench_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}

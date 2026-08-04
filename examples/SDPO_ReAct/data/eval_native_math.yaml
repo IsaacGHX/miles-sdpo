@@ -1,0 +1,37 @@
+# --eval-config for the NATIVE tool-calling SDPO_ReAct path (Qwen3).
+#
+# Sibling of eval_aime24.yaml (the plain-text-tag Qwen2.5 variant). Differences:
+#   - points at the *_native.jsonl eval sets (built by build_native_eval.py,
+#     which carry the native system prompt + a `tools` field so the <tools>
+#     block is injected exactly as in training);
+#   - two eval sets (AIME-2024 + AIME-2025) to track generalization, not just
+#     the training-adjacent distribution.
+#
+# Eval runs MORE tool-call turns than training (SDPO_REACT_EVAL_MAX_TURNS,
+# default 20, vs the training --generate-max-turns): metadata_overrides injects
+# generate_max_turns per eval sample, which multi_turn.generate reads before
+# falling back to the global --generate-max-turns. Env vars keep turn budget /
+# sample count swappable without editing this file (oc.decode re-parses the
+# oc.env string to the dataclass's declared int type; see eval_aime24.yaml's
+# header for the full rationale).
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 1.0
+    tool_key: tools
+  # Eval dir is per prompt-variant (native-default / native-force_tool) so eval
+  # rows carry the SAME system prompt as training. SDPO_REACT_EVAL_DIR is set by
+  # the launcher; falls back to the default-prompt dir.
+  datasets:
+    - name: aime24
+      path: ${oc.env:SDPO_REACT_EVAL_DIR,/root/math_eval/native-default}/aime24_native.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: aime25
+      path: ${oc.env:SDPO_REACT_EVAL_DIR,/root/math_eval/native-default}/aime25_native.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}

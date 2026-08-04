@@ -62,7 +62,7 @@ mkdir -p /root/dapo-math-17k /root/math_eval
         --in /root/dapo-math-17k/dapo-math-17k.jsonl \
         --out /root/dapo-math-17k/dapo-math-17k-react.jsonl)
 [ -f /root/math_eval/aime24.jsonl ] || \
-    (cd "$REPO_ROOT" && python -m examples.SDPO_ReAct.build_aime24_eval --out-dir /root/math_eval)
+    (cd "$REPO_ROOT" && python -m examples.SDPO_ReAct.data.build_aime24_eval --out-dir /root/math_eval)
 
 SDPO_REACT_EXP="${SDPO_REACT_EXP:-qwen2.5-7B-sdpo-react-dapo-math_$(date +%Y%m%d_%H%M%S)}"
 DUMP_DIR="/root/miles/sdpo_dumps/${SDPO_REACT_EXP}"
@@ -171,7 +171,7 @@ RM_ARGS=(
 # with 8 samples/prompt per eval_aime24.yaml.
 EVAL_ARGS=(
    --eval-interval 5
-   --eval-config "$SCRIPT_DIR/eval_aime24.yaml"
+   --eval-config "$SCRIPT_DIR/data/eval_aime24.yaml"
    --n-samples-per-eval-prompt "${SDPO_REACT_EVAL_N_SAMPLES}"
    --log-passrate
 )

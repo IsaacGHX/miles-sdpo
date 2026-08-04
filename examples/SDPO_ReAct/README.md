@@ -1,4 +1,4 @@
-# SDPO-ReAct — multi-turn tool-calling rollout for SDPO (base version)
+# SDPO-ReAct — multi-turn tool-calling rollout for SDPO
 
 Extends [`examples/SDPO`](../SDPO) (prefix-conditioned self-distillation) from
 single-turn GRPO rollout to a **ReAct-style multi-turn tool-calling rollout**:
@@ -11,8 +11,16 @@ holds for a multi-turn trajectory exactly like a single-turn one, as long as
 the whole trajectory stays one `Sample` (`--generate-multi-samples` off).
 
 Base version scope: **one tool (Python code execution)**, DAPO math training
-data, AIME-2024 eval, Qwen2.5-7B-Instruct. `cli_exec` / `web_search` are
-declared as schema-only stubs in `tools/tool_specs.py` for a later pass.
+data, AIME-2024 eval, Qwen2.5-7B-Instruct (`tools/tool_specs.py` /
+`tools/tool_client.py`, now thin back-compat shims -- see `tools/code/`).
+
+Since the base version, the tool set has grown into a composable registry
+(`tools/registry.py`) with THREE real backends -- `code_interpreter`/`cli_exec`
+(one Docker sandbox, `tools/code/` + `tools/cli/`) and `search`/`open`/`find`
+(a second sidecar wrapping gpt-oss's `simple_browser` tool over the existing
+wiki-18 retriever, `tools/search/`) -- switchable via `$SDPO_REACT_TOOLSET`,
+used by the multitask/native launcher
+(`run-qwen3-4B-sdpo-react-native.sh`). See "Files" and "Extending" below.
 
 ## Why this design
 
@@ -28,12 +36,26 @@ declared as schema-only stubs in `tools/tool_specs.py` for a later pass.
   tool call → observation → final `\boxed{}` answer) as **real chat messages**
   with a genuine `tool_calls` field — never a string-literal tag — so it always
   renders through the model's own template.
-- **Docker sandbox**: exactly **one** long-lived sidecar container, exposing
-  exactly **one** fixed port for the entire training job (`tools/run_sandbox.sh`
-  + `tools/docker/`), reached over `miles.utils.http_utils.post` — the same
-  pattern already used by `examples/experimental/swe-agent-v2`'s Harbor sidecar.
-  No port is opened per GPU/engine/rollout worker, matching the host's hard
+- **One sidecar per capability, ONE fixed port each**: `code_interpreter`/
+  `cli_exec` share the code sandbox (`tools/run_sandbox.sh` + `tools/docker/`);
+  `search`/`open`/`find` get their OWN sidecar (`tools/search/
+  run_search_sidecar.sh` + `tools/search/docker/`) -- kept separate because
+  it wraps gpt-oss's `simple_browser` tool, which requires Python >=3.12, a
+  different runtime from both the training image and the code sandbox. Every
+  sidecar is reached over `miles.utils.http_utils.post` — the same pattern
+  already used by `examples/experimental/swe-agent-v2`'s Harbor sidecar. No
+  port is opened per GPU/engine/rollout worker, matching the host's hard
   port-count limit.
+- **search/open/find = i-DeepSearch's own code, unmodified**:
+  `tools/search/docker/browser.py` is a VERBATIM copy of i-DeepSearch's
+  `tools/browser.py` (https://github.com/i-DeepSearch/observation-masking) --
+  `BrowserTool`, `LocalServiceBrowserBackend`, `BrowserPool`, the
+  `【id†url】` citation rendering, the page-stack/cursor model, all of it,
+  unchanged. The only repo-specific addition is `retrieval_adapter.py`, a
+  thin `/search`+`/get_content` HTTP shim in front of the wiki-18 retriever
+  this repo already has staged, so `LocalServiceBrowserBackend`'s existing
+  HTTP contract (built for i-DeepSearch's own BrowseComp-Plus search service)
+  works against a different corpus with zero code changes.
 - **SDPO integration**: `sdpo_react.py` is a thin wrapper (same pattern as
   `examples/EPO/epo.py`) around `examples.SDPO.sdpo.sdpo_group_reward` /
   `sdpo_eval_reward` — no fork, no duplicated logic. It only adds tool-call
@@ -51,19 +73,45 @@ declared as schema-only stubs in `tools/tool_specs.py` for a later pass.
 ```text
 examples/SDPO_ReAct/
 ├── react_prompt.py                            # system prompt + one-shot example (real tool_calls messages)
+├── native_prompt.py                            # native <tool_call> variant (multitask/Qwen3 launcher)
 ├── sdpo_react.py                               # thin group-RM wrapper around examples.SDPO.sdpo + trace dump
-├── build_aime24_eval.py                        # writes {prompt,label} aime24.jsonl
-├── eval_aime24.yaml                            # --eval-config: 8 samples/prompt, 20-turn eval budget (env-overridable)
-├── run-qwen2.5-7B-sdpo-react-dapo-math.sh      # launcher: DAPO train (5 turns) + AIME24 eval (20 turns)
+├── data/
+│   ├── build_aime24_eval.py / build_native_eval.py # writes {prompt,label} eval jsonl (legacy / native)
+│   ├── build_code_data.py / build_search_data.py   # LiveCodeBench / HotpotQA+2Wiki row builders (multitask)
+│   ├── build_multitask_data.py                     # interleave+shuffle per-domain sources into one train.jsonl
+│   └── eval_aime24.yaml / eval_native_math.yaml /
+│       eval_code.yaml / eval_multitask.yaml         # --eval-config per launcher/domain
+├── run-qwen2.5-7B-sdpo-react-dapo-math.sh      # BASE launcher: DAPO train (5 turns) + AIME24 eval (20 turns),
+│                                                 legacy plain-text tags, code_interpreter ONLY
+├── run-qwen3-4B-sdpo-react-native.sh           # NATIVE/multitask launcher: native <tool_call>, math|code|
+│                                                 search|multitask domains, full self-skill wiring
 ├── enroot-run-sdpo-react.sh                    # one-click no-sudo launcher (sibling of examples/SDPO's)
 └── tools/
-    ├── tool_specs.py                           # code_interpreter spec (+ cli_exec/web_search stubs)
-    ├── tool_client.py                          # execute_tool() -> HTTP call to the sandbox sidecar
-    ├── run_sandbox.sh                          # idempotent: build+run the ONE sandbox container/port
-    └── docker/
-        ├── Dockerfile                          # python3-slim + sympy/numpy/scipy + FastAPI sidecar
-        ├── requirements.txt
-        └── sandbox_server.py                   # POST /execute {code} -> {stdout, error, timed_out}
+    ├── registry.py                              # tool registry (name -> spec/handler/set), $SDPO_REACT_TOOLSET
+    ├── tool_specs.py / tool_client.py           # back-compat shims -> tools/code/ (single-tool base version)
+    ├── reframe_trace.py                         # domain-agnostic debug tool (independent of react_prompt)
+    ├── test_tools_docker.py                     # cross-sidecar smoke test (no miles/GPU)
+    ├── run_sandbox.sh                           # idempotent: build+run the code sandbox container/port
+    ├── docker/                                   # code sandbox image (code_interpreter + cli_exec backend)
+    │   ├── Dockerfile                            # python3-slim + sympy/numpy/scipy + FastAPI sidecar
+    │   ├── requirements.txt
+    │   └── sandbox_server.py                     # POST /execute {code} -> {stdout, error, timed_out}
+    ├── code/                                     # code_interpreter: spec + HTTP client + LiveCodeBench judge
+    │   ├── spec.py / client.py / judge.py
+    ├── cli/                                      # cli_exec: spec + client (wraps a shell cmd, reuses tools/code's sandbox)
+    │   ├── spec.py / client.py
+    └── search/                                   # search/open/find: spec + client + its OWN sidecar
+        ├── spec.py / client.py
+        ├── retrieval_server.py                    # torch-GPU wiki-18 dense retriever (drop-in for search-r1's)
+        ├── run_retrieval.sh                       # start the retriever ABOVE (needs its own GPU)
+        ├── run_search_sidecar.sh                  # idempotent: build+run the search/open/find sidecar/port
+        ├── bench_retrieval.py                     # concurrency/latency benchmark for the retriever
+        └── docker/                                # gpt-oss simple_browser sidecar (needs Python >=3.12,
+            ├── Dockerfile                          # separate runtime from both the training image and the
+            ├── requirements.txt                    # code sandbox)
+            ├── browser.py                          # i-DeepSearch's BrowserTool/BrowserPool, copied VERBATIM
+            ├── retrieval_adapter.py                 # /search+/get_content shim -> ../retrieval_server.py
+            └── server.py                            # POST /session/{id}/call {tool, args} -> {observation}
 ```
 
 ## Wiring
@@ -73,7 +121,7 @@ examples/SDPO_ReAct/
 --generate-tool-specs-path examples.SDPO_ReAct.tools.tool_specs.tool_specs
 --generate-execute-tool-function-path examples.SDPO_ReAct.tools.tool_client.execute_tool
 --generate-tool-call-parser qwen25
---generate-max-turns 5                          # training; eval overrides to 20 (see eval_aime24.yaml)
+--generate-max-turns 5                          # training; eval overrides to 20 (see data/eval_aime24.yaml)
 
 --group-rm
 --custom-rm-path examples.SDPO_ReAct.sdpo_react.sdpo_react_group_reward
@@ -84,7 +132,7 @@ examples/SDPO_ReAct/
 ```
 
 Eval running MORE turns than training (5 train / 20 eval, per spec) works via
-a new per-sample metadata override: `eval_aime24.yaml`'s `metadata_overrides:
+a new per-sample metadata override: `data/eval_aime24.yaml`'s `metadata_overrides:
 {generate_max_turns: 20}` is injected into each eval sample's metadata by
 `EvalDatasetConfig.inject_metadata`, and `multi_turn.generate` now reads that
 override before falling back to the global `--generate-max-turns` (see the
@@ -108,22 +156,31 @@ then launch training via `ray job submit`.
 
 ### Extending to a new task / bigger tool set
 
-Everything that changes per task is an env var, not a script edit:
+For the BASE launcher (single tool, `tools/tool_specs.py`/`tools/tool_client.py`),
+turn-budget env vars are the only override point:
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `SDPO_REACT_TOOL_SPECS_PATH` | `examples.SDPO_ReAct.tools.tool_specs.tool_specs` | point at your own tool set |
-| `SDPO_REACT_EXECUTE_TOOL_PATH` | `examples.SDPO_ReAct.tools.tool_client.execute_tool` | point at your own executor |
 | `SDPO_REACT_TRAIN_MAX_TURNS` | `5` | training turn budget |
-| `SDPO_REACT_EVAL_MAX_TURNS` | `20` | eval turn budget (read by `eval_aime24.yaml`) |
-| `SDPO_REACT_EVAL_N_SAMPLES` | `8` | eval samples/prompt (read by `eval_aime24.yaml`) |
+| `SDPO_REACT_EVAL_MAX_TURNS` | `20` | eval turn budget (read by `data/eval_aime24.yaml`) |
+| `SDPO_REACT_EVAL_N_SAMPLES` | `8` | eval samples/prompt (read by `data/eval_aime24.yaml`) |
+
+For the NATIVE/multitask launcher (`run-qwen3-4B-sdpo-react-native.sh`), the
+active tool SET is an env var, not a script edit:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `SDPO_REACT_TOOLSET` | `math` (code_interpreter only) | `code` \| `search` \| `cli` \| `all` -- see `tools/registry.py::_REGISTRY` |
+| `SDPO_REACT_DOMAIN` | `math` | `math` \| `code` \| `search` \| `multitask` -- picks train/eval data AND starts the matching sidecar(s) |
 
 Same "override via env, not by editing the example" flexibility as
-`examples/EPO/enroot-run-epo.sh`'s `EPO_MODEL` switch. To add a CLI-exec or
-web-search tool: write a new `tool_specs`/`execute_tool` module following
-`tools/tool_specs.py`'s / `tools/tool_client.py`'s shape (a plain list of
-OpenAI function specs + an async `execute_tool(name, params) -> str`), then
-point `SDPO_REACT_TOOL_SPECS_PATH`/`SDPO_REACT_EXECUTE_TOOL_PATH` at it.
+`examples/EPO/enroot-run-epo.sh`'s `EPO_MODEL` switch. To add a genuinely NEW
+tool: write a new subpackage under `tools/<name>/` following `tools/cli/`'s
+shape (a `spec.py` OpenAI function spec + a `client.py` with an async
+`execute_tool(name, params) -> str` for single-tool use), add one entry to
+`tools/registry.py::_REGISTRY` (spec + handler + which sets it belongs to) --
+no edits to the rollout loop, SDPO reward, or any OTHER tool's files, per the
+registry's own design goal.
 
 ## Monitoring
 
@@ -189,12 +246,22 @@ launcher to `sdpo_dumps/<exp>/`), plus a wandb panel:
 pytest tests/fast/examples/test_sdpo_react.py -v
 ```
 
-## Limitations (base version)
+## Limitations
 
-- Only `code_interpreter` has a real backend; `cli_exec`/`web_search` are
-  schema stubs that raise `NotImplementedError` if ever invoked.
-- The sandbox sidecar is single-container/single-host — no multi-node scaling
-  of tool execution capacity in this pass.
-- `env_feedback` skill source only fires for traces that actually called the
+Base launcher (`run-qwen2.5-7B-sdpo-react-dapo-math.sh`) only:
+- Only `code_interpreter` has a real backend via `tools/tool_specs.py`'s single-
+  tool spec list; that launcher never registers `cli_exec`/`search`.
+
+Both launchers:
+- Every sidecar (code sandbox, search sidecar, wiki-18 retriever) is single-
+  container/single-host — no multi-node scaling of tool execution capacity in
+  this pass.
+- `env_feedback` skill source only fires for traces that actually called a
   tool; rollouts with zero tool calls behave exactly like plain `--sdpo-self-skill
   --sdpo-skill-source incorrect` (env_feedback text is empty, a no-op).
+- `search`/`open`/`find` state (which page is "currently open") lives ONLY in
+  the search sidecar's process memory, keyed by a per-trajectory session id
+  (`miles.rollout.generate_hub.multi_turn.current_trajectory_session_id`) --
+  a sidecar restart mid-training silently resets every in-flight trajectory's
+  browsing state (a fresh `search` starts a new page stack; no crash, just as
+  if the trajectory had never opened anything).
