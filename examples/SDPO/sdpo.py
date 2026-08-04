@@ -1497,6 +1497,15 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
         # field, never mis-splits on a stray marker. See _reframe_messages_to_prose.
         prefix_messages_by_idx: dict[int, list] = {}
         peer_by_idx: dict[int, int] = {}
+        # Traces that fell into the "no correct peer" branch below WHILE
+        # self_ok=True -- i.e. this trace is the group's ONLY correct trace, so
+        # there is no other correct peer's solution/skill to borrow. It still has
+        # nothing of its OWN to diagnose (it didn't fail), but the group's OTHER
+        # traces may have failed and produced pitfalls -- give it those instead of
+        # leaving it with zero teacher signal. Tracked separately from the
+        # "not self_ok" failed-trace case in pass 2 below, since both end up with
+        # group_pitfalls as their only content but for a different reason.
+        sole_correct_no_peer_idxs: set[int] = set()
         for i, sample in enumerate(group):
             if not isinstance(sample.metadata, dict):
                 continue
@@ -1505,12 +1514,18 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 continue
             peers = [j for j in correct_indices if j != i]
             if not peers:
-                # No correct peer. A FAILED trace under pitfall injection still gets a
-                # prefix (base empty; shared pitfalls appended in pass 2). Everyone
-                # else gets no prefix.
+                # No correct peer. Under pitfall injection, BOTH a failed trace (no
+                # solution to diagnose from, but the group's shared pitfalls still
+                # apply) AND the group's sole correct trace (nothing of its own to
+                # diagnose, but it can still see what tripped up the OTHER, failed
+                # traces) get a prefix (base empty; shared pitfalls appended in pass
+                # 2). Only when pitfall injection is off entirely does a no-peer
+                # trace get no prefix at all.
                 self_ok = bool(correctness[i]) if i < len(correctness) else False
-                if pitfall_active and not self_ok:
+                if pitfall_active:
                     prefix_text_by_idx[i] = ""
+                    if self_ok:
+                        sole_correct_no_peer_idxs.add(i)
                 else:
                     sample.metadata["sdpo_teacher_prompt_tokens"] = []
                 continue
@@ -1783,7 +1798,16 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                     stu_prompt_str = tok.decode(stu_ids)
                     # Privileged info = THIS trace's own correct response (per-trace,
                     # not group-aggregated -- unlike pitfall-condense's failure_info).
-                    correct_info = _strip_response_eos(group[i].response)
+                    # Prefer the dict-native prose (metadata["messages"]) over the raw
+                    # ChatML response, same reasoning as the self-skill path above
+                    # (sdpo.py:1593-1600): a peer's own reframed prose can't mis-split
+                    # on a stray <|im_*|>/<tool_call> marker.
+                    own_msgs = group[i].metadata.get("messages") if isinstance(group[i].metadata, dict) else None
+                    correct_info = (
+                        _reframe_messages_to_prose(own_msgs, grammar=tool_grammar)
+                        if own_msgs
+                        else _strip_response_eos(group[i].response)
+                    )
                     teacher_str = _build_blind_correct_teacher_prompt_str(stu_prompt_str, gen_suffix, correct_info)
                     md["sdpo_skill_teacher_prompt_tokens"] = tok.encode(teacher_str, add_special_tokens=False)
 
@@ -1800,7 +1824,21 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                 p = group[j].prompt
                 return p if isinstance(p, str) else str(p)
 
-            pairs = [(_problem_of(i), _strip_response_eos(prefix_text_by_idx[i])) for i in idxs]
+            # Prefer the peer's dict-native prose (metadata["messages"], tracked in
+            # prefix_messages_by_idx alongside prefix_text_by_idx -- see pass 1
+            # above) over the raw ChatML response text: the condenser LLM then
+            # reads clean per-round "Round N.../Observation:..." prose instead of
+            # scraping <tool_call>/<|im_*|> control tokens, same reasoning as the
+            # self-skill path (sdpo.py:1593-1600) and the response-teacher-prefix
+            # splice (_build_teacher_prompt_str, sdpo.py:403-412).
+            def _peer_solution(j: int) -> str:
+                peer_msgs = prefix_messages_by_idx.get(j)
+                if peer_msgs:
+                    return _reframe_messages_to_prose(peer_msgs, grammar=tool_grammar)
+                cleaned = _strip_response_eos(prefix_text_by_idx[j])
+                return _reframe_multiturn_trace(cleaned) if reframe_multiturn else cleaned
+
+            pairs = [(_problem_of(i), _peer_solution(i)) for i in idxs]
             skills = await _condense_solutions(args, pairs)
             for i, skill in zip(idxs, skills):
                 full_trace = prefix_text_by_idx[i]
@@ -1840,6 +1878,20 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
                     group[i].metadata["sdpo_response_prefix_is_skill"] = 1.0 if peer_skill else 0.0
                 if peer_skill:
                     prefix_text_by_idx[i] = peer_skill
+                    # BUG FIX: _build_teacher_prompt_str prefers peer_messages (dict-
+                    # native structured trace) over peer_response WHENEVER peer_messages
+                    # is truthy (see that function: `if peer_messages: cleaned =
+                    # _reframe_messages_to_prose(peer_messages, ...)` -- peer_response is
+                    # never even looked at in that branch). prefix_messages_by_idx[i] was
+                    # set from the peer's ORIGINAL full trace at pass 1 (line ~1521) and
+                    # never touched here, so every skill-prefix swap was being silently
+                    # overridden back to the peer's full raw trace downstream -- confirmed
+                    # live: 100% of a rollout's dumped teacher_prompt_text carried a full
+                    # multi-thousand-char "Correct solution:" trace, never the ~300-char
+                    # skill, despite skill/response_prefix_is_skill_frac reporting 1.0 (that
+                    # metric only reflects THIS dict's bookkeeping, not what actually got
+                    # spliced). Clear it so the skill (peer_response) branch is taken.
+                    prefix_messages_by_idx.pop(i, None)
 
         # Group-aggregated pitfalls (two stages), when self-skill covers INCORRECT
         # traces (--sdpo-skill-source incorrect|all):
@@ -1913,12 +1965,19 @@ async def sdpo_group_reward(args: Namespace, group: list[Sample], **kwargs: Any)
 
         # Pass 2: build the teacher prompt (peer solution/skill spliced into the USER
         # turn, before the assistant marker) and tokenize. The shared pitfalls go ONLY
-        # into failed traces' prefix; correct traces keep the clean correct-peer prefix.
+        # into failed traces' prefix (nothing of their own to show, but the group's
+        # common mistakes still apply) PLUS the group's sole correct trace when it has
+        # no peer of its own to borrow a solution/skill from (see
+        # sole_correct_no_peer_idxs above) -- otherwise that trace would get ZERO
+        # teacher signal despite having answered correctly. Every OTHER correct trace
+        # keeps a clean correct-peer prefix with no pitfalls mixed in.
         for i, sample in enumerate(group):
             if i not in prefix_text_by_idx:
                 continue
             self_ok = bool(correctness[i]) if i < len(correctness) else False
-            pitfalls_for_i = group_pitfalls if (pitfall_active and not self_ok) else ""
+            pitfalls_for_i = (
+                group_pitfalls if (pitfall_active and (not self_ok or i in sole_correct_no_peer_idxs)) else ""
+            )
             student_prompt = sample.prompt if isinstance(sample.prompt, str) else ""
             teacher_prompt_str = _build_teacher_prompt_str(
                 student_prompt, gen_suffix, prefix_text_by_idx[i], remove_thinking=remove_thinking,
@@ -1989,6 +2048,78 @@ async def plain_grpo_reward(args: Namespace, sample: Sample, **kwargs: Any) -> f
     return 1.0 if _is_correct(sample, args) else 0.0
 
 
+# --------------------------------------------------------------------------- #
+# EVAL-time skill augmentation (--sdpo-eval-skill-mode, wired via
+# --custom-generate-function-path examples.SDPO.sdpo.sdpo_eval_generate):
+# before the real eval rollout, self-predict a blind skill from the problem
+# alone (the SAME self-predict prompts training uses for blind-correct/
+# pitfall-condense skill-gen) and splice it into the eval prompt's user turn,
+# so eval measures the model answering WITH its own self-predicted skill
+# already in context. The mode is set MANUALLY (not auto-derived from
+# --sdpo-skill-kd-mode) so it matches whichever skill type(s) a given training
+# run actually trained -- e.g. skill-kd-mode 'both'/'both-blind' (skill-source
+# all) trains BOTH correct- and pitfall-type skills -> eval-skill-mode 'all';
+# skill-kd-mode 'self-success'/'blind-correct' (skill-source correct) only
+# trains the correct-type skill -> eval-skill-mode 'correct'; a run whose
+# skill-source is 'incorrect' only trains the pitfall-type skill ->
+# eval-skill-mode 'pitfall'.
+# --------------------------------------------------------------------------- #
+
+EVAL_SKILL_CORRECT_TEMPLATE = "\n\nPredicted knowledge/rules for this problem:\n\n{skill}"
+EVAL_SKILL_PITFALL_TEMPLATE = "\n\nPredicted pitfalls to avoid for this problem:\n\n{skill}"
+EVAL_SKILL_INSTRUCTION = "\n\nNow solve the original problem above.\n\n"
+
+
+async def sdpo_eval_generate(input: Any) -> Any:
+    """--custom-generate-function-path for eval-time skill augmentation (see
+    --sdpo-eval-skill-mode). No-op during TRAINING (evaluation=False) or when
+    the mode is 'off' -- falls straight through to the stock generate(). During
+    EVAL, self-predicts the configured skill type(s) from the problem alone
+    (blind: no solution, no attempt) and splices them into the user turn
+    before the assistant marker, then runs the real eval rollout on the
+    skill-augmented prompt."""
+    from miles.rollout.base_types import GenerateFnOutput
+    from miles.rollout.sglang_rollout import generate
+
+    args = input.args
+    sample = input.sample
+    mode = getattr(args, "sdpo_eval_skill_mode", "off")
+
+    if not input.evaluation or mode == "off" or not isinstance(sample.prompt, str):
+        sample = await generate(args, sample, input.sampling_params, evaluation=input.evaluation)
+        return GenerateFnOutput(samples=sample)
+
+    try:
+        sections = []
+        if mode in ("correct", "all"):
+            skill = await _generate_skill_text(
+                args, _BLIND_PREDICT_SYSTEM, _blind_predict_user_prompt(sample.prompt), "self"
+            )
+            if skill.strip():
+                sections.append(EVAL_SKILL_CORRECT_TEMPLATE.format(skill=skill.strip()))
+        if mode in ("pitfall", "all"):
+            skill = await _generate_skill_text(
+                args, _PITFALL_PREDICT_SYSTEM, _pitfall_predict_user_prompt(sample.prompt), "self"
+            )
+            if skill.strip():
+                sections.append(EVAL_SKILL_PITFALL_TEMPLATE.format(skill=skill.strip()))
+
+        if sections:
+            tok = _tokenizer(args)
+            gen_suffix = _gen_prompt_suffix(tok, getattr(args, "apply_chat_template_kwargs", None))
+            section = "".join(sections) + EVAL_SKILL_INSTRUCTION
+            if gen_suffix and gen_suffix in sample.prompt:
+                idx = sample.prompt.rfind(gen_suffix)
+                sample.prompt = sample.prompt[:idx] + section + sample.prompt[idx:]
+            else:
+                sample.prompt = sample.prompt + section
+    except Exception as e:
+        logger.warning(f"eval skill augmentation failed ({e!r}); evaluating on the unaugmented prompt.")
+
+    sample = await generate(args, sample, input.sampling_params, evaluation=input.evaluation)
+    return GenerateFnOutput(samples=sample)
+
+
 async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> float:
     """Per-sample eval RM for SDPO (--eval-custom-rm-path).
 
@@ -2002,8 +2133,12 @@ async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> fl
         async with _judge_semaphore(args):
             ok = await _grade_one_code(sample, args)
     elif _sample_domain(sample) == "search":
-        # Search/QA eval: EM against golden answers (same as training).
-        ok = _grade_one_search(sample, args)
+        # Search/QA eval: EM against golden answers, with the same optional
+        # LLM-judge second opinion on an EM miss as training (reward.py's
+        # _grade_one_search) -- bound by the shared concurrency cap whenever
+        # that fallback might actually reach the judge gateway.
+        async with _judge_semaphore(args):
+            ok = await _grade_one_search(sample, args)
     elif getattr(args, "sdpo_judge", False) and (sample.response or "").strip():
         # Eval fans out one sdpo_eval_reward coroutine per sample via asyncio.gather
         # upstream, so honor the SAME global concurrency cap to avoid flooding the
