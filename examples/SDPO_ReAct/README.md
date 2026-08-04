@@ -79,8 +79,15 @@ examples/SDPO_ReAct/
 │   ├── build_aime24_eval.py / build_native_eval.py # writes {prompt,label} eval jsonl (legacy / native)
 │   ├── build_code_data.py / build_search_data.py   # LiveCodeBench / HotpotQA+2Wiki row builders (multitask)
 │   ├── build_multitask_data.py                     # interleave+shuffle per-domain sources into one train.jsonl
+│   ├── passk_filter_search.py                      # base-model pass@k learnability filter (search domain)
 │   └── eval_aime24.yaml / eval_native_math.yaml /
 │       eval_code.yaml / eval_multitask.yaml         # --eval-config per launcher/domain
+├── docs/
+│   └── prepare_doc.md                              # design/discussion notes (not a standalone README)
+├── debug/                                          # manual one-off tools, never called from the run scripts
+│   ├── rerender_search_rows.py                     # rewrite already-filtered search rows to the current prompt/tool design
+│   ├── test_message_template.py                    # standalone chat-template render/round-trip check
+│   └── _debug_rollout.py                           # standalone multi-turn rollout probe against a live sglang server
 ├── run-qwen2.5-7B-sdpo-react-dapo-math.sh      # BASE launcher: DAPO train (5 turns) + AIME24 eval (20 turns),
 │                                                 legacy plain-text tags, code_interpreter ONLY
 ├── run-qwen3-4B-sdpo-react-native.sh           # NATIVE/multitask launcher: native <tool_call>, math|code|
