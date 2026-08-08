@@ -21,6 +21,17 @@
 # A100-80G retune + path parameterization: see the mathcodesearch sibling
 # script's header for the full rationale.
 #
+# --log-probs-chunk-size 4096 (added after a real OOM, 2026-08-08, on an
+# 8xH200 node): tau2 conversations run far longer than the other two ablation
+# domains (observed response_len/max up to 130592 tokens on airline/telecom,
+# vs low thousands for mathcodesearch/alfworld-webshop) -- unchunked log-prob
+# computation allocates a [longest_seqlen, vocab] cross-entropy buffer in one
+# shot (46.23 GiB for a 99946x124160 fp32 buffer, confirmed live), which OOMs
+# regardless of --max-tokens-per-gpu (that caps the TOTAL batch token budget,
+# not any single sequence's logits buffer). Same fix the MoE 35B-A3B script
+# already carries; ported here since the OOM is response-length-driven, not
+# model-size-driven.
+#
 # usage:
 #   SDPO_ABLATION_ALGO=grpo SDPO_ABLATION_ARM=a \
 #     bash examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-tau2.sh
@@ -311,6 +322,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+   --log-probs-chunk-size "${SDPO_REACT_LOGPROBS_CHUNK:-4096}"
    # TP=2 (see module docstring's A100-80G retune section) needs sequence-
    # parallel to shard the activations/LayerNorm too.
    --sequence-parallel

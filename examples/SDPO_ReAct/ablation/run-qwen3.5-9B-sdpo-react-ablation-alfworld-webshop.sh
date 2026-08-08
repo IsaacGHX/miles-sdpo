@@ -356,6 +356,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+   --log-probs-chunk-size "${SDPO_REACT_LOGPROBS_CHUNK:-4096}"
    # TP=2 (see module docstring's A100-80G retune section) needs sequence-
    # parallel to shard the activations/LayerNorm too.
    --sequence-parallel

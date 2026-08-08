@@ -356,6 +356,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+   --log-probs-chunk-size "${SDPO_REACT_LOGPROBS_CHUNK:-4096}"
 )
 
 OPTIMIZER_ARGS=(
