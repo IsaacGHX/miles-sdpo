@@ -77,6 +77,13 @@ async def generate_rollout_async(
     args = state.args
     assert args.rollout_global_dataset
 
+    # Expose the current train step to generate functions via the shared state
+    # (mirrors the legacy sglang_rollout.py path). multi_turn.generate copies
+    # this onto sample.metadata["rollout_id"] so per-step dumps (e.g. SDPO_ReAct's
+    # agentic_traces/{rollout_id}.jsonl) split by training step instead of piling
+    # every step into one huge unknown.jsonl.
+    state.rollout_id = rollout_id
+
     await dumper_utils.configure_sglang(args)
 
     # instantiate data filters

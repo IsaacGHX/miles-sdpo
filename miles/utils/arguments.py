@@ -775,6 +775,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "When need to add tools during apply_chat_template, you should provide the key for the tools in the prompt dataset."
                 ),
             )
+            parser.add_argument(
+                "--tool-specs-resolver-path",
+                type=str,
+                default=None,
+                help=(
+                    "Zero-arg callable path (e.g. 'module.submodule.fn') returning the "
+                    "CURRENT list of tool specs. When set, takes precedence over --tool-key: "
+                    "every Dataset construction re-derives tools from this live resolver "
+                    "instead of a value baked into the prompt data at build time, so a "
+                    "renamed/removed tool in the resolver's source module never leaves a "
+                    "stale <tools> block in previously-built jsonl files."
+                ),
+            )
 
             parser.add_argument(
                 "--start-rollout-id",

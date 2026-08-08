@@ -57,6 +57,7 @@ async def eval_rollout_single_dataset(
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=args.apply_chat_template,
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+            tool_specs_resolver=load_function(args.tool_specs_resolver_path),
         )
     dataset = prompt_dataset_cache[cache_key]
 
