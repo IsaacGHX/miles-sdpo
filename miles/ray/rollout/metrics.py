@@ -29,7 +29,14 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
     all_rewards: list[float] = []  # pooled across all eval datasets for eval/all
     per_dataset_acc: list[float] = []  # per-dataset acc for the equal-weight eval/mean
     for key in data.keys():
-        rewards = data[key]["rewards"]
+        # A sample can reach eval aggregation with reward=None (e.g. an agentic
+        # episode that timed out / never recorded a model call, so no RM ever
+        # ran on it -- see miles.rollout.generate_hub.agentic_tool_call.generate's
+        # ABORTED path). Treat that the same as a failed episode (0.0) rather
+        # than crashing the whole eval on `sum(rewards)` -- one slow tau2/
+        # webshop/alfworld episode under real infra load must not take down
+        # every OTHER dataset's score in the same eval pass.
+        rewards = [r if r is not None else 0.0 for r in data[key]["rewards"]]
         all_rewards.extend(rewards)
         dataset_acc = sum(rewards) / len(rewards)
         per_dataset_acc.append(dataset_acc)
