@@ -449,15 +449,56 @@ async def _grade_one_search(sample: Sample, args: Namespace | None = None) -> bo
         return False
 
 
+def _grade_one_webshop(sample: Sample, args: Namespace | None = None) -> bool:
+    """Grade a webshop episode: correct iff the episode reached a terminal
+    step with won=True. UNLIKE code/search, there is no text to parse or
+    judge -- the WebShop sidecar itself is the ground truth, stamped onto
+    metadata['episode_won'] by tools/webshop/client.py the moment a terminal
+    step() response comes back (see that module's docstring). A trajectory
+    truncated by --generate-max-turns before any terminal step simply never
+    gets this key -- .get(..., False) correctly grades it a loss, same as
+    _grade_one_search treats a missing <answer> tag as an unambiguous miss.
+    Plain sync (no judge/gateway call, no semaphore needed)."""
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    return bool(md.get("episode_won", False))
+
+
+def _grade_one_alfworld(sample: Sample, args: Namespace | None = None) -> bool:
+    """Grade an alfworld episode: correct iff the episode reached a terminal
+    step with won=True. Same ground-truth-from-the-sidecar shape as
+    _grade_one_webshop -- see that function's docstring."""
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    return bool(md.get("episode_won", False))
+
+
+def _grade_one_tau2(sample: Sample, args: Namespace | None = None) -> bool:
+    """Grade a tau2 (tau2-bench) episode: correct iff the tau2 sidecar's
+    evaluate_simulation() call graded it a full 1.0. tau2's own reward is
+    technically a CONTINUOUS score in [0,1] (db-hash equality is 0/1 for
+    retail/airline, but telecom's reward_breakdown can land on partial
+    credit) -- stamped onto metadata['reward'] by tools/tau2/
+    agent_function.py, forwarded verbatim from the sidecar's response. Same
+    "binarize for both correctness AND the RL reward" convention as
+    _grade_one_webshop already uses (that sidecar's own task_score is ALSO
+    continuous, but episode_won -- the strict win flag -- is what both the
+    correct-peer-prefix selection AND sdpo_react_plain_grpo_reward's returned
+    reward key off, not the raw score); tau2 keeps the same all-or-nothing
+    training signal rather than introducing a second, inconsistent reward
+    shape for one domain."""
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    return float(md.get("reward", 0.0)) >= 1.0
+
+
 async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
     """Correctness for every trace in a group. Domain-aware: code samples
     (metadata['domain']=='code') run their program against test cases; search
-    samples (=='search') EM-match golden answers; the rest use the LLM judge
-    (if --sdpo-judge) or deterministic matching. A mixed math+code+search group
-    grades each sample by its OWN domain, so one multi-domain run trains all
-    domains with consistent correctness."""
+    samples (=='search') EM-match golden answers; webshop/alfworld/tau2
+    samples read their sidecar-stamped reward/episode_won signal; the rest
+    use the LLM judge (if --sdpo-judge) or deterministic matching. A mixed
+    math+code+search group grades each sample by its OWN domain, so one
+    multi-domain run trains all domains with consistent correctness."""
     domains = {_sample_domain(s) for s in group}
-    special = domains & {"code", "search"}
+    special = domains & {"code", "search", "webshop", "alfworld", "tau2"}
     # Fast path: pure math/mcq group + no judge -> the original sync path.
     if not special and not getattr(args, "sdpo_judge", False):
         return [_is_correct(s, args) for s in group]
@@ -478,6 +519,12 @@ async def _grade_group(args: Namespace, group: list[Sample]) -> list[bool]:
                     return await _grade_one_search(s, args)
                 async with sem:
                     return await _grade_one_search(s, args)
+            if dom == "webshop":
+                return _grade_one_webshop(s, args)
+            if dom == "alfworld":
+                return _grade_one_alfworld(s, args)
+            if dom == "tau2":
+                return _grade_one_tau2(s, args)
             if getattr(args, "sdpo_judge", False) and (s.response or "").strip():
                 async with sem:
                     return await _llm_judge_correct(args, s)

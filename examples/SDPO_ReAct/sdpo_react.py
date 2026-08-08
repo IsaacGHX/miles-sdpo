@@ -35,6 +35,15 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Any
 
+from examples.SDPO.reward import (
+    _grade_one_alfworld,
+    _grade_one_code,
+    _grade_one_search,
+    _grade_one_tau2,
+    _grade_one_webshop,
+    _is_correct,
+    _sample_domain,
+)
 from examples.SDPO.sdpo import sdpo_eval_reward as _sdpo_eval_reward
 from examples.SDPO.sdpo import sdpo_group_reward as _sdpo_group_reward
 from miles.utils.types import Sample
@@ -52,55 +61,101 @@ _TOOL_ERROR_PREFIXES = ("error:", "[timeout]")
 
 
 def _extract_tool_trace(sample: Sample) -> list[dict[str, str]]:
-    """(code, output) pairs, straight from generate_with_tools.generate's own
-    turn-by-turn bookkeeping (sample.metadata["turns"]) -- NOT re-derived by
-    regex-matching <code>/<output> tags out of the final decoded response
-    text. Regex reconstruction is unsound here: the "invalid tag" retry nudge
-    (see generate_with_tools.py::execute_predictions) is plain English that
-    itself CONTAINS the literal substrings <code>/</code>/<answer>/</answer>
-    as instructional prose, so a naive re.findall over the full text matches
-    inside the nudge too, corrupting the reconstruction (observed live:
-    role=tool entries with content="and" from splitting the nudge sentence
-    mid-word). The generation loop already knows, unambiguously, which turns
-    were real tool calls -- use that."""
-    turns = sample.metadata.get("turns") if isinstance(sample.metadata, dict) else None
+    """(tool_call, observation) pairs for this trajectory. Two rollout paths
+    feed this wrapper, so we normalize BOTH to the {"tool_call", "observation"}
+    schema examples/SDPO/sdpo.py::_render_env_feedback consumes:
+
+    - NATIVE tool-calling (miles.rollout.generate_hub.multi_turn.generate, used
+      by the Qwen3 launcher): that loop already records the ground-truth
+      call/observation pairs live in sample.metadata["tool_trace"] (see the
+      tool_trace bookkeeping added there). Prefer it verbatim.
+    - LEGACY plain-text tags (generate_with_tools.generate, used by the
+      Qwen2.5 launcher): reconstruct from sample.metadata["turns"] (the loop's
+      own {role, action, content} record) -- NOT by regex-matching <code>/
+      <output> tags out of the decoded text, which is unsound (the "invalid
+      tag" nudge is English prose that itself CONTAINS those tag substrings, so
+      re.findall matches inside it; observed live as role=tool content="and").
+
+    Both keys are always present in the returned dicts, so _count_tool_errors /
+    _render_env_feedback / the trace dump never need to know which path ran."""
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    native = md.get("tool_trace")
+    if native:
+        # multi_turn.generate already emits the canonical schema.
+        return [
+            {"tool_call": t.get("tool_call", ""), "observation": t.get("observation", "")}
+            for t in native
+            if isinstance(t, dict)
+        ]
+    turns = md.get("turns")
     if not turns:
         return []
     pairs = []
     for i, turn in enumerate(turns):
         if turn.get("role") == "assistant" and turn.get("action") == "code":
             output = turns[i + 1]["content"] if i + 1 < len(turns) and turns[i + 1].get("role") == "tool" else ""
-            pairs.append({"code": turn.get("content", ""), "output": output})
+            pairs.append({"tool_call": turn.get("content", ""), "observation": output})
     return pairs
 
 
 def _count_tool_errors(tool_trace: list[dict[str, str]]) -> int:
-    return sum(1 for t in tool_trace if t["output"].strip().lower().startswith(_TOOL_ERROR_PREFIXES))
+    return sum(1 for t in tool_trace if t["observation"].strip().lower().startswith(_TOOL_ERROR_PREFIXES))
+
+
+def _prompt_to_messages(prompt: str) -> list[dict[str, Any]]:
+    """Split the chat-templated prompt string (the rollout's baked-in
+    system+user turns, e.g. "<|im_start|>system\\n...<|im_end|><|im_start|>user
+    \\n...<|im_end|>") back into clean {role, content} messages. The <tools>
+    block lives inside the system turn (native tool injection) and is kept there
+    verbatim. Falls back to a single user message if no ChatML markers."""
+    if not isinstance(prompt, str) or "<|im_start|>" not in prompt:
+        return [{"role": "user", "content": prompt or ""}]
+    import re
+    msgs: list[dict[str, Any]] = []
+    for m in re.finditer(r"<\|im_start\|>(\w+)\s*\n(.*?)(?:<\|im_end\|>|$)", prompt, re.DOTALL):
+        role, content = m.group(1), m.group(2).strip()
+        # Drop the trailing assistant GENERATION PROMPT (no closing <|im_end|>):
+        # it's the empty scaffold the model continues from (e.g. "" or an empty
+        # "<think>\n\n</think>" in no-thinking mode), not a real turn -- the live
+        # messages carry the actual assistant content.
+        if role == "assistant" and re.sub(r"</?think>", "", content).strip() == "":
+            continue
+        msgs.append({"role": role, "content": content})
+    return msgs or [{"role": "user", "content": prompt}]
 
 
 def _reconstruct_messages(sample: Sample) -> list[dict[str, Any]]:
-    """Message-dict trace for post-hoc inspection, built directly from
-    sample.metadata["turns"] (the generation loop's own live record of what
-    was model output vs. tool output) rather than re-parsed from text -- see
-    _extract_tool_trace's docstring for why regex reconstruction is unsound
-    here."""
-    problem = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
-    messages: list[dict[str, Any]] = [{"role": "user", "content": problem}]
+    """OpenAI-standard message-dict trace for post-hoc inspection: the baked-in
+    prompt split into system+user turns, then the LIVE conversation the
+    generation loop recorded (assistant turns with a structured `tool_calls`
+    field, tool turns with `tool_call_id`) -- the same schema as standard
+    tool-calling trajectory logs (e.g. i-DeepSearch observation-masking), so it
+    can be re-sent through any chat template / OpenAI client without re-parsing.
 
-    turns = sample.metadata.get("turns") if isinstance(sample.metadata, dict) else None
-    if not turns:
-        # No metadata (e.g. truncated/aborted before the loop recorded
-        # anything) -- fall back to the raw decoded response as a single turn.
-        messages.append({"role": "assistant", "content": sample.response or ""})
-        return messages
+    Correct by construction from metadata["messages"] (native multi_turn.generate)
+    or metadata["turns"] (legacy generate_with_tools); falls back to the raw
+    response as one assistant turn only when no live record exists (e.g.
+    truncated before the loop recorded anything)."""
+    prompt = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    head = _prompt_to_messages(prompt)
 
-    for turn in turns:
-        if turn.get("role") == "tool":
-            messages.append({"role": "tool", "content": turn.get("content", "")})
-        else:
-            messages.append({"role": "assistant", "content": turn.get("content", "")})
+    # Native path: multi_turn.generate stores the running conversation directly
+    # (already OpenAI-standard: assistant.tool_calls + tool.tool_call_id).
+    live = md.get("messages")
+    if live:
+        return [*head, *live]
 
-    return messages
+    # Legacy path: generate_with_tools records {role, content} turns.
+    turns = md.get("turns")
+    if turns:
+        msgs = list(head)
+        for turn in turns:
+            role = "tool" if turn.get("role") == "tool" else "assistant"
+            msgs.append({"role": role, "content": turn.get("content", "")})
+        return msgs
+
+    return [*head, {"role": "assistant", "content": sample.response or ""}]
 
 
 def _dump_agentic_traces(args: Namespace, group: list[Sample]) -> None:
@@ -137,24 +192,68 @@ def _dump_agentic_traces(args: Namespace, group: list[Sample]) -> None:
             if isinstance(sample.metadata, dict) and sample.metadata.get("rollout_id") is not None:
                 rollout_id = sample.metadata["rollout_id"]
                 break
-        records = []
-        for sample in group:
-            md = sample.metadata if isinstance(sample.metadata, dict) else {}
-            records.append(
-                {
-                    "messages": _reconstruct_messages(sample),
-                    "label": sample.label,
-                    "tool_call_count": md.get("tool_call_count"),
-                    "tool_error_count": md.get("tool_error_count"),
-                    "sdpo_correct": md.get("sdpo_correct"),
-                    "status": sample.status.value if sample.status is not None else None,
-                }
-            )
-        path = Path(dump_dir) / "agentic_traces" / f"{rollout_id if rollout_id is not None else 'unknown'}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        records = [_sample_to_agentic_trace_record(sample) for sample in group]
+        _append_agentic_trace_records(dump_dir, rollout_id, records)
+    except Exception as e:  # dumping must never break rollout
+        logger.warning(f"SDPO_ReAct agentic trace dump failed (non-fatal): {e!r}")
+
+
+def _sample_to_agentic_trace_record(sample: Sample) -> dict[str, Any]:
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    # tau2 samples come from agentic_tool_call.generate (an external
+    # Orchestrator drives the whole conversation, see tools/tau2/docker/
+    # server.py's module docstring), not multi_turn.generate -- there is no
+    # sample.prompt/metadata["messages"] to reconstruct FROM the way
+    # _reconstruct_messages expects; the tau2 sidecar's own message list
+    # (agent_function.py's metadata["tau2_messages"], already {role,
+    # content, tool_calls}-shaped) is the correct-by-construction record.
+    messages = md.get("tau2_messages") if md.get("domain") == "tau2" else None
+    if messages is None:
+        messages = _reconstruct_messages(sample)
+    return {
+        "messages": messages,
+        "label": sample.label,
+        "tool_call_count": md.get("tool_call_count"),
+        "tool_error_count": md.get("tool_error_count"),
+        "sdpo_correct": md.get("sdpo_correct"),
+        "status": sample.status.value if sample.status is not None else None,
+        # domain/episode_won/task_type/game_file: let examples/agentic/'s
+        # dashboard tell webshop from alfworld episodes and break down success
+        # by task type without re-deriving anything from `messages`.
+        "domain": md.get("domain"),
+        "episode_won": md.get("episode_won"),
+        "task_type": md.get("task_type"),
+        "alfworld_game_file": md.get("alfworld_game_file"),
+        "webshop_task_id": md.get("webshop_task_id"),
+        "tau2_domain": md.get("tau2_domain"),
+        "tau2_termination_reason": md.get("tau2_termination_reason"),
+        "reward": md.get("reward"),
+    }
+
+
+def _append_agentic_trace_records(dump_dir: str, rollout_id: Any, records: list[dict[str, Any]]) -> None:
+    path = Path(dump_dir) / "agentic_traces" / f"{rollout_id if rollout_id is not None else 'unknown'}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def _dump_agentic_trace_one(args: Namespace, sample: Sample) -> None:
+    """Single-sample counterpart to ``_dump_agentic_traces``, for reward
+    paths that never see the full group (e.g. arm 1's plain-GRPO baseline,
+    --custom-rm-path without --group-rm -- see sdpo_react_plain_grpo_reward).
+    Appends ONE record to the same --dump-details/agentic_traces/
+    {rollout_id}.jsonl file the group path writes, so arm-1 baseline runs are
+    inspectable in the same dashboard/tooling as every other arm (previously
+    a real gap: arm 1 produced NO agentic_traces dump at all)."""
+    dump_dir = getattr(args, "dump_details", None)
+    if dump_dir is None:
+        return
+    try:
+        md = sample.metadata if isinstance(sample.metadata, dict) else {}
+        rollout_id = md.get("rollout_id")
+        _append_agentic_trace_records(dump_dir, rollout_id, [_sample_to_agentic_trace_record(sample)])
     except Exception as e:  # dumping must never break rollout
         logger.warning(f"SDPO_ReAct agentic trace dump failed (non-fatal): {e!r}")
 
@@ -163,10 +262,18 @@ async def sdpo_react_group_reward(args: Namespace, group: list[Sample], **kwargs
     for sample in group:
         if not isinstance(sample.metadata, dict):
             continue
-        # generate_with_tools.generate already stamps round_number /
-        # tool_call_count directly from the tag matches (source of truth);
-        # this only adds tool_error_count, which needs the paired output text.
-        sample.metadata["tool_error_count"] = _count_tool_errors(_extract_tool_trace(sample))
+        # Normalize the trajectory's tool calls to the canonical
+        # {"tool_call", "observation"} schema and stamp it back on metadata so
+        # examples/SDPO/sdpo.py's env_feedback skill path (_has_env_feedback /
+        # _render_env_feedback) works uniformly regardless of which rollout
+        # path produced the trace: multi_turn.generate already writes this
+        # schema (so this is idempotent there), while the legacy plain-text
+        # generate_with_tools.generate only records metadata["turns"] (so this
+        # is the ONE place it gets converted). tool_error_count needs the
+        # paired observation text, computed from the same normalized trace.
+        tool_trace = _extract_tool_trace(sample)
+        sample.metadata["tool_trace"] = tool_trace
+        sample.metadata["tool_error_count"] = _count_tool_errors(tool_trace)
 
     rewards = await _sdpo_group_reward(args, group, **kwargs)
     # sdpo_correct is stamped by _sdpo_group_reward above; dump AFTER it runs
@@ -180,3 +287,37 @@ async def sdpo_react_eval_reward(args: Namespace, sample: Sample, **kwargs: Any)
     SDPO's (pass@1 never touches the prefix/distillation machinery), so we
     delegate directly -- same pattern as examples/EPO/epo.py::epo_eval_reward."""
     return await _sdpo_eval_reward(args, sample, **kwargs)
+
+
+async def sdpo_react_plain_grpo_reward(args: Namespace, sample: Sample, **kwargs: Any) -> float:
+    """Single-sample reward for the plain-GRPO baseline arm (--custom-rm-path,
+    NO --group-rm): the "no SDPO at all" control. examples/SDPO/sdpo.py's own
+    plain_grpo_reward always uses the math/dapo grader (_is_correct) -- wrong
+    for a multitask (math+code+search) rollout, where code/search samples need
+    their own graders (test-case execution / EM-against-golden-answers). This
+    domain-routes per sample the same way _grade_group does for the KD arms,
+    so arm 1's task-reward criterion is the SAME grader every other arm's
+    sdpo_react_group_reward uses -- the ablation isolates the SDPO/skill
+    machinery, not a grading-rule difference."""
+    if not isinstance(sample.metadata, dict):
+        return 1.0 if _is_correct(sample, args) else 0.0
+    sample.metadata["tool_trace"] = _extract_tool_trace(sample)
+    domain = _sample_domain(sample)
+    if domain == "code":
+        ok = await _grade_one_code(sample, args)
+    elif domain == "search":
+        ok = await _grade_one_search(sample, args)
+    elif domain == "webshop":
+        ok = _grade_one_webshop(sample, args)
+    elif domain == "alfworld":
+        ok = _grade_one_alfworld(sample, args)
+    elif domain == "tau2":
+        ok = _grade_one_tau2(sample, args)
+    else:
+        ok = _is_correct(sample, args)
+    # Stamp so the trace dump below (and any other consumer expecting the
+    # same key the group-reward path sets, see sdpo.py:1408) reflects the
+    # grading result, even though arm 1 has no SDPO group machinery at all.
+    sample.metadata["sdpo_correct"] = 1.0 if ok else 0.0
+    _dump_agentic_trace_one(args, sample)
+    return 1.0 if ok else 0.0
