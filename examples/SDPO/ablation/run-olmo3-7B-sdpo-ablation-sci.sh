@@ -70,6 +70,25 @@
 # available in this session, confirmed via nvidia-smi showing H200s only) --
 # retune further on the first real OOM.
 #
+# Real single-case verification (2026-08-08, on an 8xH200 node -- no A100
+# available): GRPO+arm e ran end-to-end for 8 train steps with no crash --
+# sdpo_skill_kd_loss/skill_kl_correct/skill_kl_pitfall all nonzero and
+# stable, confirming self-success + pitfall-condense both actually fire
+# under plain GRPO (--sdpo-logprob-mode sampled without --sdpo-rlsd). Peak
+# VRAM observed: ~94.5GB/143.7GB per GPU (steady across 8 steps, not still
+# climbing). This is NOT a direct 80G-overflow signal: --sglang-mem-
+# fraction-static is a FRACTION of total card VRAM (0.6 -> ~83GB reserved
+# for SGLang on this H200, but only ~48GB on an 80G card), so the rollout-
+# engine share of that 94.5GB shrinks automatically on a smaller card. What
+# does NOT shrink automatically is the Megatron actor's own footprint
+# (weights + optimizer state + activations, sized by --max-tokens-per-gpu /
+# parallelism, not by total card size) -- this run did not isolate that
+# actor-only number from the combined peak, so whether MAX_TOKENS_PER_GPU=4096
+# for arms e/f still fits an 80G card's post-mem-fraction remainder is NOT
+# yet confirmed. Left as-is pending a real A100 run; the actor-only VRAM
+# breakdown is the next thing to measure before trusting arm e/f's 4096
+# default on an actual 80G card.
+#
 # Path parameterization (every local save/load path overridable from
 # outside, declared here at the top instead of hardcoded deep in the body):
 #   SDPO_ABLATION_DATA_ROOT      (default /root)   sci data dir
