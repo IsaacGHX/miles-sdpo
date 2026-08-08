@@ -1,0 +1,39 @@
+You are given one or more worked solutions that were graded CORRECT. Extract only the smallest set of valid, reusable reasoning skills that would help solve different problems of the same type. Produce 1–3 self-contained blocks, and omit any block whose content is merely a problem-specific computation, conclusion, notation choice, or unverified claim.
+
+Output EXACTLY this format and nothing else:
+
+[Knowledge/Rule]
+<A precise, transferable theorem, identity, algorithm, invariant, interpretation rule, or proof/verification procedure. State the hypotheses, quantifiers, and boundary conditions that make it valid. Do not mention the supplied problem, its objects, or its target.>
+[Details/Examples]
+<A short independent example in a different domain or with different symbols and values. Show how the rule is applied and include the decisive check, limitation, or failure mode. The example must not be isomorphic numerical reconstruction of the supplied problem.>
+
+Hard constraints:
+- Use the literal headers [Knowledge/Rule] and [Details/Examples] for every block.
+- Output only the blocks: no introduction, conclusion, commentary, solution, answer, or confidence statement.
+- Extract only principles directly supported by the correct solutions. Do not infer a missing theorem from the ground-truth answer or from an unexplained successful result.
+- Prefer at most two or three high-value, nonredundant blocks. A block must tell a future solver what to compute, compare, enumerate, bound, construct, or verify—not merely say to “use” a topic.
+- Abstract away all source-specific names, symbols, constants, diagrams, equations, answer formats, and distinctive intermediate values. Rewrite the principle in fresh notation.
+- Never state, imply, encode, or make readily recoverable the supplied problem’s final answer, requested count, constant, parameter, choice, or uniquely determining intermediate result. Do not repeat a source equation if it identifies the instance.
+- Do not give a roadmap for the supplied problem. State a reusable local method or theorem instead.
+- Preserve the exact logical status of claims: distinguish necessary from sufficient conditions, fixed objects from arbitrary objects, existence from uniqueness, and a construction from a universal bound.
+- Include relevant domain, sign, parity, integrality, endpoint, multiplicity, convergence, strict-versus-nonstrict, and degeneracy conditions. If a tempting shortcut is valid only under an assumption, state that assumption.
+- For an extremal or optimization result, include both the universal inequality and the sharpness/witness argument when the source supports both. Do not call a bound optimal without a matching construction or equality argument.
+- For counting or probability, specify the sample space, weights, order, repetition, independence, fixed initial conditions, and whether the choices are random or deterministic.
+- For algebra, series, and asymptotics, retain every term capable of affecting the requested order and justify all truncation, interchange, cancellation, or convergence steps.
+- For geometry, state the configuration hypotheses and verify that any symmetry, angle relation, tangency, intersection, or volume argument follows from them rather than from a diagram.
+- For algorithms involving a finite search, state why the search is exhaustive and how a candidate is verified; do not merely recommend checking examples.
+- If the supplied statement or solution is incomplete, extract only a general method for identifying the missing condition or proving insufficiency. Do not guess an intended statement and do not solve the malformed instance.
+- The independent example must use fresh symbols, values, and context, must demonstrate the rule rather than announce a result, and must not contain any answer-equivalent data from the supplied problem.
+- Avoid vague advice such as “be careful,” “use algebra,” or “check the cases” unless the block specifies exactly what is checked and why it is decisive.
+
+Good:
+[Knowledge/Rule]
+For a finite collection of divisibility requirements, replace them by divisibility by their least common multiple, then separately test all restrictions not encoded by divisibility.
+[Details/Examples]
+A number divisible by \(8\) and \(12\) must be divisible by \(\operatorname{lcm}(8,12)=24\); if it must also have a specified last digit, that digit condition remains a separate check.
+
+Bad:
+[Knowledge/Rule]
+Use the special factorization from the solution and substitute the given values.
+[Details/Examples]
+This produces the requested answer.

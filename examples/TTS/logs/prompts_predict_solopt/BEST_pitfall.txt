@@ -1,0 +1,44 @@
+You are given ONLY an unsolved problem statement. You have not seen a solution, attempted solution, ground-truth answer, or any separately generated knowledge block. Predict the smallest set of concrete mistakes that a competent solver is especially likely to make because of this statement’s wording or structure.
+
+Output 1-2 blocks in exactly this format:
+
+[Error]
+<a specific plausible invalid operation, interpretation, stopping condition, or inference>
+[Rule]
+<a precise prevention or verification rule>
+[Example]
+<a tiny independent example that explicitly demonstrates the distinction>
+
+Selection procedure:
+1. Extract the statement’s domains, quantifiers, conventions, equality cases, and requested stopping point.
+2. Consider the most natural solution route visible from the statement and identify a fatal check it could omit.
+3. Include only errors with direct textual or structural support. Use one block unless a second, genuinely different trap is comparably important.
+
+Priority risks:
+- Confusing necessary and sufficient conditions or proving only one direction.
+- Treating a candidate as an optimum, a bound as attainable, or several checked cases as a complete enumeration.
+- Misreading “distinct,” “nonzero,” “exactly one,” multiplicity, order, adjacency, disjointness, endpoints, strict inequalities, or the time/index of an event.
+- Losing domain restrictions, integrality, signs, parity, divisibility, zero-denominator cases, or admissibility after substitution.
+- Double-counting or failing to account for symmetry, repeated objects, fixed starting objects, or indistinguishable outcomes.
+- Using a familiar theorem with the wrong scaling, normalization, indexing convention, or hypotheses.
+- Trusting a recurrence or probability update without checking the one-step case and total probability.
+- Inferring an omitted hypothesis from the expected form of the answer, a diagram, or apparent contest intent.
+- Confusing finite Taylor-jet calculations with analyticity, convergence, or equality of smooth functions.
+- Mishandling equality cases when the premise uses \(\ge\), \(\le\), or asks for a least constant.
+
+Reliability gate:
+- Phrase the item as a possible error, never as an error known to occur.
+- The correction must be independently valid from the problem statement; do not speculate about the intended solution or unknown answer.
+- Do not invent a numerical slip, hidden convention, exceptional configuration, or specialized counterexample merely to fill a block.
+- Before outputting, verify that the example actually exhibits the erroneous inference and that the rule fixes it. Show the decisive calculation or logical contrast explicitly.
+- If wording is ambiguous or malformed, do not silently resolve it. Warn against choosing a reading without justification and state the relevant conditional distinction.
+- Do not duplicate a general solution method in negative wording. Focus on a verification checkpoint that prevents a plausible approach from producing a false conclusion.
+- Keep the warning proportional to the problem: elementary problems need short, direct checks rather than elaborate theoretical cautions.
+- Match the language of the problem when practical.
+
+Hard constraints:
+- Use the literal [Error], [Rule], and [Example] headers for every block.
+- Every error must be operationally specific; exclude vague warnings such as “be careful,” “check arithmetic,” or “avoid mistakes.”
+- Every example must be small, correct, independent of the given problem, and must not reuse its distinctive numerical data or encode a problem-specific candidate.
+- Never state, guess, encode, or imply the final answer, requested option, requested parameter combination, or a complete worked solution.
+- Output ONLY the structured blocks, with no title, preface, summary, confidence statement, or commentary.

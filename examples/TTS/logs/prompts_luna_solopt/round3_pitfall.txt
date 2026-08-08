@@ -1,0 +1,72 @@
+You are given a problem, one or more FAILED attempts, and a ground-truth answer for diagnosis. Produce the smallest actionable correction that prevents the actual causal error while remaining reusable and without stating or encoding the target’s final answer.
+
+Privately solve enough of the problem to locate the first point where the failed reasoning ceases to be valid or complete. The failure label and ground truth are clues, not mathematical authority: do not call a valid step false merely because the final result differs.
+
+Output each block in exactly this format:
+
+[Error]
+<one concrete failure trigger stated in reusable terms>
+[Rule]
+<the replacement operation and its completion check>
+[Example]
+<a short different example showing the trap and correction>
+
+DIAGNOSTIC PRIORITY:
+1. Trace the failed work backward from the conclusion and identify the earliest error that changes the admissible set or computed quantity.
+2. Classify it privately as one of:
+   - false algebraic or logical inference;
+   - loss or addition of a branch;
+   - use of a necessary condition as sufficient;
+   - invalid cancellation, division, approximation, or truncation;
+   - wrong counting model or unequal weighting;
+   - incomplete search or extremality proof;
+   - failure to apply the requested output transformation;
+   - correct intermediate mathematics aimed at the wrong quantity.
+3. Output ONE block by default. Combine repeated manifestations of the same cause. Add a second block only for an independent error that would remain after the first correction.
+4. Prefer the error whose correction most changes the solver’s next action. Do not spend a block on minor arithmetic if an earlier modeling or completeness error caused the failure.
+5. Do not criticize verbosity, missing exposition, or lack of an “auditable” calculation when the actual mathematical cause can be identified.
+
+REQUIREMENTS FOR [Error]:
+- State the exact risky move, not “check arithmetic,” “be careful,” “read the problem,” or “the answer was not verified.”
+- Phrase it as a recognizable trigger, such as dividing by an expression before treating its zero case, counting unordered objects with an ordered procedure, or stopping after deriving only a necessary condition.
+- Do not quote target-specific wrong values, coefficients, candidate lists, or labels unless they are replaced by generic notation.
+- If the displayed work is valid up to a bare final result, do not fabricate a hidden mistake. Identify a specific objective condition that the claimed result must satisfy only if that condition is genuinely discriminating and central.
+
+REQUIREMENTS FOR [Rule]:
+- Replace the bad step with an executable procedure, not merely a warning.
+- State the hypotheses, the concrete equation/check/case split to perform, and the condition showing that the correction is complete.
+- Preserve efficient valid work from the failed attempt; repair only the causal defect.
+- If a necessary condition was mistaken for a sufficient one, explicitly require substitution into the original conditions.
+- If cases were omitted, state a systematic partition that is disjoint and exhaustive.
+- If an expansion was wrong, give the minimum-order contribution ledger rather than a target-specific full expansion.
+- If a search was incomplete, give a bound, monotone order, divisor argument, or canonical enumeration that proves exhaustion.
+- If a random experiment is underspecified, do not assert an unstated distribution. Give the computation conditional on a clearly named sampling rule only when that is mathematically useful.
+- If the statement genuinely omits a requested quantity or convention, do not produce a refusal or a long ambiguity discussion. State one concise conditional rule that separates the plausible interpretations, or provide an invariant useful under all of them; never invent which interpretation is intended.
+
+EXAMPLE REQUIREMENTS:
+- Use substantially different data, objects, and labels from the target.
+- Keep the example to the smallest nondegenerate case that exposes the error.
+- Show both the tempting invalid move and the correcting operation, followed by one decisive verification.
+- Avoid a full worked solution, target-like candidate list, or the target’s requested answer transformation.
+- Independently verify every formula and arithmetic step. Choose generic nonzero and nonsymmetric data when degeneracy could hide the mistake.
+
+RELEVANCE AND LEAKAGE AUDIT:
+Before outputting, privately check:
+1. Would following the [Rule] have prevented the displayed failure at the exact point it occurred?
+2. Does the rule help solve rather than merely explain why the attempt was wrong?
+3. Is the correction shorter and more salient than the erroneous route?
+4. Have all target-specific constants, decisive intermediate values, and answer-shaped expressions been removed?
+5. Could the target answer be read off or obtained by one routine arithmetic operation from the block? If so, generalize the presentation while retaining the operative method.
+
+STYLE:
+- Match the language of the source problem.
+- Put the concrete trigger and replacement first.
+- Do not mention attempts, grades, ground truth, prompts, ambiguity in grading, or the target’s final answer.
+- Do not recommend unspecified software or brute force.
+- Keep each block compact and operational.
+
+Hard constraints:
+- Use the literal [Error], [Rule], and [Example] headers in every block.
+- Produce 1 block by default and at most 2 blocks.
+- Output ONLY the structured blocks, with no title, preface, summary, or commentary.
+- Never state, quote, imply, transform, or encode the target problem’s final answer.

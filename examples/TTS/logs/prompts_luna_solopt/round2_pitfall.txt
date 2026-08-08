@@ -1,0 +1,53 @@
+You are given one or more attempts labeled FAILED and a ground-truth answer. Privately diagnose the mathematics, then produce 1-3 concise prevention blocks that replace recurring mistakes with executable, independently verified methods.
+
+The failure label and ground truth are diagnostic evidence, not mathematical authority. Do not assume a step is false merely because the attempt was graded wrong, and do not invent an error if the displayed work is valid. Never discuss grading inconsistencies in the output, and never quote, transform, or encode the ground-truth answer.
+
+Output every block in exactly this format:
+
+[Error]
+<the earliest concrete false inference, omitted condition, invalid operation, or high-risk unverified step>
+[Rule]
+<a precise replacement procedure, including hypotheses, execution steps, and a completion/verification test>
+[Example]
+<a small example with genuinely different data that exhibits the trap and then applies the correction>
+
+DIAGNOSTIC PROCEDURE:
+1. Reconstruct the relevant mathematics privately and identify the earliest causal divergence. Prefer the root error over later arithmetic consequences.
+2. Distinguish:
+   - a false step;
+   - a merely unjustified step that may happen to be true;
+   - a valid step followed by an omitted case or incomplete endgame;
+   - a genuinely ambiguous or incomplete problem statement.
+3. Consolidate attempts with the same cause. Use separate blocks only for independent mistakes that require different prevention methods.
+4. Prioritize errors that a solver can actively prevent: omitted domain branches, invalid cancellation, insufficient expansion order, non-exhaustive search, overcounting, failure to check divisibility or integrality, confusion between multiplicity and distinct objects, unjustified uniqueness/extremality, misuse of symmetry, or mishandling the requested output transformation.
+5. Make the [Rule] strong enough to replace the failed reasoning, not merely warn against it. State the exact equation, bound, case split, coefficient ledger, enumeration order, invariant, or independent check to use, and explain when the process is complete.
+6. If a failed attempt contains only a bare result, do not criticize its brevity and do not fabricate the arithmetic it supposedly used. Instead identify the most relevant objective verification procedure for that problem type and frame the [Error] as the specific unchecked condition that could distinguish valid from invalid candidates.
+7. If the supplied statement is ambiguous or appears to omit a condition or requested quantity, do not let the block become a discussion of wording. State the competing mathematical interpretations briefly only if they lead to different admissible sets, then give an executable conditional test for each interpretation. Do not invent an intended condition.
+8. If the attempted conclusion is actually consistent with all displayed conditions, do not allege that it is false. Select a nearby, genuinely relevant verification failure only when it can be stated honestly as an unverified condition; otherwise explain the necessary invariant without referring to the grader.
+9. Independently verify every formula and example. Choose examples with nonzero generic coefficients or nondegenerate cases when zeros or symmetry could conceal the diagnosed mistake.
+
+ACTIONABILITY TEST:
+After reading a block, a solver should be able to answer all three questions:
+- At exactly which step can the error occur?
+- What concrete operation prevents it?
+- What final check certifies the corrected reasoning?
+
+LEAKAGE TEST:
+Privately list the target’s distinctive constants, labels, coefficient pattern, candidate values, and answer format. The output must not contain a target-specific repair sequence, candidate list, decisive intermediate value, or symbolic formula that yields the target answer after one substitution or routine operation.
+
+Examples must:
+- use substantially different data and objects, not merely renamed variables;
+- demonstrate both the erroneous move and the corrected check;
+- avoid reproducing the target’s requested transformation;
+- be verified privately and contain no target answer information.
+
+STYLE AND LENGTH:
+- Produce 1-2 blocks by default and 3 only for genuinely distinct root mistakes.
+- Put the concrete error and replacement method first; omit commentary about confidence, style, or grading.
+- Do not write generic advice such as “check arithmetic,” “read carefully,” “show work,” or “use a computer.”
+- Do not give a full correct solution to the target or criticize a valid alternative method merely because it differs from a preferred solution.
+
+Hard constraints:
+- Use the literal [Error], [Rule], and [Example] headers in every block.
+- Produce 1-3 blocks, one per distinct root mistake or objectively necessary verification failure.
+- Output ONLY the structured blocks, with no title, preface, summary, or commentary.

@@ -1,0 +1,24 @@
+You are given one or more FAILED attempts at a problem and the ground-truth answer. The attempts are WRONG. Do NOT solve the problem or write a correct solution -- you only learn from the failures. Extract the SPECIFIC mistake(s) as concrete, reusable lessons in this EXACT structured format (one block per distinct mistake, 1-3 blocks total):
+
+[Error]
+<the specific wrong step/assumption an attempt made -- concrete, not vague>
+[Rule]
+<the general principle/identity/method that would have avoided it>
+[Example]
+<a tiny concrete worked instance of the rule (small numbers / short snippet), NOT this problem's answer>
+
+Good (specific):
+[Error]
+Dropped the coefficient 2 when expanding the identity.
+[Rule]
+a^2+b^2 = (a+b)^2 - 2ab.
+[Example]
+If u+v=6 and uv=4 then u^2+v^2 = 36 - 8 = 28.
+
+Bad (vague, do NOT do this): 'Be careful with the algebra' / 'Avoid mistakes in expansion'.
+
+Hard constraints:
+- Use the literal [Error]/[Rule]/[Example] headers for every block.
+- Each field must be SPECIFIC and concrete; the [Rule] must be a transferable principle, the [Example] a self-contained mini worked instance.
+- Never state this problem's final/ground-truth answer and never give its full worked solution.
+- Output ONLY the [Error]/[Rule]/[Example] blocks, nothing else.

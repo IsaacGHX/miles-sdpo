@@ -1,0 +1,44 @@
+You are given one or more worked attempts that were graded WRONG, possibly together with a ground-truth answer. Extract 1–3 specific, reusable error-prevention skills. Each block must be based on an error actually visible in an attempt; do not invent an error merely because the final result disagrees with the ground truth.
+
+Output EXACTLY this format and nothing else:
+
+[Error]
+<Identify the concrete invalid inference, assumption, omitted case, model mismatch, arithmetic failure, or missing proof obligation visible in the attempt. Do not state the original problem’s answer.>
+[Rule]
+<State a general, operational prevention rule: tell a future solver exactly what to parse, calculate, enumerate, compare, or prove before accepting the conclusion. Include hypotheses, quantifiers, endpoint conventions, and validation tests when relevant.>
+[Example]
+<Give a short independent example with different symbols, values, and context. Show the diagnostic check or contrast. Do not solve, echo, or encode the supplied problem.>
+
+Hard constraints:
+- Use the literal headers [Error], [Rule], and [Example] for every block.
+- Output only the blocks: no introduction, conclusion, commentary, repaired solution, answer, or confidence statement.
+- Use only errors evidenced by the supplied attempts. If the exact failed step cannot be localized, describe only the directly supported proof gap or model ambiguity; do not fabricate a cause from the ground truth.
+- Do not use the ground truth to reverse-engineer, encode, or hint at the answer, nor to identify an unshown erroneous step.
+- Abstract away all source-specific names, symbols, constants, equations, diagrams, and distinctive intermediate values. Examples must be genuinely independent, not a relabeled version of the supplied problem.
+- Never state the original final answer, requested quantity, answer choice, count, parameter, or any intermediate value that determines it.
+- Make every [Rule] actionable and falsifiable. Replace “be careful” with a prescribed test, exhaustive argument, inequality, case split, or verification.
+- Distinguish a wrong conclusion from an insufficient justification. If an attempt gives a candidate without proving it, say that maximality, existence, divisibility, or another required property was not established; do not assert that the candidate itself is false unless the attempt demonstrates that.
+- For an ambiguity or apparent inconsistency, first parse the literal domain, quantifiers, fixed data, endpoint conventions, and requested quantity. Flag a missing target or unbounded free variable precisely; do not silently impose an intended restriction. Do not let an ambiguity diagnosis replace a valid solution to a well-posed interpretation.
+- For counting and expectation, identify the sample space, weighting, independence, repeated choices, fixed starting conditions, and whether a deterministic strategy is being confused with a random experiment.
+- For extremal graph, inequality, optimization, or existence arguments, separate lower-bound constructions from universal upper bounds and prove both directions needed for a threshold or optimum. Cover the full parameter range, not just sampled cases, and check exceptional denominators or degenerate cases.
+- For algebra, polynomial composition, and series, track signs, absolute values, orders, unknown coefficients, convergence, and all terms that can affect the claimed coefficient or bound. Do not strengthen a remainder estimate until the omitted terms are shown to cancel or be negligible.
+- For arithmetic forms, normalize first and verify that the expression satisfies the stipulated representation before extracting parameters.
+- For geometry, verify every claimed symmetry, tangency, perpendicularity, intersection, equal-area, or equal-volume property from the stated hypotheses rather than from a diagram.
+- For finite searches, prove that the search range is exhaustive and independently verify every surviving candidate and every maximality claim.
+- Prefer a few sharply targeted blocks over many generic warnings. Each example must illustrate the prevention rule, not merely repeat it.
+
+Good:
+[Error]
+The argument used cancellation for a signed function even after replacing it by its absolute value.
+[Rule]
+Apply symmetry only to the actual integrand: an odd signed integrand may integrate to zero on a symmetric interval, but a nonnegative power or absolute value cannot cancel; test nonnegativity and the zero-a.e. condition separately.
+[Example]
+Although \(\int_{-3}^{3} t\,dt=0\), the integral \(\int_{-3}^{3}|t|\,dt\) is positive.
+
+Bad:
+[Error]
+The solver made a mistake.
+[Rule]
+Be more careful.
+[Example]
+Check the work.

@@ -1,0 +1,37 @@
+You are given one or more FAILED attempts and the ground-truth answer. Diagnose the mathematical causes of failure and convert them into 1-3 concrete, reusable prevention blocks.
+
+You MAY privately reconstruct or check as much mathematics as needed to locate the error, but the output must not solve the target problem or reveal its answer. The ground truth is only a diagnostic check and must never be quoted, transformed, or encoded in the output.
+
+Output each block in exactly this format:
+
+[Error]
+<the earliest specific false inference, omitted condition, invalid operation, or counting/interpretation error that materially caused failure>
+[Rule]
+<a precise transferable correction, including hypotheses and an executable check or method>
+[Example]
+<a small self-contained example with different data that demonstrates both the trap and the correction>
+
+DIAGNOSTIC PROCEDURE:
+1. Trace each failed attempt to the earliest causal divergence. Prefer the root error over later incorrect arithmetic that merely follows from it.
+2. Verify the correction privately. Do not infer that a step is wrong solely because the final answer is wrong.
+3. Consolidate attempts sharing the same root cause; separate genuinely different causes.
+4. Prioritize errors likely to recur: invalid domain assumptions, omitted cases, unjustified uniqueness or extremum claims, misuse of symmetry, incorrect truncation/order terms, overcounting, failure to enforce divisibility/integrality, confusing algebraic multiplicity with distinct objects, or mishandling the requested output transformation.
+5. Make the [Rule] operational. State the exact substitution, bound, case split, invariant, remainder check, coefficient precision, or independent verification that prevents the error.
+6. If the statement is ambiguous or omits the quantity to be reported, identify the unsupported interpretation rather than inventing an intended question.
+7. If an attempt contains only a bare response, do NOT say merely that it “showed no work.” Privately derive a minimal independent check and describe the concrete condition the response failed to satisfy, without revealing the correct target value.
+8. Match the language of the source problem unless mathematical clarity strongly favors standard notation.
+
+Do NOT:
+- criticize style, brevity, confidence, or lack of explanation unless it corresponds to a specific unverifiable mathematical assumption;
+- write generic warnings such as “check arithmetic,” “read carefully,” or “avoid mistakes”;
+- treat every difference from one preferred solution method as an error;
+- give a full correct solution, a target-specific repair sequence, or any answer-equivalent intermediate result;
+- use an example that merely substitutes new variable names while retaining the target’s distinctive data.
+
+LEAKAGE CONSTRAINT:
+Never state, quote, imply, or algebraically encode the target problem’s final or ground-truth answer. Do not reveal enough target-specific intermediate values to make the answer recoverable by one trivial operation. Examples must use genuinely unrelated data.
+
+Hard constraints:
+- Use the literal [Error], [Rule], and [Example] headers in every block.
+- Produce 1-3 blocks, one per distinct root mistake.
+- Output ONLY the structured blocks, with no title, preface, summary, or commentary.

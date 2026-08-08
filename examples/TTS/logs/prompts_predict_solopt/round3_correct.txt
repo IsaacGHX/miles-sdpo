@@ -1,0 +1,41 @@
+You are given ONLY an unsolved problem statement. You have not seen a solution, attempted solution, or ground-truth answer. Produce the highest-value mathematical scaffold that can be derived reliably from the statement itself. The scaffold should move a solver through the main bottleneck, not merely restate definitions or mention a potentially relevant theorem.
+
+Output 1-2 blocks in exactly this format:
+
+[Knowledge/Rule]
+<a precise solver-ready lemma, reduction, recurrence, parameterization, bound, identity, or finite procedure>
+[Details/Examples]
+<a concise derivation, exact hypotheses, instructions for use, and one tiny independent verification example>
+
+Selection procedure:
+1. Parse the literal task: objects, domains, quantifiers, equality cases, distinctness, multiplicity, order, endpoints, and the exact quantity requested. Treat answer-shape text and multiple-choice formatting only as output metadata, never as a source of mathematical assumptions.
+2. Sketch the most natural valid route internally, then select the step that most reduces the remaining uncertainty. Prefer a derived relation that sharply restricts candidates or converts the problem to a standard finite task.
+3. Go beyond an immediate definition when the real difficulty lies later. In particular:
+   - For exact counts or classifications, give both the governing condition and a way to bound, parameterize, or enumerate all possibilities without omission or duplication.
+   - For maxima, minima, and least constants, give the upper-bound mechanism and the criterion for equality, attainability, or a matching construction; if one side cannot be safely inferred, give the strongest side that can.
+   - For algebraic or functional identities, exploit the statement’s special hypotheses and derive the first nontrivial consequence rather than supplying only a generic expansion formula.
+   - For geometry, connect the incidence, tangency, angle, or intersection conditions to explicit equations or a fully specified coordinate model.
+   - For probability or processes, specify the state, transition, stopping index, and exact recurrence or linearity calculation.
+   - For elementary arithmetic, give the exact computation or finite search rule and the final verification condition, without adding unnecessary theory.
+4. A second block is allowed only when it supplies a separate indispensable bridge, such as a completeness certificate after a candidate-generating reduction.
+5. Do not perform the final requested evaluation, list the complete problem-specific candidate set, select an answer option, or state the requested answer. However, do not withhold a decisive intermediate identity merely because the final arithmetic after it is short.
+
+Reliability gate:
+- Use only facts that are direct consequences of the statement, standard results with exactly matching hypotheses and conventions, or claims briefly derived in the block.
+- Verify every sign, coefficient, factorial, normalization, inequality direction, index range, endpoint, and multiplicity. Test recurrences at the initial or one-step case and probability transitions for total mass \(1\).
+- Preserve integrality, positivity, parity, divisibility, nonzero-denominator, ordering, and admissibility conditions through substitutions and converses.
+- A necessary condition must be labeled necessary unless the converse is proved. If claiming an equivalence, show both directions briefly.
+- For finite searches, state why the search is finite, what range must be checked, how symmetry or ordering avoids duplicates, and what test certifies a surviving candidate.
+- For smooth functions and formal Taylor expansions, make only finite-jet claims unless convergence or analyticity is given. Use parity or other structural cancellations before invoking a general coefficient formula.
+- For geometric equations, state coordinate placement, orientation or modulo convention, and whether intersections are counted as distinct points or with multiplicity.
+- Do not infer omitted assumptions from a diagram, expected answer form, typography, or likely contest intention. If the literal statement has materially different plausible readings, give a compact conditional distinction only when it affects the mathematics. Do not make an ambiguity warning the primary block if a useful relation valid under all readings is available.
+- Do not assert a classification, extremal value, uniqueness result, special factorization, or boundedness claim without an included argument.
+- The independent example must be minimal and must visibly check the rule. It must not reuse the problem’s distinctive numerical data, mimic its hidden answer, or introduce an alternative interpretation that distracts from the rule.
+
+Hard constraints:
+- Use the literal [Knowledge/Rule] and [Details/Examples] headers for every block.
+- Each block must be concise, mathematical, and directly actionable.
+- Exclude generic advice such as “try cases,” “use algebra,” “apply Vieta,” or “check the conditions” unless converted into an explicit equation, range, procedure, or certificate.
+- Never state, guess, encode, or imply the final answer, requested option, requested parameter combination, or a complete worked solution.
+- Match the language of the problem when practical.
+- Output ONLY the structured blocks, with no title, preface, summary, confidence statement, or commentary.

@@ -1,0 +1,33 @@
+You are given ONLY an unsolved problem statement. You have not seen a solution, attempted solution, or ground-truth answer. Predict the smallest amount of reliable mathematical knowledge that will help a solver make the next correct steps without suggesting the unknown result.
+
+Output 1-2 blocks in exactly this format:
+
+[Knowledge/Rule]
+<a precise, actionable rule, identity, reduction, or finite procedure directly supported by the problem statement>
+[Details/Examples]
+<the hypotheses, how to apply the rule, and one tiny independent example with an explicit correctness check>
+
+Selection procedure:
+1. Identify the exact task, objects, domains, quantifiers, and boundary words such as “distinct,” “exactly,” “largest,” “for every,” “after,” or “with multiplicity.”
+2. Locate the first genuine bottleneck. Supply the concrete bridge needed there: for example, an equation from definitions, a correctly normalized identity, a state recurrence, a counting decomposition, an admissibility test, or a finite search order.
+3. Prefer one elementary reduction over several broad or advanced facts. For a short arithmetic or finite-search problem, give a short execution rule rather than unnecessary theory. Add a second block only if it addresses a separate indispensable step.
+4. Stop before the problem-specific final arithmetic, exhaustive enumeration, optimization, or requested answer extraction.
+
+Reliability gate:
+- Every stated formula must be either a direct definition, a standard identity with exactly matching conventions, or briefly derived in the block. Do not rely on a theorem name alone when normalization, indexing, orientation, or endpoint conventions may differ.
+- Silently verify every derived coefficient, probability, recurrence, sign, inequality direction, and index range. Check probability transitions sum to \(1\), test recurrences at the initial or one-step case, and substitute a small input into algebraic identities.
+- If eliminating variables or claiming a converse, verify both directions and preserve all integrality, positivity, multiplicity, divisibility, and nonzero-denominator conditions.
+- If using a geometric coordinate or angle formula, state its orientation/modulo convention and distinguish lines, rays, segments, directed angles, and the smaller angle when relevant.
+- An example must genuinely satisfy the example’s premises and demonstrate the stated conclusion. Include enough arithmetic or substitution to make that check visible; do not merely assert that it works.
+- Never turn an expected-answer format, multiple-choice layout, diagram appearance, typographical irregularity, or likely contest intention into a mathematical assumption. If the statement is genuinely ambiguous, state only a rule valid under all readings or describe the alternatives conditionally without selecting one.
+- Do not assert a classification, extremal constant, uniqueness result, factorization, special configuration, or global boundedness/unboundedness claim unless it follows from an included argument.
+- For smooth functions, formal series, infinite sums, limits, or similar settings, distinguish finite-order algebra from convergence or analyticity claims.
+- For extrema, exact counts, existence, uniqueness, or “exactly one,” include the criterion needed to certify completeness or optimality, but do not perform the complete certification for this problem.
+- Match the language of the problem when practical.
+
+Hard constraints:
+- Use the literal [Knowledge/Rule] and [Details/Examples] headers for every block.
+- Each block must be concise and operational; do not include generic advice such as “try cases,” “use algebra,” or “apply a theorem.”
+- The example must be small, fully checked, independent of the given problem, and must not reuse its distinctive numerical data or encode a problem-specific candidate.
+- Never state, guess, encode, or imply the final answer, requested option, requested parameter combination, or a complete worked solution.
+- Output ONLY the structured blocks, with no title, preface, summary, confidence statement, or commentary.

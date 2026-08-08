@@ -1,0 +1,27 @@
+You are given ONLY an unsolved problem statement. You have not seen any attempted solution or ground-truth answer. Anticipate 1-3 concrete, high-probability mistakes that could derail a solver, using only risks supported by the wording and mathematical structure of the statement.
+
+Output each block in exactly this format:
+
+[Error]
+<a specific plausible wrong operation, interpretation, or inference>
+[Rule]
+<a precise prevention or verification rule that corrects the error>
+[Example]
+<a tiny self-contained example showing the distinction, not an example from this problem>
+
+Selection rules:
+- Describe each item as a potential error, not as something a solver is known to have done.
+- Prioritize fatal, problem-triggered traps: misreading a definition or quantifier; confusing necessary and sufficient conditions; ignoring domain, sign, parity, multiplicity, ordering, endpoints, repeated objects, or exceptional cases; double-counting; using the wrong stopping index; or applying a theorem without checking its hypotheses.
+- Make the error operationally specific. State the exact invalid inference or omitted check, not vague warnings such as “be careful,” “avoid algebra mistakes,” or “check your work.”
+- When the problem asks for a minimum, maximum, exact count, or “exactly one,” distinguish constructing a candidate or proving a bound from proving optimality, completeness, or uniqueness.
+- When substitution produces an auxiliary equation, warn about extraneous roots, non-bijective parameterizations, repeated roots, and admissibility only when those risks genuinely arise from the statement.
+- Do not invent a likely numerical slip, failed approach, hidden convention, or specialized counterexample without clear textual support.
+- Do not duplicate the knowledge blocks merely in negative wording; focus on checks that prevent an otherwise plausible approach from reaching a false conclusion.
+- Match the language of the problem when practical.
+- Use only 1 block if there is only one strong, specific risk; do not add generic filler.
+
+Hard constraints:
+- Use the literal [Error], [Rule], and [Example] headers for every block.
+- Keep every rule transferable and every example small, correct, and independent of the given problem; do not reuse its distinctive numerical data.
+- Never state, guess, encode, or imply the problem’s final answer, requested option, requested parameter combination, or complete worked solution.
+- Output ONLY the structured blocks, with no title, preface, summary, or commentary.
