@@ -1,0 +1,48 @@
+# TTS single-turn config: luna solves + writes skills, gpt-5.6-sol optimizes.
+#
+# The experiment: keep the layer-1 scaffold entirely on gpt-5.6-luna (solver AND
+# skill_writer / correct+pitfall distillers), but hand the layer-2 meta-optimizer
+# to a DIFFERENT, external model -- gpt-5.6-sol -- so an outside perspective
+# rewrites luna's skill-generation prompt pair. Contrast with
+# single_turn_math_luna.yaml (all-luna), where the optimizer never beat the SDPO
+# seed prompt: the hypothesis is that a different optimizer model finds headroom
+# the self-optimizing luna could not.
+#
+# Both models sit behind the Salesforce Research OpenAI-compatible gateway; auth
+# is SFT_GATEWAY_KEY (Bearer) loaded from ~/gitproj/apis/.env. Both are reasoning
+# models (gpt-5*): the openai backend sends max_completion_tokens and omits
+# temperature/top_p automatically.
+
+skill_mode: predict          # DEPLOYMENT-ALIGNED: predict skill from the bare problem
+                             # (no traces, no answer) -- same protocol as eval_tts.py.
+rounds: 3
+n_rollouts: 8                # rollouts per problem (the SDPO group size)
+concurrency: 8               # problems in flight at once
+grader: dapo                 # math: DAPO boxed / numeric grading
+default_domain: math
+
+skill_max_tokens: 4000       # luna reasoning tokens count against this budget
+solver_max_tokens: 8000
+optimizer_max_tokens: 12000
+max_correct_traces: 3        # cap traces fed to each distiller (token budget)
+max_failed_traces: 3
+
+engines:
+  solver:
+    backend: openai
+    model: gpt-5.6-luna
+    base_url: https://gateway.salesforceresearch.ai/openai/process/v1
+    api_key_env: SFT_GATEWAY_KEY
+    max_tokens: 8000
+  skill_writer:
+    backend: openai
+    model: gpt-5.6-luna
+    base_url: https://gateway.salesforceresearch.ai/openai/process/v1
+    api_key_env: SFT_GATEWAY_KEY
+    max_tokens: 4000
+  optimizer:                 # EXTERNAL optimizer: different model rewrites luna's prompts
+    backend: openai
+    model: gpt-5.6-sol
+    base_url: https://gateway.salesforceresearch.ai/openai/process/v1
+    api_key_env: SFT_GATEWAY_KEY
+    max_tokens: 12000

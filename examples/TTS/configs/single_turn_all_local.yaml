@@ -1,0 +1,37 @@
+# TTS single-turn config: ALL LOCAL (no remote API needed).
+#
+# Every role runs on ONE local SGLang Qwen2.5-7B server -- solver, skill_writer,
+# and optimizer all point at the same base_url, so they share a single engine
+# instance. Use this to run the whole loop offline / without API keys, or as the
+# baseline before comparing against a stronger remote optimizer.
+
+rounds: 4
+concurrency: 32
+grader: dapo
+default_domain: math
+use_skill: true
+feed_prior_attempts: true
+
+skill_max_tokens: 1024
+solver_max_tokens: 4096
+optimizer_max_tokens: 4096
+
+engines:
+  solver:
+    backend: openai
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:30000/v1
+    temperature: 0.7
+    max_tokens: 4096
+  skill_writer:
+    backend: openai
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:30000/v1
+    temperature: 0.7
+    max_tokens: 1024
+  optimizer:
+    backend: openai
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:30000/v1
+    temperature: 0.4
+    max_tokens: 4096

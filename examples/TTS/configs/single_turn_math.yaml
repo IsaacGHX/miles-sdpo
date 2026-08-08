@@ -1,0 +1,50 @@
+# TTS single-turn config: MIXED local + remote (the task's two-engine setup).
+#
+# solver       = local SGLang Qwen2.5-7B-Instruct (the model we scaffold)
+# skill_writer = the SAME local model (self-skill, like SDPO's --sdpo-self-skill)
+# optimizer    = remote gpt-5.6-luna (strong meta-optimizer rewriting the
+#                skill-gen prompt from traces)
+#
+# Every role is independent: to make skill_writer or optimizer LOCAL too, just
+# point them at the sglang base_url; to make the solver REMOTE, give it a hosted
+# model + api_key_env. Roles with identical settings share one engine instance.
+#
+# Start the local server first (see run-single-turn.sh):
+#   python -m sglang.launch_server --model-path <qwen2.5-7b> --port 30000 ...
+
+rounds: 4
+concurrency: 32
+grader: dapo                 # math: DAPO boxed / numeric grading
+default_domain: math
+use_skill: true
+feed_prior_attempts: true    # feed each round's solver traces into next skill-gen
+
+skill_max_tokens: 1024
+solver_max_tokens: 4096
+skill_temperature: 0.7
+solver_temperature: 0.7
+optimizer_max_examples: 24
+optimizer_max_tokens: 4096
+
+engines:
+  solver:
+    backend: openai                          # SGLang's OpenAI-compatible server
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:30000/v1
+    # no api_key_env -> no auth header (local server)
+    temperature: 0.7
+    max_tokens: 4096
+
+  skill_writer:
+    backend: openai
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:30000/v1      # identical to solver -> shared engine
+    temperature: 0.7
+    max_tokens: 1024
+
+  optimizer:
+    backend: openai
+    model: gpt-5.6-luna                       # remote strong optimizer
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY               # key read from env, never in config
+    max_tokens: 4096
