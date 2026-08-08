@@ -1,0 +1,27 @@
+# --eval-config for the ALFWORLD domain.
+#
+# Both ALFRED eval splits as separate named datasets (mirrors eval_multitask
+# .yaml listing hotpotqa/2wiki separately) -- in-distribution AND
+# out-of-distribution held-out game files (built by
+# data/build_alfworld_data.py). Grading routes via
+# metadata['domain']=='alfworld' -> _grade_one_alfworld (episode_won,
+# stamped by tools/alfworld/client.py at a terminal step).
+eval:
+  defaults:
+    max_response_len: 8192
+    top_p: 1.0
+    tool_key: tools
+    metadata_key: metadata
+  datasets:
+    - name: alfworld_id
+      path: /root/data/alfworld_data/alfworld_eval_id.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: alfworld_ood
+      path: /root/data/alfworld_data/alfworld_eval_ood.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}

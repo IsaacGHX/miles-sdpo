@@ -1,0 +1,42 @@
+You are given one or more worked attempts that were graded WRONG, possibly together with a ground-truth answer. Extract 1–3 specific, reusable error-prevention skill blocks. Do not solve the problem, repair the entire attempt, or use the ground truth to state, encode, or reverse-engineer the answer.
+
+Output EXACTLY this format and nothing else:
+
+[Error]
+<The concrete invalid step, assumption, omission, or interpretation made by an attempt. Describe the failure without stating the problem’s answer.>
+[Rule]
+<A general, actionable principle that prevents this error. Include the relevant hypothesis, quantifier, boundary case, or validation test.>
+[Example]
+<A short, self-contained example with different values and context. Show the correct check or contrast, without solving or echoing the given problem.>
+
+Hard constraints:
+- Use the literal headers [Error], [Rule], and [Example] for every block.
+- Output only the blocks; no introduction, conclusion, commentary, corrected solution, or answer.
+- Each [Error] must identify a real mistake evidenced by the failed attempt, not a speculative possibility or a generic warning.
+- Do not treat the ground truth as evidence that a particular unshown step was wrong. If the failure cannot be localized, state a generalizable issue only when it is directly supported by the attempt.
+- Do not turn a disagreement with the literal wording into a “pitfall” by inventing an intended interpretation. First parse the stated domains, quantifiers, endpoint conventions, and requested quantity exactly; flag ambiguity rather than silently changing the problem.
+- Make the [Rule] operational: tell the solver what to inspect, calculate, enumerate, bound, or prove before accepting a conclusion.
+- For extremal graph, inequality, optimization, or existence arguments, distinguish a lower-bound construction from a universal upper bound; neither alone proves the claimed threshold or optimum.
+- For counting and expectation, identify the sample space and weighting, account for fixed starting conditions, and distinguish independent repeated choices from one global choice or a deterministic strategy.
+- For algebra and series, track orders, signs, absolute values, convergence, and all terms capable of affecting the requested coefficient or bound.
+- For arithmetic forms such as \(k\sqrt m+n\), first normalize the expression and verify that it actually has the stipulated form before extracting parameters.
+- For geometry, verify that the claimed symmetry, intersection, tangency, or equal-volume property follows from the stated configuration rather than from a convenient diagram.
+- Examples must use different values, symbols, and context from the supplied problem. They must illustrate the prevention rule, not disclose the original result.
+- Never state the problem’s final or ground-truth answer, a distinctive intermediate value that determines it, or an equivalent encoded answer. Never write a full corrected solution.
+- Avoid vague blocks such as “be careful with arithmetic” or “check your work”; name the exact check.
+
+Good:
+[Error]
+The argument used cancellation for a signed integral even though the integrand had been replaced by its absolute value.
+[Rule]
+Symmetry gives zero for an odd signed integrand on a symmetric interval, but an integral of a nonnegative quantity requires a separate positivity or magnitude analysis.
+[Example]
+\(\int_{-2}^{2}x\,dx=0\), whereas \(\int_{-2}^{2}|x|\,dx=4\).
+
+Bad:
+[Error]
+The solver made a mistake.
+[Rule]
+Be more careful.
+[Example]
+Check the calculation.

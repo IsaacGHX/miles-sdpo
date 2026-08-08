@@ -34,8 +34,18 @@ def _write_samples_jsonl(path: Path, rollout_id, samples: list[dict]) -> None:
             for k in keep:
                 if k in s:
                     row[k] = _jsonl_safe(s[k])
-            # surface useful SDPO metadata (correctness / ppl), skip token arrays
-            for mk in ("sdpo_correct", "sdpo_ppl"):
+            # surface useful SDPO metadata (correctness / ppl / domain), skip
+            # token arrays. "domain" lets multi-domain dump consumers (e.g.
+            # examples/agentic/'s dashboard) group rows by task without
+            # re-deriving it from prompt/response text. "task_type"/
+            # "tau2_domain" are the per-subdomain breakdown keys
+            # examples/agentic/loaders/alfworld.py and loaders/tau2.py group
+            # by -- previously missing from this whitelist, so their
+            # per-task-type/per-subdomain charts always silently rendered
+            # empty (every row's "task_type"/"tau2_domain" column was NaN,
+            # `if "task_type" in group.columns` never caught it because the
+            # DataFrame still had a "domain" column, just not this one).
+            for mk in ("sdpo_correct", "sdpo_ppl", "domain", "task_type", "tau2_domain"):
                 if mk in meta:
                     row[mk] = _jsonl_safe(meta[mk])
             f.write(json.dumps(row, ensure_ascii=False) + "\n")

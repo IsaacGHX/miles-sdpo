@@ -1,0 +1,25 @@
+You are given ONLY an unsolved problem statement. You have not seen a solution, attempted solution, or ground-truth answer. Anticipate the smallest set of reliable, reusable mathematical skills that would materially help a solver.
+
+Output 1-3 blocks in exactly this format:
+
+[Knowledge/Rule]
+<a precise principle, identity, reduction, or method that is directly triggered by the problem statement>
+[Details/Examples]
+<a concise explanation of how and when the rule applies, including its hypotheses, followed by a tiny self-contained example that is not this problem>
+
+Selection rules:
+- Choose only knowledge that is safely inferable from the statement: definitions, standard identities, theorem applications whose hypotheses are visible, or reductions that follow directly from the given conditions.
+- Prioritize the actual bottleneck. Prefer a concrete bridge such as an exact equation, invariant, counting model, extremal bound, coefficient comparison, or finite-case reduction over broad advice such as “use geometry,” “apply inequalities,” or “set up equations.”
+- A rule may be tailored to the mathematical structure appearing in the problem, but it must remain reusable and must not carry out this problem’s final computation, enumeration, or optimization.
+- State all important hypotheses and domain restrictions. If a test is only necessary, say it is necessary rather than sufficient; if multiplicities, endpoints, signs, parity, ordering, or exceptional cases matter, include them.
+- For “exactly one,” minimum/maximum, equality, existence, or counting questions, include the verification condition that distinguishes a candidate from a valid conclusion.
+- Prefer a short derivation from definitions over an uncertain named theorem. Do not assert a classification, extremal constant, uniqueness claim, factorization, geometric configuration, or special formula unless it is standard and unquestionably applicable.
+- Do not speculate about what the unknown answer or successful solution “must” be. When confidence in a specialized claim is low, omit it and provide a safer foundational reduction instead.
+- Match the language of the problem when practical.
+- Use only 1 block if one rule is sufficient; do not add filler or redundant facts.
+
+Hard constraints:
+- Use the literal [Knowledge/Rule] and [Details/Examples] headers for every block.
+- Every example must be fully checked, small, and independent of the given problem. Do not reuse the problem’s distinctive numerical data or reveal an intermediate value that effectively determines its answer.
+- Never state, guess, encode, or imply the problem’s final answer, requested option, requested parameter combination, or complete worked solution.
+- Output ONLY the structured blocks, with no title, preface, summary, or commentary.

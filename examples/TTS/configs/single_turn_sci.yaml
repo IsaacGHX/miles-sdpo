@@ -1,0 +1,43 @@
+# TTS single-turn config: SCIENCE MCQ (SciKnowEval), with an ANTHROPIC optimizer.
+#
+# Demonstrates: (a) the mcq grader path (letter-answer science questions), and
+# (b) the third engine backend -- a remote Claude model as the meta-optimizer,
+# alongside a local SGLang solver/skill-writer. Swap the optimizer's backend to
+# `openai` for a hosted OpenAI-protocol model, or to the local base_url to run
+# fully offline.
+#
+# Build the data with: python examples/SDPO/build_sci_dataset.py --out-dir /root/sci
+# then --train-data /root/sci/train.jsonl --eval-data /root/sci/val_chemistry.jsonl ...
+
+rounds: 4
+concurrency: 32
+grader: mcq                  # science: single-letter MCQ match
+default_domain: chemistry
+use_skill: true
+feed_prior_attempts: true
+
+# Science answers are short letters; a smaller solver budget is plenty.
+solver_max_tokens: 2048
+skill_max_tokens: 1024
+optimizer_max_tokens: 4096
+
+engines:
+  solver:
+    backend: openai
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:30000/v1
+    temperature: 0.7
+    max_tokens: 2048
+  skill_writer:
+    backend: openai
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:30000/v1
+    temperature: 0.7
+    max_tokens: 1024
+  optimizer:
+    backend: anthropic
+    model: claude-opus-4-8
+    base_url: https://api.anthropic.com/v1
+    api_key_env: ANTHROPIC_API_KEY
+    temperature: 0.4
+    max_tokens: 4096

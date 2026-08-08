@@ -1,0 +1,62 @@
+You are given a problem and one or more worked attempts that received a CORRECT final grade. Produce the smallest reusable skill that would most improve a fresh solution of this problem and analogous problems, without stating or encoding the target’s final answer.
+
+Privately solve the relevant mathematics independently. A correct final grade does not certify the attempt’s intermediate claims, equivalences, branch choices, or generalizations. Retain only statements that you have checked from first principles.
+
+Output each block in exactly this format:
+
+[Knowledge/Rule]
+<a precise executable rule or procedure>
+[Details/Examples]
+<a short derivation, branch check, or genuinely different micro-example>
+
+SELECTION PRIORITY:
+1. Identify the earliest genuine bottleneck: the transformation, invariant, bound, case split, recurrence, coefficient ledger, or counting model after which the remaining work is routine.
+2. Output ONE block by default. Add a second block only if it supplies an independent indispensable stage, such as a separate extremality proof or output-format certification. Never add a block merely because another valid fact appeared in an attempt.
+3. Prefer the method that is shortest to execute reliably, not the method that is most sophisticated or most general.
+4. Do not replace a useful structural reduction with raw enumeration such as “test every number,” “list all cases,” or “use a computer” when congruences, monotonicity, symmetry, factorization, valuation, or a sharp bound substantially narrows the work.
+5. Conversely, for a genuinely small finite task, give the direct calculation or finite check rather than introducing an elaborate theorem.
+
+REQUIRED CONTENT OF [Knowledge/Rule]:
+- State when the rule applies and define the quantities it uses.
+- Give the decisive operation explicitly.
+- Distinguish implications from equivalences. If a condition only filters candidates, say that surviving candidates must be checked in the original conditions.
+- Include only the endgame needed to certify the requested property: completeness, uniqueness, extremality, exact multiplicity, integrality, divisibility, domain membership, or the requested rounding/remainder transformation.
+- When branches arise from signs, orientations, absolute values, tangency, multiplicity, zero denominators, or endpoints, list the relevant branches and state how each is retained or rejected.
+- For compositions, series, or coefficient extraction, specify the minimum truncation order and keep a ledger of every contribution to the requested order.
+- For probabilistic problems, state the sample space and weighting only if the problem supplies or logically determines them; do not invent a randomness convention.
+- For optimization or threshold problems, include both sides when needed: a universal bound and a construction or equality case.
+
+RELIABILITY AUDIT:
+Before writing, privately perform all of the following:
+1. Re-derive every displayed identity independently of the attempts.
+2. Test each claimed “if and only if” against boundary, zero, repeated-root, symmetric, and opposite-orientation cases that are relevant.
+3. Check whether the proposed rule actually resolves the problem’s main difficulty rather than merely restating the definition.
+4. Prefer a direct independent verification over agreement among multiple attempts.
+5. Remove any theorem whose hypotheses are not fully satisfied.
+
+TRANSFER WITHOUT LEAKAGE:
+- Preserve the target’s mathematical structure at a symbolic family level; do not abstract so far that the rule becomes generic advice.
+- A general symbolic theorem or formula is allowed even when it is directly useful. Leakage means target-specific specialization, not ordinary applicability of a reusable theorem.
+- Do not include the target’s distinctive numerical constants, labels, candidate list, evaluated intermediate values, requested final numerator/denominator, or any expression that is merely the target answer in disguised form.
+- Do not reproduce the target’s exact coefficient, digit, graph, or geometric configuration with cosmetic renaming.
+- Never state, quote, imply, or algebraically encode the target’s final answer.
+
+DETAILS/EXAMPLES:
+- Keep this section subordinate to the rule. Use at most one micro-example, normally 2-5 lines.
+- Use substantially different data and labels.
+- Demonstrate the decisive step or a branch/completeness check, not a full second problem.
+- If a numerical example would distract or resemble the target, give a compact symbolic derivation or sanity check instead.
+- Verify all arithmetic and ensure the example is nondegenerate; do not choose zeros or symmetry that conceal terms or branches.
+- Do not show a false method unless correcting it is essential to understanding the rule.
+
+STYLE:
+- Match the language of the source problem.
+- Put the executable method first and omit historical background, motivational prose, and theorem-name-only advice.
+- Do not mention attempts, grades, ground truth, prompts, leakage, or uncertainty.
+- Keep each block compact enough to be used during solving.
+
+Hard constraints:
+- Use the literal [Knowledge/Rule] and [Details/Examples] headers in every block.
+- Produce 1 block by default and at most 2 blocks.
+- Output ONLY the structured blocks, with no title, preface, summary, or commentary.
+- Never state the target problem’s final answer.

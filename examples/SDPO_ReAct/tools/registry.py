@@ -29,12 +29,16 @@ call the same `execute_tool(name, params) -> str` contract.
 import json
 import os
 
+from examples.SDPO_ReAct.tools.alfworld.client import call_alfworld_tool
+from examples.SDPO_ReAct.tools.alfworld.spec import ALFWORLD_STEP_SPEC
 from examples.SDPO_ReAct.tools.cli.client import run_command
 from examples.SDPO_ReAct.tools.cli.spec import CLI_EXEC_SPEC
 from examples.SDPO_ReAct.tools.code.client import run_code
 from examples.SDPO_ReAct.tools.code.spec import CODE_INTERPRETER_SPEC
 from examples.SDPO_ReAct.tools.search.client import call_search_tool
 from examples.SDPO_ReAct.tools.search.spec import FIND_SPEC, OPEN_SPEC, SEARCH_SPEC
+from examples.SDPO_ReAct.tools.webshop.client import call_webshop_tool
+from examples.SDPO_ReAct.tools.webshop.spec import WEBSHOP_STEP_SPEC
 
 # --------------------------------------------------------------------------- #
 # Backends. Each is `async handler(params: dict) -> str`. Thin adapters over
@@ -63,6 +67,14 @@ async def _handle_find(params: dict) -> str:
     return await call_search_tool("find", params)
 
 
+async def _handle_webshop_step(params: dict) -> str:
+    return await call_webshop_tool(params)
+
+
+async def _handle_alfworld_step(params: dict) -> str:
+    return await call_alfworld_tool(params)
+
+
 # --------------------------------------------------------------------------- #
 # Registry: name -> (spec, handler, set-membership). Add a tool HERE only --
 # the spec/handler themselves live in that tool's own subpackage.
@@ -73,6 +85,8 @@ _REGISTRY = {
     "search": {"spec": SEARCH_SPEC, "handler": _handle_search, "sets": {"search", "deepsearch", "all"}},
     "open": {"spec": OPEN_SPEC, "handler": _handle_open, "sets": {"search", "deepsearch", "all"}},
     "find": {"spec": FIND_SPEC, "handler": _handle_find, "sets": {"search", "deepsearch", "all"}},
+    "webshop_step": {"spec": WEBSHOP_STEP_SPEC, "handler": _handle_webshop_step, "sets": {"webshop", "agentic", "all"}},
+    "alfworld_step": {"spec": ALFWORLD_STEP_SPEC, "handler": _handle_alfworld_step, "sets": {"alfworld", "agentic", "all"}},
 }
 
 
@@ -96,9 +110,17 @@ tool_specs = [t["spec"] for t in _REGISTRY.values() if "math" in t["sets"]]
 # Plain module-level lists for --generate-tool-specs-path (which load_function
 # dereferences to the object directly -- a LIST, not a function, so the rollout
 # parser gets the specs without calling anything). all_tool_specs = every tool
-# (code_interpreter + cli_exec + search/open/find) for a multi-domain run where
-# the rollout must parse tool calls from ALL domains' rows.
+# (code_interpreter + cli_exec + search/open/find + webshop_step/alfworld_step)
+# for a multi-domain run where the rollout must parse tool calls from ALL
+# domains' rows.
 all_tool_specs = [t["spec"] for t in _REGISTRY.values() if "all" in t["sets"]]
+
+# agentic_tool_specs = just webshop_step + alfworld_step, for the agentic run
+# script's "agentic" (webshop+alfworld combined) domain -- deliberately NOT
+# all_tool_specs, so a mixed webshop/alfworld rollout can't accidentally
+# parse a stray code_interpreter/search call no row in that domain ever
+# declares (harmless if it happened, but confusing/wasteful).
+agentic_tool_specs = [t["spec"] for t in _REGISTRY.values() if "agentic" in t["sets"]]
 
 
 # --------------------------------------------------------------------------- #

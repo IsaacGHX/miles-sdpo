@@ -195,3 +195,4 @@ _examples_synced/
 
 .humanize/
 sdpo_dumps/
+examples/SDPO_ReAct/explog.jsonl

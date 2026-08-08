@@ -1,0 +1,57 @@
+You are given one or more worked attempts that received a CORRECT final grade. Extract 1-3 concise, independently verified skill blocks that help solve analogous problems without revealing or nearly reconstructing the target answer.
+
+A correct grade does not certify every sentence or strategy in an attempt. Privately reconstruct enough mathematics to determine which steps are valid, necessary, and genuinely transferable. Discard accidental observations, unsupported claims, and methods that work only because of the target’s particular numbers.
+
+Output every block in exactly this format:
+
+[Knowledge/Rule]
+<a precise reusable rule or short procedure, with its hypotheses, decisive step, and completion/validation condition>
+[Details/Examples]
+<a compact example with genuinely different data that demonstrates the decisive step and its verification>
+
+CONTENT REQUIREMENTS:
+1. Extract the smallest complete method that crosses the main bottleneck. It must tell the solver:
+   - when the method applies;
+   - what equation, invariant, bound, case split, or counting device to form;
+   - how to finish the remaining search or calculation;
+   - how to verify uniqueness, maximality, exact intersection count, integrality, or absence of extraneous cases.
+2. Prefer one end-to-end method over several disconnected facts. If several stages are essential, combine them into one numbered or logically ordered procedure inside a block.
+3. Include the operational endgame. Do not stop at “reduce to a finite search,” “differentiate,” “use Vieta,” “apply symmetry,” or “bound the expression”: state how candidates are generated, rejected, and certified complete.
+4. Translate qualifiers in the problem into exact tests. Examples:
+   - “exactly one” requires a root/intersection count including multiplicity and domain;
+   - “largest” or “smallest” requires a monotone search or a matching bound and construction;
+   - “all integer roots” requires both integrality and exhaustive enumeration without overcounting;
+   - a floor, remainder, coefficient, or numerator-denominator request requires a final interval, modular, precision, or reduced-form check.
+5. Distinguish necessary from sufficient conditions. If a reduction only filters candidates, explicitly require substitution into the original conditions afterward.
+6. When series, compositions, or approximations are involved, state the exact truncation order needed and account for every source contributing to the requested coefficient.
+7. Match the source problem’s language unless standard notation is clearer.
+
+TRANSFER AND LEAKAGE TEST:
+Before outputting a block, privately list the target’s distinctive signature: its named objects, numerical constants, parameter values, requested answer form, and any intermediate values from the attempts. Remove that signature from the output.
+
+A block is forbidden if a solver can recover the target answer by merely:
+- substituting one target constant into a displayed closed formula;
+- carrying out one routine arithmetic operation;
+- reading off a target-specific candidate list or near-complete derivation.
+
+If this happens, abstract the rule to a more general decision procedure, omit target-specific specialization, and use a substantially different example. A useful general theorem may still be stated, but do not specialize it to the target’s exact family and parameter values.
+
+EXAMPLE REQUIREMENTS:
+- Use different numerical data, labels, and requested quantity.
+- Do not preserve the target’s distinctive coefficient pattern, geometry, digit set, graph family, or answer transformation with only cosmetic substitutions.
+- Verify the example privately from first principles.
+- Make the example illustrate the difficult step, not merely routine arithmetic.
+- Do not include a false “common result” for contrast unless its falsity is explicitly demonstrated.
+
+STYLE AND LENGTH:
+- Produce 1-2 blocks by default and 3 only for genuinely independent bottlenecks.
+- Keep each block compact; put the executable rule before background explanation.
+- Avoid roadmaps tied to the target’s labels and avoid theorem-name-only advice.
+- Do not mention grading, attempts, ground truth, prompt instructions, or whether the target statement is flawed.
+
+Never state, quote, imply, or algebraically encode the target problem’s final answer. Never reveal a target-specific intermediate result from which the answer follows by one trivial step.
+
+Hard constraints:
+- Use the literal [Knowledge/Rule] and [Details/Examples] headers in every block.
+- Produce 1-3 blocks, one per distinct high-value skill.
+- Output ONLY the structured blocks, with no title, preface, summary, or commentary.

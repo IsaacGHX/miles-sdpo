@@ -1,0 +1,37 @@
+You are given one or more worked solutions that were graded CORRECT. Extract the smallest set of decisive, reusable reasoning skills that would help solve unseen problems of the same type. A skill should capture the method that materially produced correctness—not merely a definition, routine setup, notation choice, or problem-specific calculation.
+
+Output ONLY 1–3 blocks in exactly this format, with no introduction or text outside the blocks:
+
+[Knowledge/Rule]
+<State one precise, transferable theorem, identity, invariant, algorithm, case-classification method, or proof/verification procedure. Give an operational recipe: specify what to identify, calculate, transform, enumerate, compare, or prove, and state the hypotheses, quantifiers, domains, and boundary conditions required. Preserve the logical direction of the source argument: distinguish necessary from sufficient conditions, existence from uniqueness, a lower bound from an attained optimum, and a candidate from a verified solution.>
+[Details/Examples]
+<Give a short independent example in a different context and with fresh notation and values. Demonstrate the rule through its decisive steps and check the relevant limitation, endpoint, exceptional case, or equality condition. Do not merely announce the result.>
+
+Hard constraints:
+- Use the literal headers [Knowledge/Rule] and [Details/Examples] for every block.
+- Output only the blocks; never include a solution, final answer, answer choice, requested count, parameter, constant, or any intermediate value that determines the supplied answer.
+- Abstract away all source-specific names, symbols, constants, diagrams, equations, distinctive values, and answer formats. Use fresh notation and a genuinely independent example, not a relabeling or numerical reconstruction.
+- Extract only principles directly evidenced by the correct work. Do not infer a theorem from the ground truth or from an unexplained successful conclusion.
+- Prefer one or two high-value blocks over several generic observations. Do not include a block unless it changes what a future solver would do.
+- When the source uses several dependent steps, express them as a compact reusable procedure rather than isolated facts. Include the decisive reduction and the final verification step.
+- For a finite search or case split, state why the cases/range are exhaustive, how exceptional denominators or degeneracies are handled, and how every survivor is independently verified.
+- For an extremal, threshold, optimization, or “largest/smallest” claim, include both the universal bound or exclusion argument and a construction/equality witness attaining it when supported.
+- For counting or probability, specify the objects being counted, whether order and repetition matter, the sample-space weights, independence, fixed initial conditions, and whether a process is random or deterministic.
+- For algebra, compositions, series, limits, and asymptotics, retain every term that can affect the requested order; justify cancellation, factorization, interchange, convergence, and remainder estimates. Never use an \(O(x^r)\) remainder to claim an \(x^r\) coefficient unless that coefficient is explicitly controlled.
+- For divisibility and arithmetic, normalize the representation first, combine compatible conditions correctly, and separately verify digit, sign, range, integrality, and representation requirements.
+- For geometry, state configuration hypotheses and derive—not assume from a diagram—symmetry, angle, tangency, perpendicularity, intersection, multiplicity, or volume claims. Resolve the possible rays/orientations.
+- For inequalities and identities, state sign or positivity assumptions and identify exactly where equality can occur.
+- If the supplied statement or solution is malformed, extract only a general method for detecting the missing quantifier, target, domain, or condition. Do not guess the intended problem or solve the malformed instance.
+- Avoid vague advice such as “use algebra,” “check cases,” or “be careful.” Replace it with a concrete test or sequence of actions.
+
+Good:
+[Knowledge/Rule]
+To establish that a finite candidate search gives the largest admissible integer, derive a necessary divisibility or congruence condition, prove that the resulting descending search range contains every possible candidate, test each remaining candidate against the original condition, and stop only at the first valid one.
+[Details/Examples]
+For a bounded problem involving a number and its nonzero digits, first replace the separate divisibility requirements by the lcm of the distinct digits, then inspect the finite candidates in descending order and verify the first passing candidate directly. A zero digit is excluded from the lcm but remains relevant to the digit-length condition.
+
+Bad:
+[Knowledge/Rule]
+Use the special equation from the solution and substitute the given values.
+[Details/Examples]
+This gives the requested answer.

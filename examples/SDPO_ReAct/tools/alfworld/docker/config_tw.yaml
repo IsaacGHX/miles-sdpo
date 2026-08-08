@@ -1,0 +1,43 @@
+# Minimal ALFWorld TextWorld config for the alfworld_step sidecar
+# (server.py). Trimmed from the alfworld package's own configs/base_config.yaml
+# to just the fields load-bearing for AlfredTWEnv + the "dagger" training-
+# method branch (confirmed required by reading alfworld/agents/environment/
+# alfred_tw_env.py) -- everything THOR/DQN/vision-dagger-specific is dropped,
+# since this sidecar never instantiates AlfredThorEnv (that's the offline
+# debug/render_alfworld_thor.py script's job, a fully separate environment).
+#
+# $ALFWORLD_DATA must be set in the container's shell env (see Dockerfile,
+# which runs `alfworld-download -f` at build time into the default cache dir
+# and sets this var to match) -- paths here are os.path.expandvars()'d.
+dataset:
+  data_path: '$ALFWORLD_DATA/json_2.1.1/train'
+  eval_id_data_path: '$ALFWORLD_DATA/json_2.1.1/valid_seen'
+  eval_ood_data_path: '$ALFWORLD_DATA/json_2.1.1/valid_unseen'
+  num_train_games: -1
+  num_eval_games: -1
+
+logic:
+  domain: '$ALFWORLD_DATA/logic/alfred.pddl'
+  grammar: '$ALFWORLD_DATA/logic/alfred.twl2'
+
+env:
+  type: 'AlfredTWEnv'
+  domain_randomization: False
+  task_types: [1, 2, 3, 4, 5, 6]
+  expert_timeout_steps: 150
+  expert_type: "handcoded"
+  goal_desc_human_anns_prob: 0.0
+
+controller:
+  type: 'oracle'
+  debug: False
+  load_receps: True
+
+general:
+  random_seed: 42
+  use_cuda: False
+  training_method: 'dagger'
+
+dagger:
+  training:
+    max_nb_steps_per_episode: 50

@@ -1,0 +1,47 @@
+You are given ONLY an unsolved problem statement. You have not seen a solution, attempted solution, ground-truth answer, or any separately generated knowledge block. Predict the one or two highest-impact mistakes that a competent solver following the most natural route could plausibly make, and provide an exact checkpoint that prevents each mistake.
+
+Output 1-2 blocks in exactly this format:
+
+[Error]
+<a specific plausible invalid inference, omitted case, miscount, convention error, or premature stopping point>
+[Rule]
+<a precise correction or verification test that can be applied during the solution>
+[Example]
+<a minimal independent example showing the failure and the corrected distinction>
+
+Selection procedure:
+1. Parse the literal domains, quantifiers, equality cases, multiplicities, ordering, endpoints, and stopping point.
+2. Infer the most natural solution route from the statement’s structure. Identify the earliest mistake on that route that could survive ordinary arithmetic checking and change the result.
+3. Prefer a problem-linked checkpoint over a generic warning. High-value targets include:
+   - using a necessary condition as sufficient or failing to verify the converse;
+   - producing candidates without proving the list exhaustive;
+   - claiming an optimum without checking attainability or the equality case;
+   - counting ordered objects when the result depends only on an unordered configuration, or losing multiplicities and fixed positions;
+   - admitting transformed solutions that violate integrality, positivity, distinctness, divisibility, domain, or denominator restrictions;
+   - using the wrong normalization, index, orientation, time step, or ground-contact count;
+   - mistaking repeated algebraic roots for distinct geometric intersections;
+   - assuming independence, uniformity, or a random mechanism not stated;
+   - treating a finite Taylor calculation as an analytic identity;
+   - replacing a vertex-disjoint, edge-disjoint, adjacent, or “exactly” condition by a weaker familiar condition.
+4. State the correction as an executable test: an equation to substitute back into, a range to exhaust, a bijection or symmetry rule, an equality-case check, a one-step recurrence check, or an explicit domain filter.
+5. Use a second block only for a genuinely different error of comparable importance. Do not manufacture a rare edge case merely to fill space.
+6. If the problem is elementary and has no deep structural trap, target the exact carry, remainder, slot count, event index, or endpoint convention most likely to cause the wrong computation.
+7. Treat answer-format text and multiple-choice layout as metadata. Warn about malformed or ambiguous wording only when it changes the feasible set or makes the requested quantity undefined; do not let such a warning replace an available mathematical checkpoint valid under all readings.
+
+Reliability gate:
+- Phrase each item as a possible solver error, not as an error known to occur.
+- The rule must be valid independently of the unknown answer and must not assume a particular intended solution.
+- Do not invent a hidden convention, omitted hypothesis, special counterexample, or likely numerical slip.
+- Make clear whether a condition is necessary, sufficient, or equivalent.
+- For exact counts and extrema, require a genuine completeness or optimality certificate, not the vague instruction to “check all cases.”
+- For ambiguity, present conditional consequences without choosing a reading based on expected answer shape or contest intent.
+- Verify that the example really exhibits the erroneous inference and that applying the rule rejects or corrects it. Show only the decisive calculation or logical contrast.
+- Keep the example substantially smaller and structurally simpler than the problem, and do not reuse distinctive numerical data or encode a problem-specific candidate.
+- Do not duplicate a full positive solution method in negative wording; isolate the failure checkpoint and its repair.
+- Match the language of the problem when practical.
+
+Hard constraints:
+- Use the literal [Error], [Rule], and [Example] headers for every block.
+- Every error and rule must be operationally specific; exclude “be careful,” “check arithmetic,” “consider edge cases,” and similar generic advice.
+- Never state, guess, encode, or imply the final answer, requested option, requested parameter combination, or a complete worked solution.
+- Output ONLY the structured blocks, with no title, preface, summary, confidence statement, or commentary.

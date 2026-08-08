@@ -1,0 +1,45 @@
+# TTS single-turn config: ALL ROLES = gpt-5.6-luna (Salesforce Research gateway).
+#
+# solver / skill_writer (correct + pitfall distillers) / optimizer all run on
+# gpt-5.6-luna over the OpenAI-compatible gateway. This is the "just run luna and
+# see how much it optimizes" config. Auth: SFT_GATEWAY_KEY as a Bearer token
+# (loaded from ~/gitproj/apis/.env by run-single-turn.sh); base_url from
+# OPENAI_API_URL (the gateway) -- set here explicitly so the config is
+# self-contained.
+#
+# luna is a reasoning model (gpt-5*): the openai backend automatically sends
+# max_completion_tokens and omits temperature/top_p for it.
+
+skill_mode: predict          # DEPLOYMENT-ALIGNED: predict skill from the bare problem
+                             # (no traces, no answer) -- same protocol as eval_tts.py.
+rounds: 3
+n_rollouts: 8                # rollouts per problem (the SDPO group size)
+concurrency: 8               # problems in flight at once
+grader: dapo                 # math: DAPO boxed / numeric grading
+default_domain: math
+
+skill_max_tokens: 4000       # luna reasoning tokens count against this budget
+solver_max_tokens: 8000
+optimizer_max_tokens: 12000
+max_correct_traces: 3        # cap traces fed to each distiller (token budget)
+max_failed_traces: 3
+
+engines:
+  solver:
+    backend: openai
+    model: gpt-5.6-luna
+    base_url: https://gateway.salesforceresearch.ai/openai/process/v1
+    api_key_env: SFT_GATEWAY_KEY
+    max_tokens: 8000
+  skill_writer:
+    backend: openai
+    model: gpt-5.6-luna
+    base_url: https://gateway.salesforceresearch.ai/openai/process/v1
+    api_key_env: SFT_GATEWAY_KEY
+    max_tokens: 4000
+  optimizer:
+    backend: openai
+    model: gpt-5.6-luna
+    base_url: https://gateway.salesforceresearch.ai/openai/process/v1
+    api_key_env: SFT_GATEWAY_KEY
+    max_tokens: 12000

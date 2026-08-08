@@ -1,0 +1,17 @@
+# τ²-bench (sierra-research/tau2-bench) has no clashing pins with a modern
+# stack -- confirmed via reading its pyproject.toml: litellm>=1.80.15,<1.82.7,
+# pandas>=2.2.3, numpy>=1.24.0, fastapi>=0.115.11, no legacy `gym` (only
+# `gymnasium` in an unused optional extra). The ONLY hard constraint is its
+# own Python>=3.12,<3.14 requirement (see ../docker/Dockerfile), which is why
+# this needs its own container at all -- not a dependency conflict, a runtime
+# version conflict with the training image's Python 3.10.
+#
+# Installed from git, NOT the PyPI package named "tau2" -- that name is
+# squatted by an unrelated physics/spectroscopy package (confirmed: its wheel
+# contains modules like `hysteresis`/`lineshapes`/`raman_calculator`, nothing
+# to do with agent benchmarking).
+git+https://github.com/sierra-research/tau2-bench.git
+fastapi==0.115.*
+# tau2 itself requires uvicorn>=0.34.0 (confirmed via a real pip
+# ResolutionImpossible failure pinning 0.32.*) -- match its own floor.
+uvicorn[standard]==0.34.*

@@ -79,8 +79,11 @@ from miles.utils.types import Sample
 from examples.SDPO.reward import (
     _extract_answer,
     _grade_group,
+    _grade_one_alfworld,
     _grade_one_code,
     _grade_one_search,
+    _grade_one_tau2,
+    _grade_one_webshop,
     _is_correct,
     _judge_semaphore,
     _llm_judge_correct,
@@ -2139,6 +2142,19 @@ async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> fl
         # that fallback might actually reach the judge gateway.
         async with _judge_semaphore(args):
             ok = await _grade_one_search(sample, args)
+    elif _sample_domain(sample) == "webshop":
+        # Webshop eval: same sidecar-stamped episode_won flag as training
+        # (reward.py's _grade_one_webshop) -- no judge/gateway call, so no
+        # semaphore needed here.
+        ok = _grade_one_webshop(sample, args)
+    elif _sample_domain(sample) == "alfworld":
+        ok = _grade_one_alfworld(sample, args)
+    elif _sample_domain(sample) == "tau2":
+        # tau2 eval: same sidecar-stamped reward as training (reward.py's
+        # _grade_one_tau2) -- no judge/gateway call, so no semaphore needed
+        # here (the tau2 sidecar itself already called the user-simulator
+        # LLM during orchestration; that's outside this function's scope).
+        ok = _grade_one_tau2(sample, args)
     elif getattr(args, "sdpo_judge", False) and (sample.response or "").strip():
         # Eval fans out one sdpo_eval_reward coroutine per sample via asyncio.gather
         # upstream, so honor the SAME global concurrency cap to avoid flooding the
