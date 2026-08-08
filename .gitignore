@@ -196,3 +196,5 @@ _examples_synced/
 .humanize/
 sdpo_dumps/
 examples/SDPO_ReAct/explog.jsonl
+examples/SDPO_ReAct/ablation/explog.jsonl
+examples/SDPO/ablation/explog.jsonl

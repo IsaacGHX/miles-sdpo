@@ -257,6 +257,9 @@ enroot start --rw \
         # Reuse SDPO'"'"'s idempotent sglang tolist patch (shared, algorithm-
         # agnostic infra -- see examples/SDPO/patch-sglang-tolist.sh).
         bash examples/SDPO/patch-sglang-tolist.sh
+        # Reuse SDPO'"'"'s idempotent sglang Olmo2/Olmo3 rope_theta patch --
+        # only relevant for SDPO_REACT_MODEL=olmo3, harmless no-op otherwise.
+        bash examples/SDPO/patch-sglang-olmo-rope.sh
 
         python -c "import miles; print(\"Miles import OK\")"
 

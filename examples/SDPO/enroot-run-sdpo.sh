@@ -73,6 +73,7 @@ enroot start --rw \
     --env PREP_ONLY="${PREP_ONLY:-0}" \
     --env SDPO_MODEL="${SDPO_MODEL:-olmo3-math-colocate}" \
     --env SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:-}" \
+    --env SDPO_ABLATION_ALGO="${SDPO_ABLATION_ALGO:-}" \
     --env MILES_NEMOTRONH_KEEP_MTP="${MILES_NEMOTRONH_KEEP_MTP:-}" \
     --env HF_HOME=/root/hf_cache \
     --env TRITON_CACHE_DIR=/root/caches/triton \
@@ -107,6 +108,18 @@ enroot start --rw \
                 HF_REPO=allenai/Olmo-3-7B-Instruct
                 MODEL_SH=scripts/models/olmo3-7B.sh
                 RUN_SH=examples/SDPO/run-olmo3-7B-sdpo-sci.sh
+                DATA_KIND=sci
+                ;;
+            olmo3-sci-ablation)
+                # Sibling of olmo3-sci-colocate: the new two-axis
+                # SDPO_ABLATION_ALGO x SDPO_ABLATION_ARM matrix script under
+                # examples/SDPO/ablation/, A100-80G-scoped + path-parameterized.
+                # Requires $SDPO_ABLATION_ALGO (grpo|sdpo|rlsd) and
+                # $SDPO_ABLATION_ARM (a|b|c|d|e|f).
+                MODEL_DIR=Olmo-3-7B-Instruct
+                HF_REPO=allenai/Olmo-3-7B-Instruct
+                MODEL_SH=scripts/models/olmo3-7B.sh
+                RUN_SH=examples/SDPO/ablation/run-olmo3-7B-sdpo-ablation-sci.sh
                 DATA_KIND=sci
                 ;;
             olmo3-sci-colocate)
@@ -214,6 +227,9 @@ enroot start --rw \
 
         # Patch the sglang tolist bug in this image (idempotent).
         bash examples/SDPO/patch-sglang-tolist.sh
+        # Patch the sglang Olmo2/Olmo3 rope_theta KeyError (idempotent) --
+        # only relevant for SDPO_MODEL=olmo3*, harmless no-op otherwise.
+        bash examples/SDPO/patch-sglang-olmo-rope.sh
 
         python -c "import miles; print(\"Miles import OK\")"
 
