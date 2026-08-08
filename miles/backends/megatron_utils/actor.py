@@ -21,7 +21,12 @@ from miles.utils.hf_config import load_hf_config
 from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.ray_utils import Box
-from miles.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+from miles.utils.reloadable_process_group import (
+    destroy_process_groups,
+    monkey_patch_dist_checkpointing_merge,
+    monkey_patch_torch_dist,
+    reload_process_groups,
+)
 from miles.utils.replay_base import all_replay_managers, routing_replay_manager
 from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils import init_tracking
@@ -120,6 +125,7 @@ class MegatronTrainRayActor(TrainRayActor):
         with_opd_teacher: bool = False,
     ) -> int | None:
         monkey_patch_torch_dist()
+        monkey_patch_dist_checkpointing_merge()
 
         super().init(args, role, with_ref, with_opd_teacher=with_opd_teacher)
 
