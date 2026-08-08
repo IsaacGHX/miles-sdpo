@@ -1548,6 +1548,22 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sdpo-search-judge-fallback",
+                action="store_true",
+                default=False,
+                help=(
+                    "Search/QA domain double-check: EM (exact-match against golden_answers) grades "
+                    "first as usual; ONLY when EM says 'wrong' does this ask the LLM judge (same "
+                    "--sdpo-judge-base-url/-model/-api-key-env gateway as --sdpo-judge) for a second "
+                    "opinion before finalizing 'incorrect'. Reduces EM's false negatives (a correct "
+                    "answer phrased differently than the one golden string it happens to compare "
+                    "against) without touching an EM hit or spending judge calls on already-correct "
+                    "traces. Independent of --sdpo-judge (which replaces math/mcq grading entirely); "
+                    "this only ever narrows search's 'incorrect' set, never widens it beyond EM's own "
+                    "'correct' set."
+                ),
+            )
+            parser.add_argument(
                 "--sdpo-grader",
                 type=str,
                 choices=["mcq", "dapo"],
@@ -1685,6 +1701,26 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=512,
                 help="max_new_tokens for the self-skill generation call during rollout.",
+            )
+            parser.add_argument(
+                "--sdpo-eval-skill-mode",
+                type=str,
+                choices=["off", "correct", "pitfall", "all"],
+                default="off",
+                help=(
+                    "EVAL-time skill augmentation: before the real eval rollout, self-generate a "
+                    "blind, problem-only skill (same self-predict prompts as training's blind-"
+                    "correct/pitfall-condense skill-gen) and splice it into the eval prompt's user "
+                    "turn, so eval measures the model answering WITH its own self-predicted skill "
+                    "already in context -- not auto-derived from --sdpo-skill-kd-mode, set it "
+                    "manually to match whichever skill type(s) that run actually trained. 'off' "
+                    "(default): no augmentation. 'correct': self-predict the knowledge/rules skill "
+                    "only (e.g. for a run trained with skill-kd-mode self-success/blind-correct). "
+                    "'pitfall': self-predict the pitfalls-to-avoid skill only (e.g. for "
+                    "pitfall-condense). 'all': self-predict BOTH and concatenate both (e.g. for "
+                    "both/both-blind). Requires wiring --custom-generate-function-path "
+                    "examples.SDPO.sdpo.sdpo_eval_generate; a no-op during training regardless."
+                ),
             )
             parser.add_argument(
                 "--sdpo-skill-source",
@@ -2927,6 +2963,22 @@ def miles_validate_args(args):
             raise ValueError("--sdpo-rlsd and --sdpo-kd-loss are mutually exclusive (alternative KD mechanisms).")
         if args.use_opd:
             raise ValueError("--sdpo-rlsd and --use-opd are mutually exclusive (alternative KD mechanisms).")
+
+    # --sdpo-eval-skill-mode only takes effect through the custom eval generate
+    # function (sdpo_eval_generate) that actually performs the skill-splice; a
+    # mode set without wiring that function would silently no-op every eval.
+    if getattr(args, "sdpo_eval_skill_mode", "off") != "off":
+        eval_datasets = getattr(args, "eval_datasets", None) or []
+        wired = getattr(args, "custom_generate_function_path", None) == "examples.SDPO.sdpo.sdpo_eval_generate" or any(
+            getattr(d, "custom_generate_function_path", None) == "examples.SDPO.sdpo.sdpo_eval_generate"
+            for d in eval_datasets
+        )
+        if not wired:
+            raise ValueError(
+                "--sdpo-eval-skill-mode is set but --custom-generate-function-path "
+                "examples.SDPO.sdpo.sdpo_eval_generate is not wired (globally or per eval dataset) -- "
+                "the mode would silently no-op every eval rollout."
+            )
 
     # Validate on-policy distillation (OPD) arguments
     if args.use_opd:
