@@ -1,0 +1,19 @@
+# Checkpoint-save reliability tweaks for the 35B-A3B MoE run, applied via
+# --custom-config-path (miles applies this via setattr in miles_validate_args,
+# which runs BEFORE megatron_validate_args -- see
+# miles/utils/reloadable_process_group.py's docstrings for the general pattern
+# of config-dataclass-only Megatron fields that have no CLI flag).
+#
+# ckpt_fully_parallel_save: false -- disables Megatron's fully-parallel
+# checkpoint-save strategy (dist_checkpointing/strategies/fully_parallel.py),
+# which routes each rank's shard through torch's PyTorchStreamWriter async
+# writer. Observed live: that writer hit an internal position-tracking
+# assertion on /fsx (a network filesystem) -- "[enforce fail at
+# inline_container.cc:672] . unexpected pos 704 vs 598" -- a known-flaky
+# combination of torch's async DCP writer + non-local/network storage, NOT
+# related to the fully_reshardable-vs-dp_reshardable choice (this happened on
+# a plain dp_reshardable save). Disabling fully-parallel save routes each
+# rank's shard through the simpler synchronous single-writer path, which is
+# slower per-rank but avoids the concurrent-writer race that trips the
+# assertion on Lustre/NFS-backed paths.
+ckpt_fully_parallel_save: false
