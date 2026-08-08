@@ -1,0 +1,32 @@
+# --eval-config for the TAU2 domain (retail/airline/telecom).
+#
+# Three held-out sets, one per tau2 subdomain (built by data/
+# build_tau2_data.py from inclusionAI/AReaL-tau2-data, mirrors
+# eval_alfworld.yaml's multi-split shape). Grading routes via
+# metadata['domain']=='tau2' -> _grade_one_tau2 (reward stamped by
+# tools/tau2/agent_function.py from the sidecar's evaluate_simulation()
+# call).
+#
+# No tool_key/input_key overrides needed -- tau2 rows carry tools:[] (tau2's
+# own tool schemas live inside the sidecar's Environment, not this repo's
+# tool-spec mechanism) and prompt/label are placeholders (the real
+# conversation is driven entirely by tau2's Orchestrator, see
+# tools/tau2/agent_function.py's module docstring).
+eval:
+  defaults:
+    max_response_len: 8192
+    top_p: 1.0
+    metadata_key: metadata
+  datasets:
+    - name: tau2_retail
+      path: /root/data/tau2_data/tau2_retail_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+    - name: tau2_airline
+      path: /root/data/tau2_data/tau2_airline_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+    - name: tau2_telecom
+      path: /root/data/tau2_data/tau2_telecom_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}

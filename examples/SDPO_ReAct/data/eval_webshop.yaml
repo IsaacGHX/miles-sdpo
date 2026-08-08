@@ -1,0 +1,19 @@
+# --eval-config for the WEBSHOP domain.
+#
+# Held-out WebShop task-index range (built by data/build_webshop_data.py --
+# reuses SDAR's own <500 held-out convention). Grading routes via
+# metadata['domain']=='webshop' -> _grade_one_webshop (episode_won, stamped
+# by tools/webshop/client.py at a terminal step -- see that module).
+eval:
+  defaults:
+    max_response_len: 8192
+    top_p: 1.0
+    tool_key: tools
+    metadata_key: metadata
+  datasets:
+    - name: webshop
+      path: /root/data/webshop_data/webshop_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
