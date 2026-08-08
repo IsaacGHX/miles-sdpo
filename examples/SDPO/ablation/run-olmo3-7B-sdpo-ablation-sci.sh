@@ -100,7 +100,7 @@
 # Other env overrides:
 #   SDPO_ABLATION_ALGO           (required) grpo | sdpo | rlsd
 #   SDPO_ABLATION_ARM            (required) a | b | c | d | e | f
-#   SDPO_ABLATION_NUM_ROLLOUT    (default 101 -- per spec, single-step/sci uses 101)
+#   SDPO_ABLATION_NUM_ROLLOUT    (default 201 -- per user request 2026-08-08, bumped from spec default 101)
 #   SDPO_ABLATION_MAX_TOKENS_PER_GPU  (default 8192, 4096 for arms e/f)
 #   SDPO_ABLATION_SGLANG_MEM_FRACTION (default 0.6)
 #
@@ -125,7 +125,7 @@ if [ "$SDPO_ABLATION_ALGO" = "grpo" ]; then
         *) echo "GRPO only supports arms a/e/f (got '${SDPO_ABLATION_ARM}')" >&2; exit 1 ;;
     esac
 fi
-SDPO_ABLATION_NUM_ROLLOUT="${SDPO_ABLATION_NUM_ROLLOUT:-101}"
+SDPO_ABLATION_NUM_ROLLOUT="${SDPO_ABLATION_NUM_ROLLOUT:-201}"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then HAS_NVLINK=1; else HAS_NVLINK=0; fi
