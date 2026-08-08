@@ -124,6 +124,8 @@ enroot start --rw \
     --env GEMINI_API_KEY="${GEMINI_API_KEY:-}" \
     --env DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}" \
     --env SDPO_REACT_ARM="${SDPO_REACT_ARM:-}" \
+    --env SDPO_ABLATION_ALGO="${SDPO_ABLATION_ALGO:-}" \
+    --env SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:-}" \
     --env SDPO_REACT_PROMPT="${SDPO_REACT_PROMPT:-}" \
     --env SDPO_REACT_NUM_ROLLOUT="${SDPO_REACT_NUM_ROLLOUT:-}" \
     --env SDPO_REACT_THINKING="${SDPO_REACT_THINKING:-}" \
@@ -221,6 +223,20 @@ enroot start --rw \
                 # the large-model run script switches on SDPO_REACT_MODEL, so
                 # normalize it to the value that script expects.
                 export SDPO_REACT_MODEL=qwen3.5-27B
+                ;;
+            qwen3.5-9B)
+                # Qwen3.5-9B ablation matrix (examples/SDPO_ReAct/ablation/) --
+                # the two-axis SDPO_ABLATION_ALGO x SDPO_ABLATION_ARM scripts,
+                # not the older single-axis SDPO_REACT_ARM ones. NATIVE_RUN_SH/
+                # AGENTIC_RUN_SH point at the tau2 scripts mathcodesearch/
+                # alfworld-webshop siblings so this stays a single coherent
+                # switch if those get exercised through this launcher too.
+                MODEL_DIR=Qwen3.5-9B
+                HF_REPO=Qwen/Qwen3.5-9B
+                MODEL_SH=scripts/models/qwen3.5-9B.sh
+                NATIVE_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-mathcodesearch.sh
+                AGENTIC_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-alfworld-webshop.sh
+                TAU2_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-tau2.sh
                 ;;
             qwen3.5-35B-A3B)
                 # Qwen3.5-35B-A3B MoE (256 experts, top-8, ~3B active). Same arms;

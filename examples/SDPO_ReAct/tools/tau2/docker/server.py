@@ -158,6 +158,15 @@ class RunResponse(BaseModel):
     messages: list[dict]
     termination_reason: str
     task_id: str
+    # Per-RewardType score breakdown (DB/ENV_ASSERTION/ACTION/COMMUNICATE, +
+    # NL_ASSERTION for telecom's NL-assertion checks) -- evaluate_simulation
+    # multiplies these together into the single `reward` above, but each is
+    # useful on its own (e.g. "did the agent take the right actions" vs "did
+    # it communicate correctly" vs "is the DB in the right end state" fail
+    # independently and look identical in the pooled reward alone). Keys are
+    # RewardType enum VALUES (plain strings, e.g. "DB"/"ACTION"), not the
+    # enum objects themselves (Pydantic/JSON can't serialize those directly).
+    reward_breakdown: dict[str, float] = {}
 
 
 def _run_task_sync(req: RunRequest) -> RunResponse:
@@ -224,11 +233,16 @@ def _run_task_sync(req: RunRequest) -> RunResponse:
     )
     simulation.reward_info = reward_info
 
+    reward_breakdown = {
+        rt.value: float(v) for rt, v in (reward_info.reward_breakdown or {}).items()
+    }
+
     return RunResponse(
         reward=float(reward_info.reward),
         messages=[m.model_dump(mode="json") for m in (simulation.messages or [])],
         termination_reason=str(simulation.termination_reason),
         task_id=task.id,
+        reward_breakdown=reward_breakdown,
     )
 
 

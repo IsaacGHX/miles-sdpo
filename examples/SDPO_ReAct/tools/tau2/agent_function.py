@@ -135,6 +135,16 @@ async def run(
         logger.error(f"tau2 sidecar call failed: {e}")
         return None
 
+    # Per-RewardType score breakdown (DB/ENV_ASSERTION/ACTION/COMMUNICATE, +
+    # NL_ASSERTION on telecom) -- evaluate_simulation multiplies these into
+    # the single scalar reward above, so a 0.0 doesn't say WHICH check(s)
+    # failed. Stashed with a tau2_reward_ prefix per key (e.g.
+    # tau2_reward_DB, tau2_reward_ACTION) so miles/ray/rollout/metrics.py's
+    # per-domain eval aggregation (any metadata key -> mean) picks each up
+    # as its own wandb series without any parsing on the metrics side.
+    reward_breakdown = response.get("reward_breakdown") or {}
+    breakdown_fields = {f"tau2_reward_{k}": float(v) for k, v in reward_breakdown.items()}
+
     return {
         # Constant "tau2" (not "tau2_retail" etc) for reward-dispatch routing
         # -- same pattern as alfworld, where metadata["domain"]=="alfworld"
@@ -147,4 +157,5 @@ async def run(
         "tau2_messages": response.get("messages", []),
         "tau2_termination_reason": response.get("termination_reason", ""),
         "tau2_task_id": response.get("task_id", ""),
+        **breakdown_fields,
     }

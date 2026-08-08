@@ -166,6 +166,7 @@ def _compute_metrics_from_samples(args, samples):
 
     log_dict |= _compute_agentic_tool_metrics(args, samples)
     log_dict |= _compute_per_domain_metrics(args, samples)
+    log_dict |= _compute_reward_breakdown_metrics(args, samples)
 
     tito_vals = [s.metadata.get("tito_session_mismatch") for s in samples]
     tito_vals = [v for v in tito_vals if v is not None]
@@ -322,6 +323,33 @@ def _compute_per_domain_metrics(args, all_samples: list[Sample]):
         tcc = [s.metadata["tool_call_count"] for s in subset if isinstance(s.metadata, dict) and "tool_call_count" in s.metadata]
         if tcc:
             out[p + "zero_tool_call_frac"] = float(np.mean([int(t == 0) for t in tcc]))
+    return out
+
+
+def _compute_reward_breakdown_metrics(args, all_samples: list[Sample]):
+    """Generic per-component reward breakdown, for domains whose grader
+    computes a reward from several independent checks (e.g. tau2's DB/
+    ENV_ASSERTION/ACTION/COMMUNICATE/NL_ASSERTION checks, multiplied
+    together into the single scalar sample.reward -- a 0.0 doesn't say
+    WHICH check failed). No-op (empty dict) unless a custom generate/reward
+    function stashed one or more `tau2_reward_<COMPONENT>` keys on
+    sample.metadata (see examples/SDPO_ReAct/tools/tau2/agent_function.py).
+
+    Emits, under the reward_breakdown/ panel: reward_breakdown/<component>
+    (mean across samples that have that key -- not every sample necessarily
+    has every component, e.g. NL_ASSERTION only appears on tasks that carry
+    NL assertions).
+    """
+    keys = set()
+    for s in all_samples:
+        if isinstance(s.metadata, dict):
+            keys.update(k for k in s.metadata if k.startswith("tau2_reward_"))
+    out = {}
+    for key in sorted(keys):
+        vals = [s.metadata[key] for s in all_samples if isinstance(s.metadata, dict) and key in s.metadata]
+        if vals:
+            component = key[len("tau2_reward_") :]
+            out[f"reward_breakdown/{component}"] = float(np.mean(vals))
     return out
 
 
