@@ -351,6 +351,15 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static "${SDPO_ABLATION_SGLANG_MEM_FRACTION:-0.6}"
+   # Confirmed live (2026-08-09, 8xH200): the default 60s flush_cache
+   # timeout (RolloutManager.offload -> SGLangEngine.release_memory_
+   # occupation -> flush_cache) can fire while a genuinely still-decoding
+   # tau2 session (observed 125K+ tokens) is holding the engine, since
+   # /flush_cache only returns 200 once all in-flight generation drains.
+   # This is a real long-tail latency in this domain, not a memory-pressure
+   # issue -- raising --max-tokens-per-gpu/--sglang-mem-fraction-static
+   # does not fix it. 300s gives slow episodes room to finish first.
+   --sglang-flush-cache-timeout "${SDPO_REACT_FLUSH_CACHE_TIMEOUT:-300}"
 )
 
 MISC_ARGS=(

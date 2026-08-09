@@ -41,7 +41,14 @@ from miles.utils.http_utils import post
 
 logger = logging.getLogger(__name__)
 
-TAU2_SIDECAR_URL = os.environ.get("SDPO_REACT_TAU2_SIDECAR_URL", "http://127.0.0.1:8424")
+# os.environ.get's default only applies when the key is ABSENT -- the enroot
+# launchers pass every optional override as `--env VAR="${VAR:-}"` (empty
+# string, not unset, when the user didn't set it), so an `or` fallback is
+# required here, not a dict .get default (confirmed live: an empty-string
+# SDPO_REACT_TAU2_SIDECAR_URL collapsed this to "/run", a path with no host,
+# which every httpx call then silently retried 60x with "Request URL is
+# missing an 'http://' or 'https://' protocol").
+TAU2_SIDECAR_URL = os.environ.get("SDPO_REACT_TAU2_SIDECAR_URL") or "http://127.0.0.1:8424"
 
 # User-simulator model. Default: the Salesforce Research gateway's
 # gpt-5.6-luna (SFT_GATEWAY_KEY/OPENAI_API_URL, loaded from ~/gitproj/apis/

@@ -40,6 +40,22 @@ def add_sglang_arguments(parser):
     """
     parser = add_sglang_router_arguments(parser)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    parser.add_argument(
+        "--sglang-flush-cache-timeout",
+        type=int,
+        default=60,
+        help=(
+            "Seconds to poll GET /flush_cache before giving up (SGLangEngine.flush_cache, "
+            "1 attempt/sec). /flush_cache returns non-200 while the server still has requests "
+            "in flight, so this is really 'how long to wait for in-flight generation to drain "
+            "before offload'. The default (60s) can be too short for domains with very long "
+            "individual episodes (e.g. tau2-bench conversations that can exceed 100K tokens) -- "
+            "confirmed live: a still-decoding 125K-token session caused release_memory_occupation "
+            "to raise TimeoutError at the default value. Raise this for such domains rather than "
+            "lowering --sglang-mem-fraction-static or --max-tokens-per-gpu, which don't address "
+            "the actual cause (a single slow generation, not memory pressure)."
+        ),
+    )
 
     old_add_argument = parser.add_argument
 
