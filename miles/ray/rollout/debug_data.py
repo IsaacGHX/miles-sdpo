@@ -45,7 +45,14 @@ def _write_samples_jsonl(path: Path, rollout_id, samples: list[dict]) -> None:
             # empty (every row's "task_type"/"tau2_domain" column was NaN,
             # `if "task_type" in group.columns` never caught it because the
             # DataFrame still had a "domain" column, just not this one).
-            for mk in ("sdpo_correct", "sdpo_ppl", "domain", "task_type", "tau2_domain"):
+            # "tau2_messages": tau2 samples never populate prompt/response (the
+            # conversation is driven externally by tau2's own Orchestrator, see
+            # tools/tau2/agent_function.py's module docstring) -- sample.prompt
+            # is a fixed placeholder string, so without this key a tau2 row's
+            # rollout_data dump has no trace of the real conversation at all,
+            # including the user's actual first turn. tau2_messages (already
+            # {role, content, tool_calls}-shaped) IS that real conversation.
+            for mk in ("sdpo_correct", "sdpo_ppl", "domain", "task_type", "tau2_domain", "tau2_messages"):
                 if mk in meta:
                     row[mk] = _jsonl_safe(meta[mk])
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
