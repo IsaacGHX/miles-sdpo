@@ -45,6 +45,12 @@ class GenerateState:
 
         self.generate_function = load_generate_function(args.custom_generate_function_path) or generate
 
+        # Current train step, stamped by generate_rollout_async each step; None
+        # during eval. Generate functions may copy it onto sample.metadata for
+        # per-step dump splitting. Initialized here so eval (which never sets it)
+        # can still read it without AttributeError.
+        self.rollout_id: int | None = None
+
         self.reset()
 
     def reset(self) -> None:

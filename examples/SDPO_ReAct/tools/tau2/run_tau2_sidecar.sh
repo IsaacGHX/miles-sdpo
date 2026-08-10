@@ -63,9 +63,20 @@ docker build -t "$IMAGE_TAG" "$SCRIPT_DIR/docker"
 # whatever PORT this launcher was given -- no -p remapping exists in this
 # mode. TAU2_SIDECAR_PORT (Dockerfile's ENV, read by its shell-form CMD)
 # carries the override in.
-docker run -d --rm \
+#
+# --restart unless-stopped (NOT --rm): confirmed live (2026-08-09) a training
+# job crashed after ~30min when this sidecar segfaulted (exit code 139,
+# docker events) under sustained load -- with --rm the dead container was
+# gone for good, so every subsequent tau2 sample got "All connection attempts
+# failed" for the rest of the multi-hour job, one crashed container taking
+# down the whole run. The dynamic-sampling filter's own None-reward guard
+# (miles/rollout/filter_hub/dynamic_sampling_filters.py) now drops the
+# affected groups instead of raising, but the sidecar itself should also come
+# back on its own rather than staying dead.
+docker run -d \
     --name "$CONTAINER" \
     --network=host \
+    --restart unless-stopped \
     -e "TAU2_SIDECAR_PORT=${PORT}" \
     "$IMAGE_TAG"
 

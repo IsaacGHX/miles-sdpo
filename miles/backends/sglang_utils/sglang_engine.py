@@ -419,7 +419,8 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         # flush cache will not return status_code 200 when there are pending requests
-        for _ in range(60):
+        timeout = getattr(self.args, "sglang_flush_cache_timeout", 60)
+        for _ in range(timeout):
             try:
                 response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
                 if response.status_code == 200:

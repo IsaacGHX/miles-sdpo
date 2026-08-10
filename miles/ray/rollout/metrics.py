@@ -29,7 +29,14 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
     all_rewards: list[float] = []  # pooled across all eval datasets for eval/all
     per_dataset_acc: list[float] = []  # per-dataset acc for the equal-weight eval/mean
     for key in data.keys():
-        rewards = data[key]["rewards"]
+        # A sample can reach eval aggregation with reward=None (e.g. an agentic
+        # episode that timed out / never recorded a model call, so no RM ever
+        # ran on it -- see miles.rollout.generate_hub.agentic_tool_call.generate's
+        # ABORTED path). Treat that the same as a failed episode (0.0) rather
+        # than crashing the whole eval on `sum(rewards)` -- one slow tau2/
+        # webshop/alfworld episode under real infra load must not take down
+        # every OTHER dataset's score in the same eval pass.
+        rewards = [r if r is not None else 0.0 for r in data[key]["rewards"]]
         all_rewards.extend(rewards)
         dataset_acc = sum(rewards) / len(rewards)
         per_dataset_acc.append(dataset_acc)
@@ -87,11 +94,15 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
 
     sample_metrics = _compute_metrics_from_samples(args, samples)
     log_dict = {**(rollout_extra_metrics or {})}
-    # skill/* already carry their own panel prefix -> keep them top-level (NOT under
-    # rollout/); everything else goes under rollout/.
-    log_dict |= dict_add_prefix({k: v for k, v in sample_metrics.items() if not k.startswith("skill/")}, "rollout/")
+    # skill/* and domain/* already carry their own panel prefix -> keep them
+    # top-level (NOT under rollout/) so they show as their own wandb panels
+    # (skill/, domain/code/, domain/math/, ...); everything else goes under rollout/.
+    _own_panel = ("skill/", "domain/")
+    log_dict |= dict_add_prefix(
+        {k: v for k, v in sample_metrics.items() if not k.startswith(_own_panel)}, "rollout/"
+    )
     for k, v in sample_metrics.items():
-        if k.startswith("skill/"):
+        if k.startswith(_own_panel):
             log_dict[k] = v
     log_dict |= dict_add_prefix(_compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
     # Dedicated "response_len/" panel: all length-related metrics in one place.
@@ -161,6 +172,8 @@ def _compute_metrics_from_samples(args, samples):
         log_dict["skill/response_prefix_is_skill_frac"] = float(np.mean(rp_skill))
 
     log_dict |= _compute_agentic_tool_metrics(args, samples)
+    log_dict |= _compute_per_domain_metrics(args, samples)
+    log_dict |= _compute_reward_breakdown_metrics(args, samples)
 
     tito_vals = [s.metadata.get("tito_session_mismatch") for s in samples]
     tito_vals = [v for v in tito_vals if v is not None]
@@ -274,6 +287,77 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+
+def _compute_per_domain_metrics(args, all_samples: list[Sample]):
+    """Per-task-type (domain) breakdown of the key training metrics, for MIXED
+    multi-task rollouts (e.g. shuffled math + code + search). Groups samples by
+    metadata['domain'] and emits, under a per-domain panel `domain/<name>/...`:
+      - success_rate (sdpo_correct), count, frac_of_batch
+      - response_len_mean, truncated_ratio
+      - tool_call_count_mean, zero_tool_call_frac, round_number_mean
+    So math vs code vs search progress is visible separately (an aggregate hides
+    which domain is improving/collapsing). No-op (empty) when all samples share
+    ONE domain -- single-domain runs already have the global metrics above, so
+    this only adds panels when there's genuinely a mix to break out."""
+    def _dom(s):
+        md = s.metadata if isinstance(s.metadata, dict) else {}
+        return (md.get("domain") or "math").strip().lower()
+
+    by_domain: dict[str, list[Sample]] = {}
+    for s in all_samples:
+        by_domain.setdefault(_dom(s), []).append(s)
+    if len(by_domain) <= 1:
+        return {}
+
+    def _meanmd(subset, key):
+        vals = [s.metadata[key] for s in subset if isinstance(s.metadata, dict) and key in s.metadata]
+        return float(np.mean(vals)) if vals else None
+
+    out = {}
+    n_total = len(all_samples)
+    for dom, subset in sorted(by_domain.items()):
+        p = f"domain/{dom}/"
+        out[p + "count"] = float(len(subset))
+        out[p + "frac_of_batch"] = len(subset) / n_total if n_total else 0.0
+        out[p + "response_len_mean"] = float(np.mean([s.effective_response_length for s in subset]))
+        out[p + "truncated_ratio"] = float(np.mean([int(s.status == Sample.Status.TRUNCATED) for s in subset]))
+        for mkey, okey in (("sdpo_correct", "success_rate"), ("tool_call_count", "tool_call_count_mean"),
+                           ("round_number", "round_number_mean"), ("tool_error_count", "tool_error_count_mean")):
+            v = _meanmd(subset, mkey)
+            if v is not None:
+                out[p + okey] = v
+        tcc = [s.metadata["tool_call_count"] for s in subset if isinstance(s.metadata, dict) and "tool_call_count" in s.metadata]
+        if tcc:
+            out[p + "zero_tool_call_frac"] = float(np.mean([int(t == 0) for t in tcc]))
+    return out
+
+
+def _compute_reward_breakdown_metrics(args, all_samples: list[Sample]):
+    """Generic per-component reward breakdown, for domains whose grader
+    computes a reward from several independent checks (e.g. tau2's DB/
+    ENV_ASSERTION/ACTION/COMMUNICATE/NL_ASSERTION checks, multiplied
+    together into the single scalar sample.reward -- a 0.0 doesn't say
+    WHICH check failed). No-op (empty dict) unless a custom generate/reward
+    function stashed one or more `tau2_reward_<COMPONENT>` keys on
+    sample.metadata (see examples/SDPO_ReAct/tools/tau2/agent_function.py).
+
+    Emits, under the reward_breakdown/ panel: reward_breakdown/<component>
+    (mean across samples that have that key -- not every sample necessarily
+    has every component, e.g. NL_ASSERTION only appears on tasks that carry
+    NL assertions).
+    """
+    keys = set()
+    for s in all_samples:
+        if isinstance(s.metadata, dict):
+            keys.update(k for k in s.metadata if k.startswith("tau2_reward_"))
+    out = {}
+    for key in sorted(keys):
+        vals = [s.metadata[key] for s in all_samples if isinstance(s.metadata, dict) and key in s.metadata]
+        if vals:
+            component = key[len("tau2_reward_") :]
+            out[f"reward_breakdown/{component}"] = float(np.mean(vals))
+    return out
 
 
 def _compute_agentic_tool_metrics(args, all_samples: list[Sample]):

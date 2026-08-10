@@ -653,15 +653,21 @@ def policy_loss_function(
                 if isinstance(sdpo_kd_clip_cov_frac, torch.Tensor)
                 else sdpo_kd_clip_cov_frac
             )
-    # Skill-KD's own report is gated on run_kd (sdpo_kd_loss OR sdpo_skill_kd),
-    # not sdpo_kd_loss alone -- under --sdpo-rlsd, sdpo_kd_loss is always False
-    # (mutually exclusive, see loss_hub/rlsd.py), but skill-KD still runs (see
-    # run_kd above) and sdpo_skill_kd_loss/skill_entropy are real, non-zero
-    # values that were silently never reaching wandb's skill/ panel before
-    # this fix -- reported_loss's key set only needs to match across
-    # microbatches of the SAME run, and run_kd is already a run-level
-    # (not per-microbatch) condition, so this is safe.
-    if run_kd and getattr(args, "sdpo_skill_kd", False):
+    # Skill-KD's own report is gated on the run-level --sdpo-skill-kd flag
+    # ALONE, not on run_kd -- run_kd also requires skill_tok_mask is not None,
+    # which is computed PER MICROBATCH (None whenever that microbatch happens
+    # to contain zero skill-tagged samples, e.g. under dynamic microbatching).
+    # Gating reported_loss's key set on run_kd made these 4 keys appear only
+    # on microbatches that happened to have a skill sample, so
+    # aggregate_train_losses' positional sum across microbatches saw
+    # mismatched tensor lengths and crashed ("size of tensor a (13) must
+    # match size of tensor b (18)") -- observed live, deterministically, on
+    # every arm-5/5.1 attempt. sdpo_skill_kd_loss/_correct/_pitfall are
+    # zero-initialized above regardless of skill_tok_mask, so gating on the
+    # plain flag (a true run-level condition) is safe: microbatches without
+    # skill samples just report 0 for these keys, exactly like
+    # entropy_denom's "stable key set" fix above.
+    if getattr(args, "sdpo_skill_kd", False):
         reported_loss["sdpo_skill_kd_loss"] = sdpo_skill_kd_loss.clone().detach()
         # dedicated skill/ panel: skill KD (= skill "kl") and skill-token entropy.
         reported_loss["skill/kl"] = sdpo_skill_kd_loss.clone().detach()

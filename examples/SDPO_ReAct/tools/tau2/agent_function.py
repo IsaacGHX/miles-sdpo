@@ -41,7 +41,14 @@ from miles.utils.http_utils import post
 
 logger = logging.getLogger(__name__)
 
-TAU2_SIDECAR_URL = os.environ.get("SDPO_REACT_TAU2_SIDECAR_URL", "http://127.0.0.1:8424")
+# os.environ.get's default only applies when the key is ABSENT -- the enroot
+# launchers pass every optional override as `--env VAR="${VAR:-}"` (empty
+# string, not unset, when the user didn't set it), so an `or` fallback is
+# required here, not a dict .get default (confirmed live: an empty-string
+# SDPO_REACT_TAU2_SIDECAR_URL collapsed this to "/run", a path with no host,
+# which every httpx call then silently retried 60x with "Request URL is
+# missing an 'http://' or 'https://' protocol").
+TAU2_SIDECAR_URL = os.environ.get("SDPO_REACT_TAU2_SIDECAR_URL") or "http://127.0.0.1:8424"
 
 # User-simulator model. Default: the Salesforce Research gateway's
 # gpt-5.6-luna (SFT_GATEWAY_KEY/OPENAI_API_URL, loaded from ~/gitproj/apis/
@@ -135,6 +142,16 @@ async def run(
         logger.error(f"tau2 sidecar call failed: {e}")
         return None
 
+    # Per-RewardType score breakdown (DB/ENV_ASSERTION/ACTION/COMMUNICATE, +
+    # NL_ASSERTION on telecom) -- evaluate_simulation multiplies these into
+    # the single scalar reward above, so a 0.0 doesn't say WHICH check(s)
+    # failed. Stashed with a tau2_reward_ prefix per key (e.g.
+    # tau2_reward_DB, tau2_reward_ACTION) so miles/ray/rollout/metrics.py's
+    # per-domain eval aggregation (any metadata key -> mean) picks each up
+    # as its own wandb series without any parsing on the metrics side.
+    reward_breakdown = response.get("reward_breakdown") or {}
+    breakdown_fields = {f"tau2_reward_{k}": float(v) for k, v in reward_breakdown.items()}
+
     return {
         # Constant "tau2" (not "tau2_retail" etc) for reward-dispatch routing
         # -- same pattern as alfworld, where metadata["domain"]=="alfworld"
@@ -147,4 +164,5 @@ async def run(
         "tau2_messages": response.get("messages", []),
         "tau2_termination_reason": response.get("termination_reason", ""),
         "tau2_task_id": response.get("task_id", ""),
+        **breakdown_fields,
     }

@@ -124,6 +124,8 @@ enroot start --rw \
     --env GEMINI_API_KEY="${GEMINI_API_KEY:-}" \
     --env DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}" \
     --env SDPO_REACT_ARM="${SDPO_REACT_ARM:-}" \
+    --env SDPO_ABLATION_ALGO="${SDPO_ABLATION_ALGO:-}" \
+    --env SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:-}" \
     --env SDPO_REACT_PROMPT="${SDPO_REACT_PROMPT:-}" \
     --env SDPO_REACT_NUM_ROLLOUT="${SDPO_REACT_NUM_ROLLOUT:-}" \
     --env SDPO_REACT_THINKING="${SDPO_REACT_THINKING:-}" \
@@ -135,6 +137,8 @@ enroot start --rw \
     --env SDPO_REACT_ROLLOUT_BATCH="${SDPO_REACT_ROLLOUT_BATCH:-}" \
     --env SDPO_REACT_TP="${SDPO_REACT_TP:-}" \
     --env SDPO_REACT_MAX_TOKENS_PER_GPU="${SDPO_REACT_MAX_TOKENS_PER_GPU:-}" \
+    --env SDPO_ABLATION_MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-}" \
+    --env SDPO_ABLATION_SGLANG_MEM_FRACTION="${SDPO_ABLATION_SGLANG_MEM_FRACTION:-}" \
     --env SDPO_REACT_EP_SIZE="${SDPO_REACT_EP_SIZE:-}" \
     --env SDPO_REACT_R3="${SDPO_REACT_R3:-}" \
     --env SDPO_REACT_OPT_CPU_OFFLOAD="${SDPO_REACT_OPT_CPU_OFFLOAD:-}" \
@@ -222,6 +226,20 @@ enroot start --rw \
                 # normalize it to the value that script expects.
                 export SDPO_REACT_MODEL=qwen3.5-27B
                 ;;
+            qwen3.5-9B)
+                # Qwen3.5-9B ablation matrix (examples/SDPO_ReAct/ablation/) --
+                # the two-axis SDPO_ABLATION_ALGO x SDPO_ABLATION_ARM scripts,
+                # not the older single-axis SDPO_REACT_ARM ones. NATIVE_RUN_SH/
+                # AGENTIC_RUN_SH point at the tau2 scripts mathcodesearch/
+                # alfworld-webshop siblings so this stays a single coherent
+                # switch if those get exercised through this launcher too.
+                MODEL_DIR=Qwen3.5-9B
+                HF_REPO=Qwen/Qwen3.5-9B
+                MODEL_SH=scripts/models/qwen3.5-9B.sh
+                NATIVE_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-mathcodesearch.sh
+                AGENTIC_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-alfworld-webshop.sh
+                TAU2_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-tau2.sh
+                ;;
             qwen3.5-35B-A3B)
                 # Qwen3.5-35B-A3B MoE (256 experts, top-8, ~3B active). Same arms;
                 # the large-model launcher sets EP=8 + R3 rollout-routing-replay
@@ -257,6 +275,9 @@ enroot start --rw \
         # Reuse SDPO'"'"'s idempotent sglang tolist patch (shared, algorithm-
         # agnostic infra -- see examples/SDPO/patch-sglang-tolist.sh).
         bash examples/SDPO/patch-sglang-tolist.sh
+        # Reuse SDPO'"'"'s idempotent sglang Olmo2/Olmo3 rope_theta patch --
+        # only relevant for SDPO_REACT_MODEL=olmo3, harmless no-op otherwise.
+        bash examples/SDPO/patch-sglang-olmo-rope.sh
 
         python -c "import miles; print(\"Miles import OK\")"
 
