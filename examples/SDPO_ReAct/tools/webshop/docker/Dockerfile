@@ -8,6 +8,14 @@
 # Python<=3.10 -- hard-conflicts with the training image's own stack, same
 # isolation rationale as every other sidecar in this repo.
 #
+# INSIDE the container: run.py starts N worker.py PROCESSES (own GIL each)
+# plus router.py, the one process actually bound to 8422 -- see router.py's
+# docstring for why a single process couldn't use more than ~1 CPU under real
+# concurrency (env.step()'s HTML/text processing and gym.make()'s Lucene/JVM
+# index open are GIL-bound) and how the multi-process split fixes that while
+# keeping the external HTTP contract (../client.py, ../run_webshop_sidecar.sh)
+# unchanged.
+#
 # pyserini's LuceneSearcher (used to instantiate the env at ALL, not just for
 # the search[query] action -- see web_agent_site/engine/engine.py) needs a
 # JVM, hence openjdk below.
@@ -60,8 +68,8 @@ RUN cd search_engine && mkdir -p resources resources_100 resources_1k resources_
     python convert_product_file_format.py && bash run_indexing.sh
 
 WORKDIR /app
-COPY server.py .
+COPY run.py router.py worker.py .
 ENV PYTHONPATH=/app/webshop
 
 EXPOSE 8422
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8422"]
+CMD ["python3", "run.py"]

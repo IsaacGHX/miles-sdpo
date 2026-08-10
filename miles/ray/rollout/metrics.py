@@ -46,6 +46,12 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
         if (samples := data[key].get("samples")) is not None:
             # response_len, truncated, repetition, etc. -> val-aux
             log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"val-aux/{key}/")
+            # alfworld_ood's per-task-type (Pick/Look/Clean/Heat/Cool/Pick2)
+            # breakdown, and webshop's continuous task_score alongside the
+            # binary acc/pass@k above -- both additive, keyed off
+            # metadata stamped at data-build/rollout time.
+            log_dict |= dict_add_prefix(_compute_per_task_type_eval_metrics(args, samples), f"val-aux/{key}/")
+            log_dict |= dict_add_prefix(_compute_webshop_score_eval_metrics(samples), f"val-aux/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"val-aux/{key}_truncated_ratio"] = sum(truncated) / len(truncated)
@@ -331,6 +337,46 @@ def _compute_per_domain_metrics(args, all_samples: list[Sample]):
         if tcc:
             out[p + "zero_tool_call_frac"] = float(np.mean([int(t == 0) for t in tcc]))
     return out
+
+
+def _compute_per_task_type_eval_metrics(args, samples: list[Sample]):
+    """Per-ALFRED-task-type (Pick/Look/Clean/Heat/Cool/Pick2) breakdown of an
+    eval dataset's win rate, keyed off metadata['task_type'] (stamped by
+    examples/SDPO_ReAct/data/build_alfworld_data.py's _task_type_from_path).
+    No-op for non-alfworld eval datasets (e.g. webshop), whose samples never
+    carry this key. The combined val-aux/<key>_acc / eval/<key> score already
+    computed by log_eval_rollout_data covers the aggregate across all 6 types
+    -- this only adds the per-type split, so neither replaces the other."""
+    by_type: dict[str, list[Sample]] = {}
+    for s in samples:
+        md = s.metadata if isinstance(s.metadata, dict) else {}
+        task_type = md.get("task_type")
+        if task_type:
+            by_type.setdefault(task_type, []).append(s)
+    if not by_type:
+        return {}
+
+    out = {}
+    for task_type, subset in sorted(by_type.items()):
+        rewards = [s.get_reward_value(args) if s.reward is not None else 0.0 for s in subset]
+        out[f"task_type/{task_type}"] = float(np.mean(rewards))
+    return out
+
+
+def _compute_webshop_score_eval_metrics(samples: list[Sample]):
+    """Webshop's continuous partial-credit task_score, additive alongside the
+    binary win-rate acc/pass@k that log_eval_rollout_data already computes
+    from sample.reward. Stamped onto metadata['webshop_task_score'] by
+    examples/SDPO_ReAct/tools/webshop/client.py on the terminal step. No-op
+    for non-webshop eval datasets, whose samples never carry this key."""
+    scores = [
+        s.metadata["webshop_task_score"]
+        for s in samples
+        if isinstance(s.metadata, dict) and "webshop_task_score" in s.metadata
+    ]
+    if not scores:
+        return {}
+    return {"webshop_score": float(np.mean(scores))}
 
 
 def _compute_reward_breakdown_metrics(args, all_samples: list[Sample]):

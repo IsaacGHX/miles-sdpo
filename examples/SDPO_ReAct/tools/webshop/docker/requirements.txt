@@ -49,3 +49,6 @@ transformers==4.19.2
 fastapi==0.68.*
 uvicorn[standard]==0.15.*
 pydantic==1.8.2
+# router.py's outgoing client to the worker processes -- no pydantic/fastapi
+# dependency of its own, so it doesn't fight the old pins above.
+httpx==0.23.*

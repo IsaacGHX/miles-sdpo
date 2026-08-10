@@ -1,8 +1,11 @@
 # --eval-config for the AGENTIC domain (webshop + alfworld combined).
 #
-# All 3 held-out sets so the combined run's per-benchmark progress is visible
+# Both held-out sets so the combined run's per-benchmark progress is visible
 # (mirrors eval_multitask.yaml's own math+code+search union). Grading routes
-# per-row via metadata['domain'].
+# per-row via metadata['domain']. alfworld_ood's per-task-type (Pick/Look/
+# Clean/Heat/Cool/Pick2) breakdown is computed automatically from
+# metadata['task_type'] -- see _compute_per_task_type_metrics in
+# miles/ray/rollout/metrics.py -- no separate id/ood split needed for that.
 eval:
   defaults:
     max_response_len: 8192
@@ -12,12 +15,6 @@ eval:
   datasets:
     - name: webshop
       path: /root/data/webshop_data/webshop_eval.jsonl
-      rm_type: null
-      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
-      metadata_overrides:
-        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
-    - name: alfworld_id
-      path: /root/data/alfworld_data/alfworld_eval_id.jsonl
       rm_type: null
       n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
       metadata_overrides:

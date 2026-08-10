@@ -41,7 +41,7 @@ import os
 from miles.rollout.generate_hub.multi_turn import current_trajectory_metadata, current_trajectory_session_id
 from miles.utils.http_utils import post
 
-ALFWORLD_SIDECAR_URL = os.environ.get("SDPO_REACT_ALFWORLD_SIDECAR_URL", "http://127.0.0.1:8423")
+ALFWORLD_SIDECAR_URL = os.environ.get("SDPO_REACT_ALFWORLD_SIDECAR_URL") or "http://127.0.0.1:8423"
 MAX_RESULT_CHARS = 4000
 
 _TOOL_NAMES = {"alfworld_step"}

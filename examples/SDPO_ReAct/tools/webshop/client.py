@@ -27,7 +27,7 @@ import os
 from miles.rollout.generate_hub.multi_turn import current_trajectory_metadata, current_trajectory_session_id
 from miles.utils.http_utils import post
 
-WEBSHOP_SIDECAR_URL = os.environ.get("SDPO_REACT_WEBSHOP_SIDECAR_URL", "http://127.0.0.1:8422")
+WEBSHOP_SIDECAR_URL = os.environ.get("SDPO_REACT_WEBSHOP_SIDECAR_URL") or "http://127.0.0.1:8422"
 MAX_RESULT_CHARS = 4000
 
 _TOOL_NAMES = {"webshop_step"}
