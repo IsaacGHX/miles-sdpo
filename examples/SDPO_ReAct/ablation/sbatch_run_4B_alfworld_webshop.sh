@@ -30,6 +30,12 @@
 #
 # usage:
 #   sbatch examples/SDPO_ReAct/ablation/sbatch_run_4B_alfworld_webshop.sh
+#   # or split the matrix across two nodes/jobs (each still one sbatch job,
+#   # so neither trips the fairness enforcer on its own):
+#   COMBOS_OVERRIDE="grpo a|grpo e|grpo f|rlsd a|rlsd e|rlsd f|sdpo a" \
+#     sbatch examples/SDPO_ReAct/ablation/sbatch_run_4B_alfworld_webshop.sh
+#   COMBOS_OVERRIDE="sdpo e|sdpo f|rlsd b|rlsd c|rlsd d|sdpo b|sdpo c|sdpo d" \
+#     sbatch examples/SDPO_ReAct/ablation/sbatch_run_4B_alfworld_webshop.sh
 #SBATCH --job-name=hx-sdpo-4B-ablation-queue
 #SBATCH --account=low-pri
 #SBATCH --partition=ml.p5en.48xlarge-low,ml.p5en.48xlarge-ultra-low
@@ -66,13 +72,22 @@ unset SDPO_ABLATION_ALGO
 # (the 9 arms every algo supports), then the rest of the arm matrix
 # (rlsd/sdpo x b/c/d -- GRPO only supports a/e/f, enforced by the ablation
 # script's own arm-validation check).
-COMBOS=(
-    "grpo a" "grpo e" "grpo f"
-    "rlsd a" "rlsd e" "rlsd f"
-    "sdpo a" "sdpo e" "sdpo f"
-    "rlsd b" "rlsd c" "rlsd d"
-    "sdpo b" "sdpo c" "sdpo d"
-)
+#
+# COMBOS_OVERRIDE (env var, pipe-separated "algo arm" entries) runs a SUBSET
+# instead of the full 15 -- used to split the matrix across two nodes/jobs
+# (see usage comment above): each job still only ever has ONE sbatch entry
+# in squeue, so splitting this way doesn't trip the fairness enforcer either.
+if [ -n "${COMBOS_OVERRIDE:-}" ]; then
+    IFS='|' read -ra COMBOS <<< "$COMBOS_OVERRIDE"
+else
+    COMBOS=(
+        "grpo a" "grpo e" "grpo f"
+        "rlsd a" "rlsd e" "rlsd f"
+        "sdpo a" "sdpo e" "sdpo f"
+        "rlsd b" "rlsd c" "rlsd d"
+        "sdpo b" "sdpo c" "sdpo d"
+    )
+fi
 
 LOG_DIR="/fsx/home/haoxiang.zhang/logs"
 STATUS_FILE="$LOG_DIR/sbatch_run_4B_alfworld_webshop_status_${SLURM_JOB_ID}.txt"
