@@ -110,6 +110,20 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     tokenizer = input.state.tokenizer
     assert not args.partial_rollout, "Partial rollout is not supported"
 
+    # Snapshot NOW, before any `await` below -- input.state is a shared
+    # singleton (GenerateState) across every concurrently-running generate()
+    # coroutine for this rollout step. Reading state.rollout_id AFTER the
+    # multi-turn tool-call loop (as this used to do) races the next training
+    # step: a slow trajectory (many tool round trips) can still be running
+    # when generate_rollout_async advances state.rollout_id for the NEXT
+    # step, so this trajectory's read sees the wrong step's id -- confirmed
+    # live via a real ablation run's agentic_traces/ dump, where an
+    # unknown.jsonl (2002 rows, bigger than any single per-step file) held
+    # alfworld/webshop traces that should have landed in 0..9.jsonl. Capturing
+    # it here, before the first `await post(...)`, is race-free: this
+    # coroutine's own frame is untouched by any other coroutine.
+    rollout_id = getattr(input.state, "rollout_id", None)
+
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     execute_tool_function = load_function(args.generate_execute_tool_function_path)
@@ -267,14 +281,16 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         # Live conversation record (assistant + tool turns, in order) for
         # correct-by-construction post-hoc dumps (SDPO_ReAct agentic_traces).
         sample.metadata["messages"] = messages
-        # Current train step (set by generate_rollout_async on state each step),
-        # so downstream per-step dumps (e.g. SDPO_ReAct agentic_traces/
-        # {rollout_id}.jsonl) split by training step instead of one huge file.
-        # None during eval (state.rollout_id stays unset) -> dump falls back to
-        # its own naming. Mirrors the legacy generate_with_tools.generate.
-        rid = getattr(input.state, "rollout_id", None)
-        if rid is not None:
-            sample.metadata["rollout_id"] = rid
+        # Current train step (snapshotted at the TOP of this function, before
+        # this trajectory's first await -- see that comment for why reading
+        # input.state.rollout_id here instead would race concurrent
+        # trajectories), so downstream per-step dumps (e.g. SDPO_ReAct
+        # agentic_traces/{rollout_id}.jsonl) split by training step instead
+        # of one huge file. None during eval (state.rollout_id stays unset)
+        # -> dump falls back to its own naming. Mirrors the legacy
+        # generate_with_tools.generate.
+        if rollout_id is not None:
+            sample.metadata["rollout_id"] = rollout_id
 
     return GenerateFnOutput(samples=multi_samples if args.generate_multi_samples else sample)
 
