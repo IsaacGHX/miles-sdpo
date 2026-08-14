@@ -1,19 +1,31 @@
-"""Sidecar server exposing ``webshop_step`` for SDPO_ReAct, built directly on
-WebShop's own ``WebAgentTextEnv-v0`` gym env (github.com/princeton-nlp/WebShop,
-vendored verbatim at build time -- see Dockerfile) -- no tag-parsing/text-
-action-loop reimplemented here, just this repo's session-pool HTTP wrapper.
+"""One WEBSHOP SIDECAR WORKER process -- owns a SHARD of sessions, run as one
+of N processes behind router.py (the thing that actually listens on the
+sidecar's public port; see that module's docstring for the multi-process
+architecture and why it exists). Built directly on WebShop's own
+``WebAgentTextEnv-v0`` gym env (github.com/princeton-nlp/WebShop, vendored
+verbatim at build time -- see Dockerfile) -- no tag-parsing/text-action-loop
+reimplemented here, just this repo's session-pool HTTP wrapper.
 
 Runs INSIDE its own container (Python<=3.10 + WebShop's own old gym/pyserini/
 torch pins, which would otherwise conflict with the training image -- see
-Dockerfile's docstring), one long-lived sidecar for the whole training job,
-exposing exactly one HTTP port -- same pattern as ../../alfworld/docker/
-server.py and ../../search/docker/server.py.
+Dockerfile's docstring). Listens on ``127.0.0.1:$WORKER_PORT`` (loopback
+only -- router.py is the only intended caller, in the same container); one
+process, one Python interpreter, one GIL -- the GIL is exactly why a single
+worker isn't enough under real eval/rollout concurrency (env.step()'s own
+HTML/text processing and gym.make()'s Lucene index open are pure-Python/JVM
+work that one process's GIL fully serializes regardless of thread count; see
+router.py's docstring for the wall-clock numbers that motivated splitting
+into N processes, mirroring the identical fix already applied to
+../../alfworld/docker/).
 
 State model: WebshopPool.sessions keeps one live gym env PER SESSION id for
-the container's lifetime -- a session corresponds to one model trajectory
-(miles/rollout/generate_hub/multi_turn.py assigns it a fresh id per rollout;
-see ../client.py for the caller side). No persistence/cleanup thread by
-design, same rationale as every other sidecar's session pool.
+this WORKER's shard's lifetime -- a session corresponds to one model
+trajectory (miles/rollout/generate_hub/multi_turn.py assigns it a fresh id
+per rollout; see ../client.py for the caller side). No persistence/cleanup
+thread by design, same rationale as every other sidecar's session pool.
+router.py's stable hash of task_id (not session_id -- see its docstring for
+why) guarantees every request for a given session always reaches the SAME
+worker process, so this per-process dict is never accessed cross-process.
 
 Task pinning: WebShop's own ``WebAgentTextEnv.reset(session=task_id)`` DOES
 natively index into a fixed, seeded-shuffle goal list by session_int -- but
@@ -31,7 +43,8 @@ this is the only way to get the SAME task_id to mean the exact same goal text
 on every replay, which reproducible train/eval assignment (see
 ../client.py's docstring) genuinely requires.
 
-Contract (see ../client.py for the caller side):
+Contract (identical to router.py's public one -- see ../client.py for the
+caller side, which talks to the router, never directly to a worker):
     POST /session/{session_id}/step {"action": str, "task_id": int|str|None}
       -> {"observation": str, "done": bool, "won": bool, "task_score": float}
     GET  /health -> {"status": "ok"}
@@ -40,8 +53,10 @@ Contract (see ../client.py for the caller side):
 
 import logging
 import random
+import threading
 from typing import Optional, Union
 
+import anyio
 import gym
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -52,9 +67,34 @@ from pydantic import BaseModel
 import web_agent_site.envs  # noqa: F401
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-logger = logging.getLogger("webshop_sidecar")
+logger = logging.getLogger("webshop_sidecar_worker")
 
 app = FastAPI()
+
+
+# Each worker process now only serves the task_ids that hash to it
+# (router.py splits the eval task set across N_WORKERS processes), so it
+# needs less concurrency than the old single-process server did at 512 -- 64
+# is comfortably above one shard's realistic concurrent-session count and
+# avoids the GIL/thread-count scheduling overhead that 512-in-one-process
+# caused (see router.py's docstring for the full story of why one process
+# wasn't enough).
+@app.on_event("startup")
+async def _raise_threadpool_limit():
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 64
+
+# gym.make("WebAgentTextEnv-v0") constructs a brand-new pyserini
+# LuceneSearcher per session (see engine.py's init_search_engine, called from
+# WebAgentTextEnv.__init__) -- a JVM-backed index open, not a cheap local
+# call. A rollout batch's worth of NEW sessions all calling init_session()
+# concurrently (each on its own FastAPI threadpool worker) means many
+# concurrent first-time JVM/Lucene index opens; also, `random.seed(0)` right
+# before gym.make() mutates the process-global `random` module state (see the
+# module docstring), so two overlapping init_session() calls can interleave
+# their seed-then-sample sequence and land on the wrong goal/price threshold.
+# Same "serialize the shared/expensive one-time setup path" fix as
+# ../../alfworld/docker/server.py's _ENV_LOCK.
+_INIT_LOCK = threading.Lock()
 
 
 class WebshopPool:
@@ -64,16 +104,18 @@ class WebshopPool:
         self.sessions: dict[str, object] = {}
 
     def init_session(self, session_id: str, task_id=None) -> None:
-        # See module docstring: seeds the process-global `random` module
-        # BEFORE gym.make() so get_goals()'s unseeded price-threshold sample
-        # is deterministic too, not just the goal-list shuffle order.
-        random.seed(0)
-        env = gym.make("WebAgentTextEnv-v0", observation_mode="text")
-        if task_id is not None:
-            env.reset(session=task_id)
-        else:
-            env.reset()
-        self.sessions[session_id] = env
+        with _INIT_LOCK:
+            # See module docstring: seeds the process-global `random` module
+            # BEFORE gym.make() so get_goals()'s unseeded price-threshold
+            # sample is deterministic too, not just the goal-list shuffle
+            # order.
+            random.seed(0)
+            env = gym.make("WebAgentTextEnv-v0", observation_mode="text")
+            if task_id is not None:
+                env.reset(session=task_id)
+            else:
+                env.reset()
+            self.sessions[session_id] = env
 
     def step(self, session_id: str, action: str) -> tuple[str, bool, bool, float]:
         env = self.sessions[session_id]
@@ -129,7 +171,16 @@ class StepResponse(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
+    # async (not def): step()/init_session() below are sync defs, so FastAPI
+    # dispatches each concurrent /step call to a worker in its shared
+    # threadpool -- a rollout batch's worth of sessions all blocking on a
+    # slow gym.make()/env.step() (or, for a fresh session, the Lucene/JVM
+    # search-engine init inside init_search_engine()) can saturate that pool.
+    # A sync def here would then queue behind them for the same workers and
+    # look like the sidecar died under load, even though it's still making
+    # progress underneath. async runs directly on the event loop, so it
+    # always answers immediately regardless of threadpool saturation.
     return {"status": "ok"}
 
 

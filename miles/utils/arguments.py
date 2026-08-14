@@ -2964,19 +2964,29 @@ def miles_validate_args(args):
         if args.use_opd:
             raise ValueError("--sdpo-rlsd and --use-opd are mutually exclusive (alternative KD mechanisms).")
 
-    # --sdpo-eval-skill-mode only takes effect through the custom eval generate
-    # function (sdpo_eval_generate) that actually performs the skill-splice; a
-    # mode set without wiring that function would silently no-op every eval.
+    # --sdpo-eval-skill-mode only takes effect through a custom eval generate
+    # function that actually performs the skill-splice; a mode set without
+    # wiring one of those would silently no-op every eval. Two known
+    # implementations share this contract (self-predict + splice, then
+    # dispatch to the real rollout): examples.SDPO.sdpo.sdpo_eval_generate
+    # (single-turn) and examples.SDPO_ReAct.sdpo_react.
+    # sdpo_react_eval_generate_with_skill (multi-turn tool-calling, so
+    # agentic domains like webshop/alfworld keep their tool loop instead of
+    # silently degrading to one text completion).
+    _EVAL_SKILL_GENERATE_FN_PATHS = (
+        "examples.SDPO.sdpo.sdpo_eval_generate",
+        "examples.SDPO_ReAct.sdpo_react.sdpo_react_eval_generate_with_skill",
+    )
     if getattr(args, "sdpo_eval_skill_mode", "off") != "off":
         eval_datasets = getattr(args, "eval_datasets", None) or []
-        wired = getattr(args, "custom_generate_function_path", None) == "examples.SDPO.sdpo.sdpo_eval_generate" or any(
-            getattr(d, "custom_generate_function_path", None) == "examples.SDPO.sdpo.sdpo_eval_generate"
+        wired = getattr(args, "custom_generate_function_path", None) in _EVAL_SKILL_GENERATE_FN_PATHS or any(
+            getattr(d, "custom_generate_function_path", None) in _EVAL_SKILL_GENERATE_FN_PATHS
             for d in eval_datasets
         )
         if not wired:
             raise ValueError(
-                "--sdpo-eval-skill-mode is set but --custom-generate-function-path "
-                "examples.SDPO.sdpo.sdpo_eval_generate is not wired (globally or per eval dataset) -- "
+                "--sdpo-eval-skill-mode is set but --custom-generate-function-path is not wired "
+                f"(globally or per eval dataset) to one of {_EVAL_SKILL_GENERATE_FN_PATHS} -- "
                 "the mode would silently no-op every eval rollout."
             )
 

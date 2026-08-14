@@ -8,6 +8,13 @@
 # likely conflicting with the training image's own torch/transformers stack
 # -- same isolation rationale as every other sidecar in this repo.
 #
+# INSIDE the container: run.py starts N worker.py PROCESSES (own GIL each)
+# plus router.py, the one process actually bound to 8423 -- see router.py's
+# docstring for why a single process couldn't use more than ~1 CPU under real
+# concurrency (PDDL parsing/grounding is pure Python, GIL-bound) and how the
+# multi-process split fixes that while keeping the external HTTP contract
+# (../client.py, ../run_alfworld_sidecar.sh) unchanged.
+#
 # `alfworld-download -f` is baked in at BUILD time (bounded, one-time
 # download of PDDL/grammar/game files -- see the alfworld package's own
 # downloader) so this sidecar is self-contained and idempotent to start,
@@ -32,8 +39,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 ENV ALFWORLD_DATA=/root/.cache/alfworld
 RUN alfworld-download -f
 
-COPY server.py config_tw.yaml .
+COPY run.py router.py worker.py config_tw.yaml .
 ENV ALFWORLD_CONFIG=/app/config_tw.yaml
 
 EXPOSE 8423
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8423"]
+CMD ["python3", "run.py"]

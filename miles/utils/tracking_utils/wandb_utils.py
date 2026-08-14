@@ -1,5 +1,7 @@
 import logging
 import os
+import secrets
+import string
 from copy import deepcopy
 
 import wandb
@@ -47,9 +49,12 @@ def init_wandb_primary(args):
         wandb.login(key=args.wandb_key, host=args.wandb_host)
 
     # Prepare wandb init parameters
-    # add random 6 length string with characters
+    # add random 8 length string with characters -- generated locally, not via
+    # wandb.util.generate_id(), which is an undocumented internal that moved/
+    # vanished across wandb versions (AttributeError on some container pulls).
     if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
+        suffix = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+        group = args.wandb_group + "_" + suffix
         run_name = f"{group}-RANK_{args.rank}"
     else:
         group = args.wandb_group
