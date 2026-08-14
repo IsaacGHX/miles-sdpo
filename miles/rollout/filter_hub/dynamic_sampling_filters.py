@@ -8,6 +8,12 @@ __all__ = ["check_reward_nonzero_std", "check_no_aborted", "check_sdpo_group_has
 
 def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     rewards = [sample.get_reward_value(args) for sample in samples]
+    # A None reward means the sample was never scored (e.g. Sample.Status.ABORTED --
+    # confirmed live: a tau2 sidecar crash mid-run left every in-flight sample without
+    # a reward, and torch.tensor() on a list containing None raises TypeError, which
+    # previously took down the whole training job instead of just dropping the group).
+    if any(r is None for r in rewards):
+        return DynamicFilterOutput(keep=False, reason="reward_none_aborted")
     keep = torch.tensor(rewards, dtype=torch.float64).std() > 1e-8
     return DynamicFilterOutput(
         keep=keep,
