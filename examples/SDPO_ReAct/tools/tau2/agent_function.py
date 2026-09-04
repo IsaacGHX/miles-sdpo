@@ -67,7 +67,21 @@ _PROVIDER_KEY_ENV = {"gemini": "GEMINI_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
 # reasoning_effort to 'none'" -- confirmed live against this exact gateway
 # during the port's own smoke test) -- litellm forwards unknown kwargs in
 # llm_args straight into the request body, so this is the only extra needed.
-_GPT5_RESPONSE_KWARGS = {"reasoning_effort": "none"}
+#
+# max_completion_tokens is ALSO required, not optional: tau2's own
+# tau2/utils/llm_utils.py::generate() does `content =
+# response_choice.message.content` with ZERO empty-content handling, and
+# UserSimulator._generate_next_message builds `UserMessage(content=
+# user_response, ...)` straight from that -- with no tool_calls (retail/
+# airline's user has none), an empty content makes UserMessage.validate()
+# raise ("UserMessage must have either content or tool_calls"), which
+# aborts the whole episode at reward=0. Without an explicit budget, a
+# reasoning model can spend the WHOLE default token allowance on <think>
+# and leave nothing for the actual reply -- confirmed live: 2.5% of one
+# ablation run's training episodes died on exactly this exception. A
+# generous budget (user turns are short conversational replies, not
+# multi-step reasoning) makes running out this way effectively impossible.
+_GPT5_RESPONSE_KWARGS = {"reasoning_effort": "none", "max_completion_tokens": 2048}
 
 
 async def run(
@@ -151,6 +165,7 @@ async def run(
     # as its own wandb series without any parsing on the metrics side.
     reward_breakdown = response.get("reward_breakdown") or {}
     breakdown_fields = {f"tau2_reward_{k}": float(v) for k, v in reward_breakdown.items()}
+    messages = response.get("messages", [])
 
     return {
         # Constant "tau2" (not "tau2_retail" etc) for reward-dispatch routing
@@ -161,8 +176,43 @@ async def run(
         # by the sidecar) is that per-subdomain field.
         "reward": response.get("reward", 0.0),
         "domain": "tau2",
-        "tau2_messages": response.get("messages", []),
+        "tau2_messages": messages,
         "tau2_termination_reason": response.get("termination_reason", ""),
         "tau2_task_id": response.get("task_id", ""),
+        # examples/SDPO/sdpo.py's skill/pitfall generator reads
+        # metadata["question"] (falling back to sample.prompt, the raw chat-
+        # templated string, only when absent) to fill the "PROBLEM:" section
+        # of the skill-distillation prompt. Without this key it fell back to
+        # sample.prompt -- and _strip_chat_template there keeps only the
+        # LAST <|im_start|>user...<|im_end|> block, which for tau2 is the
+        # very FIRST real user turn (the whole conversation is one prompt,
+        # tau2's own Orchestrator generates every later turn, so there is
+        # only ever one user block in that raw string). Confirmed live: a
+        # real trace's problem_text was "Hi, I need help changing the dates
+        # on my reservation. My user ID is ..." -- the opening line only,
+        # with the actual ask (which reservation, which new date, whether
+        # other requests came up) still unresolved. Joining every REAL user
+        # turn from tau2's own message log (the one that matters here, not
+        # the raw prompt string) recovers what the user actually needed
+        # across the whole conversation -- confirmed live on a real retail
+        # trace: the opening line was just "I need to cancel my order for
+        # the hiking boots", but by the end the user had also asked to swap
+        # a T-shirt for sneakers on a SEPARATE order, which the opening line
+        # gives no hint of at all.
+        #
+        # Each real user turn is labeled "round N:" rather than joined bare
+        # -- multiple user turns run together with no separator read like
+        # one continuous statement (e.g. "...the hiking boots.My email is
+        # ..." with the turn boundary invisible), which obscures that later
+        # turns are the user's RESPONSES to intervening agent/tool turns
+        # (clarifications, corrections, new asks), not a single opening
+        # statement continued.
+        "question": "\n".join(
+            f"round {i}: {m.get('content')}"
+            for i, m in enumerate(
+                (m for m in messages if m.get("role") == "user" and m.get("content")),
+                start=1,
+            )
+        ),
         **breakdown_fields,
     }

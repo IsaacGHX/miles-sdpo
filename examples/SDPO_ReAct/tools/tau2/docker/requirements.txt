@@ -15,3 +15,8 @@ fastapi==0.115.*
 # tau2 itself requires uvicorn>=0.34.0 (confirmed via a real pip
 # ResolutionImpossible failure pinning 0.32.*) -- match its own floor.
 uvicorn[standard]==0.34.*
+# Required by tau2's banking_knowledge domain (BM25 retrieval for the
+# knowledge base tools) -- not in tau2's own PyPI extras, confirmed missing
+# at runtime via ModuleNotFoundError in
+# tau2/knowledge/document_preprocessors/bm25_indexer.py.
+rank-bm25
