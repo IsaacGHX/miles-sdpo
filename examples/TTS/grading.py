@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 
-from examples.SDPO.reward import _is_correct
+from examples.SDPO.reward import _grade_one_code, _is_correct
 from miles.utils.types import Sample
 
 
@@ -36,3 +36,14 @@ def grade(response: str, label: str, args: Namespace) -> bool:
     to follow the answer-format contract in its system prompt."""
     sample = Sample(response=response or "", label=label or "")
     return bool(_is_correct(sample, args))
+
+
+async def grade_code(tool_trace: list[dict], test_cases: list[dict]) -> bool:
+    """Is the LAST code the model actually ran via code_interpreter (per
+    ``tool_trace``) correct against ``test_cases``? TOOL-MANDATORY, same
+    contract as examples/SDPO/reward.py::_grade_one_code -- a trajectory that
+    never runs its solution through the tool has no candidate and is wrong
+    regardless of what its final text claims."""
+    sample = Sample(metadata={"tool_trace": tool_trace, "test_cases": test_cases})
+    args = Namespace(sdpo_code_require_tool=True)
+    return bool(await _grade_one_code(sample, args))

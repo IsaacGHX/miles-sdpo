@@ -79,6 +79,7 @@ class ChatResult:
     completion_tokens: int | None = None
     reasoning: str | None = None  # separate reasoning channel, if the backend has one
     raw: dict[str, Any] | None = None  # the raw provider response, for debugging
+    tool_calls: list[dict[str, Any]] | None = None  # OpenAI-style [{"id","type","function":{"name","arguments"}}]
 
 
 @dataclass
@@ -202,6 +203,7 @@ class Engine:
         top_p: float | None = None,
         max_tokens: int | None = None,
         stop: list[str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> ChatResult:
         c = self.config
@@ -210,6 +212,7 @@ class Engine:
             "top_p": c.top_p if top_p is None else top_p,
             "max_tokens": c.max_tokens if max_tokens is None else max_tokens,
             "stop": stop,
+            "tools": tools,
         }
         return await self._request(messages, params, **kwargs)
 
@@ -241,12 +244,21 @@ class OpenAIChatBackend(Engine):
         if self._is_reasoning_model():
             payload["max_completion_tokens"] = params["max_tokens"]
             # reasoning models reject explicit temperature/top_p; omit them.
+            if params.get("tools"):
+                # gateway constraint (verified live): function tools are rejected
+                # on /chat/completions unless reasoning_effort is 'none' (the
+                # reasoning-capable alternative is the separate /v1/responses
+                # endpoint, not used here to keep one request shape for all
+                # roles). Only applies when tools are actually passed.
+                payload["reasoning_effort"] = "none"
         else:
             payload["max_tokens"] = params["max_tokens"]
             payload["temperature"] = params["temperature"]
             payload["top_p"] = params["top_p"]
         if params.get("stop"):
             payload["stop"] = params["stop"]
+        if params.get("tools"):
+            payload["tools"] = params["tools"]
 
         headers = {"Content-Type": "application/json"}
         if c.api_key:
@@ -266,6 +278,7 @@ class OpenAIChatBackend(Engine):
             completion_tokens=usage.get("completion_tokens"),
             reasoning=(msg.get("reasoning_content") or None),
             raw=out,
+            tool_calls=msg.get("tool_calls") or None,
         )
 
 

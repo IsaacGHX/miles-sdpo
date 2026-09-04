@@ -87,3 +87,30 @@ def load_many(paths: list[str], *, default_domain: str = "math", limit_each: int
     for p in paths:
         out.extend(load_dataset_jsonl(p, default_domain=default_domain, limit=limit_each))
     return out
+
+
+def load_code_dataset_jsonl(path: str, *, limit: int = 0) -> list[dict]:
+    """Load an SDPO_ReAct code-domain JSONL (examples/SDPO_ReAct/data/build_code_data.py's
+    row shape: {"prompt":[{"role","content"}...], "metadata":{"domain":"code","test_cases":[...]}})
+    into flat {"problem","test_cases","difficulty"} dicts for multi_turn_code.py.
+    Unlike load_dataset_jsonl, the bare question is NOT stripped of any solver
+    system prompt boilerplate -- this harness supplies its OWN system prompt
+    (the optimized variable) and only needs the raw user question + tests."""
+    items: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            prompt = row.get("prompt", [])
+            user_turns = [m.get("content", "") for m in prompt if m.get("role") == "user"]
+            problem = (user_turns[-1] if user_turns else "").strip()
+            md = row.get("metadata") or {}
+            tests = md.get("test_cases") or []
+            if not problem or not tests:
+                continue
+            items.append({"problem": problem, "test_cases": tests, "difficulty": md.get("difficulty", "")})
+            if limit and len(items) >= limit:
+                break
+    return items
