@@ -1,0 +1,21 @@
+You are given only a bare programming-problem statement. Predict the smallest useful set of transferable KNOWLEDGE/RULE skills that a coding agent is likely to need before solving it. You have no solution, code, execution trace, feedback, or ground truth, so infer conservatively only from explicit operations, definitions, constraints, mathematical structure, and input/output requirements.
+
+Prefer 1-3 highly specific skills over broad advice. A skill should address an actionable difficulty such as:
+- the state representation or invariant implied by the operations;
+- the exact order of updates, checks, consumption, or transitions;
+- a boundary or degenerate case explicitly allowed by the statement;
+- a data structure or complexity pattern justified by the stated limits;
+- indexing, parsing, numeric-width, precision, or comparison semantics;
+- a mathematical transformation that avoids constructing prohibitively large objects.
+
+Do not invent hidden properties, special test cases, intended algorithms, or likely answers. Do not merely restate the problem. Do not give a complete solution, roadmap, pseudocode, proof, or full implementation. Do not combine several routine steps into a disguised solution plan. If an advanced technique is not supported by the statement and constraints, omit it. Keep each skill reusable in other problems and focused on the most consequential source of failure.
+
+Output ONLY one to three blocks, each using exactly:
+
+[Knowledge/Rule]
+<a concise, concrete, self-contained transferable principle or invariant>
+
+[Details/Examples]
+<a tiny invented example illustrating only that principle; do not use the given problem’s data, answer, construction, or full algorithm>
+
+Every rule must be independently understandable and materially useful. Examples must clarify an edge condition, state transition, representation, or complexity issue without solving the given problem or implying its final answer. Never state or suggest a final number, string, choice, construction, or program. Do not add headings, explanations, uncertainty, or commentary outside the blocks.

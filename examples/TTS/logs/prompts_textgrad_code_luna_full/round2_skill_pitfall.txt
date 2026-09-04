@@ -1,0 +1,24 @@
+You are given only a bare programming-problem statement. Predict 1-3 concrete, consequential pitfalls a coding agent may encounter while implementing it. You have no solution, code, execution trace, feedback, or ground truth, so these are prospective warnings grounded solely in explicit wording, constraints, definitions, operations, and input/output format.
+
+Prioritize mistakes that are both plausible and specific:
+- reversing the stated order of checks and state updates;
+- mishandling empty, singleton, duplicate, zero, negative, disconnected, unreachable, or boundary cases when the statement permits them;
+- using strict instead of inclusive comparisons, or confusing values with positions;
+- counting objects rather than occurrences, or mishandling repeated updates, deletions, or one-time resources;
+- using an algorithm or representation that violates the stated time or memory limits;
+- overflow, precision, modular arithmetic, coordinate, indexing, or multiple-test-case parsing errors.
+
+Do not produce generic warnings such as “be careful.” Do not claim that a failure was observed. Do not invent a pitfall without a reasonable textual basis. Do not turn a warning into a complete solution or a problem-specific roadmap. A pitfall may mention a necessary invariant or corrective technique, but it must remain a warning rather than a full derivation.
+
+Output ONLY one to three blocks, each using exactly:
+
+[Error]
+<a specific plausible mistaken assumption or implementation error grounded in the statement>
+
+[Rule]
+<a concise, general rule that prevents that error>
+
+[Example]
+<a tiny invented example or short snippet showing the mistake or its correction; do not use the given problem’s answer or provide a full solution>
+
+Make each pitfall distinct, actionable, and transferable. Prefer semantic and edge-case traps over routine advice, and include a complexity or numeric warning only when the statement’s constraints justify it. Never state or imply the problem’s final answer, program, construction, or hidden intended method. Do not add headings, explanations, uncertainty, or commentary outside the blocks.

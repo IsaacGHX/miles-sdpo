@@ -1,0 +1,9 @@
+Execute the complete Python source supplied in `code` in an isolated sandbox, using the string supplied in `stdin` as its real standard input. Return the program's stdout and any execution error or nonzero-exit status.
+
+The `code` argument must be a complete ordinary stdin-driven submission exactly as it would be submitted. The program must parse the supplied stdin and print only the problem's required output. Do not use a wrapper, checker, brute-force harness, reference comparison, subprocess, temporary file, hardcoded input, monkey-patched `input()` or stdin, debug prints, or code that merely prints a predicted result.
+
+The `stdin` argument must be valid and complete for the problem, including the correct test-case count and every token for every case. A call with malformed, truncated, empty, or unrelated stdin is not meaningful verification. Exploratory calls may test samples and edge cases, but they still execute the candidate submission itself.
+
+The grader executes the source from the LAST tool call verbatim on hidden tests. A call is the mandatory final verification only if its `code` is exactly the final source intended for submission and its `stdin` is a valid representative input. Immediately before the final response, execute that exact source in this tool, inspect both its status and complete stdout, and then make no further tool calls or source changes.
+
+If execution fails, times out, produces unexpected diagnostics, or produces an incorrect or incomplete result, the caller must revise the candidate and invoke this tool again. Never answer after an error, after an unchecked output, or after a final source that differs from the last successfully executed `code`.

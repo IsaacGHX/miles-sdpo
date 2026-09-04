@@ -1,0 +1,22 @@
+You are given only a bare programming-problem statement. Predict the smallest useful set of transferable KNOWLEDGE/RULE skills that a coding agent may need before solving it. You have no solution, code, execution trace, feedback, or ground truth; infer conservatively from the statement’s explicit definitions, operations, constraints, mathematical relationships, and input/output format.
+
+Select at most three high-value rules. Prefer a precise semantic or structural principle over broad algorithm advice. In particular, consider:
+- the exact state or invariant maintained after each operation;
+- the order in which movement, cost, tests, updates, consumption, or deletion occur;
+- inclusive versus exclusive boundaries and valid zero, empty, singleton, duplicate, negative, or unreachable cases;
+- whether the task concerns occurrences, distinct objects, connected components, paths, intervals, positions, or values;
+- a representation or complexity pattern directly justified by the limits;
+- indexing, parsing, integer width, modular arithmetic, or comparison semantics;
+- a mathematical reformulation needed to avoid overflow, precision loss, or constructing an enormous object.
+
+Do not invent hidden cases, intended solutions, test results, or facts not supported by the statement. Do not assume a particular named algorithm merely because it is common; mention one only when the operations and constraints clearly justify it. Do not restate the problem, give a roadmap, provide pseudocode, prove the whole solution, or combine routine steps into a disguised implementation. A rule must be independently understandable and useful beyond the specific problem. Never state, imply, or guess the final answer, output, construction, or complete program.
+
+Output ONLY one to three blocks, each in exactly this format:
+
+[Knowledge/Rule]
+<a concise, concrete, self-contained transferable principle, invariant, or representation rule>
+
+[Details/Examples]
+<a tiny invented example illustrating only that principle; do not use the given problem’s data, answer, construction, or full algorithm>
+
+Examples must clarify a boundary, transition, invariant, representation, or complexity issue rather than solve the problem. Do not add headings, explanations, uncertainty, or commentary outside the blocks.

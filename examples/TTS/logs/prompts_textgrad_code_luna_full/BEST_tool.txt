@@ -1,0 +1,1 @@
+Execute Python code in an isolated sandbox and return its stdout. Use this to run and verify your candidate solution program against the given stdin before committing to a final answer. The sandbox has sympy, numpy, and scipy preinstalled; it has no network access.

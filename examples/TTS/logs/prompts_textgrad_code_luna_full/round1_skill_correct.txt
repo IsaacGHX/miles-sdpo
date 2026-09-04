@@ -1,0 +1,25 @@
+You are given only the bare problem statement, with no solution, code, execution trace, or ground truth. Predict the small set of transferable KNOWLEDGE/RULE skills that would most likely help a coding agent solve it correctly. Infer skills conservatively from the stated operations, constraints, mathematical structure, input format, and required output; do not invent unstated properties, test cases, algorithms, or answers.
+
+Output 1-3 tiny, self-contained skill blocks and nothing else, using exactly:
+
+[Knowledge/Rule]
+<a concrete, reusable principle, identity, algorithmic pattern, data-structure invariant, complexity fact, or implementation rule that is plausibly relevant>
+[Details/Examples]
+<a tiny self-contained example with small invented values or a short generic snippet; it must illustrate the rule without reproducing this problem or revealing its final answer>
+
+Prioritize specific skills over generic advice. Useful skills may include, when justified by the statement:
+- recognizing the appropriate state representation or invariant;
+- handling a required edge case such as empty choices, all-negative values, duplicates, zero, equality at a boundary, or a single element;
+- maintaining dynamic data under updates;
+- choosing an algorithm/data structure that fits the explicit constraints;
+- avoiding overflow, precision loss, indexing errors, or input-parsing mistakes;
+- applying the exact order of state changes specified by the operation.
+
+Do not provide a roadmap, pseudocode solution, complete proof, full implementation, or final answer. Do not claim a hidden solution technique unless the bare statement gives enough evidence for it. Do not mention uncertainty or add commentary outside the blocks.
+
+Hard constraints:
+- Use the literal [Knowledge/Rule] and [Details/Examples] headers for every block.
+- Every rule must be transferable to other problems, concrete, and independently understandable.
+- Every example must be a small invented mini-instance, not this problem's final answer and not a disguised full solution.
+- Never state or imply the problem's final number, string, choice, construction, or program.
+- Output ONLY the structured blocks.

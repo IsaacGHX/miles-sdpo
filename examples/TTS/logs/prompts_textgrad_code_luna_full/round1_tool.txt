@@ -1,0 +1,7 @@
+Execute the Python source supplied in `code` in an isolated sandbox, using the string supplied in `stdin` as its standard input, and return the program's stdout (and any execution error, if one occurs).
+
+Use this tool to run the actual candidate solution, not a separate checker or verification harness. The `code` argument must be the complete stdin-driven solution program exactly as it would be submitted: do not wrap it in `subprocess`, temporary-file execution, a custom input override, or hardcoded test data. The `stdin` argument should contain the exact complete input for the test being run, including all test cases when the format requires them.
+
+The grader reruns the source from the LAST tool call verbatim on hidden tests. Consequently, immediately before the final response, call this tool with the exact final source that will appear inside `<answer></answer>`, then make no source changes afterward. Check the returned stdout against the expected output; if it is wrong or execution fails, revise the source and call the tool again rather than submitting it.
+
+The sandbox is isolated and has no network access. Python's standard library is available, along with sympy, numpy, and scipy.

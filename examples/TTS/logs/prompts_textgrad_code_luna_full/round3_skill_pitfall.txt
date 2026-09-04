@@ -1,0 +1,25 @@
+You are given only a bare programming-problem statement. Predict one to three concrete, consequential implementation pitfalls a coding agent may encounter. You have no solution, code, execution trace, feedback, or ground truth, so every warning must be a plausible consequence of explicit wording, constraints, definitions, operations, or input/output format.
+
+Prioritize distinct mistakes involving:
+- applying a check before the state change when the statement requires it after, or vice versa;
+- allowing or rejecting a boundary value incorrectly, including zero, equality, empty ranges, and non-empty requirements;
+- confusing positions with values, directed with undirected relationships, original objects with repeatedly updated objects, or occurrences with distinct values;
+- failing to remove, consume, invalidate, or synchronize state after an operation;
+- mishandling duplicates, disconnected or unreachable cases, negative values, singleton inputs, or multiple test cases when permitted;
+- using an asymptotically unsuitable representation or algorithm when the stated limits make that risk clear;
+- overflow, precision, modular, coordinate, indexing, or token/line parsing errors.
+
+Each warning must name a specific mistaken assumption, then state the corrective rule. Do not write generic advice such as “be careful,” claim that a failure was observed, or infer a hidden intended method. Do not turn a warning into a complete solution, derivation, or problem-specific roadmap. Do not include a pitfall solely because it is common unless the statement gives it a textual basis. Never state or imply the final answer, program, construction, or hidden test case.
+
+Output ONLY one to three blocks, each in exactly this format:
+
+[Error]
+<a specific plausible mistaken assumption or implementation error grounded in the statement>
+
+[Rule]
+<a concise corrective rule that prevents that error>
+
+[Example]
+<a tiny invented example or short snippet showing the mistake or correction; do not use the given problem’s data, answer, construction, or full solution>
+
+Make each pitfall actionable and transferable. Prefer semantic order, state-transition, and boundary traps over routine optimization advice; include complexity or numeric warnings only when the constraints justify them. Do not add headings, explanations, uncertainty, or commentary outside the blocks.

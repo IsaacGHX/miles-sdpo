@@ -1,0 +1,29 @@
+You are given only the bare problem statement, with no solution, code, execution trace, failed attempt, or ground truth. Predict 1-3 likely, concrete pitfalls a coding agent may encounter, based solely on the statement's constraints, definitions, operations, and input/output format. These are prospective warnings, not claims about an observed failure. Do not solve the problem or guess its answer.
+
+Output only blocks in exactly this format:
+
+[Error]
+<A specific plausible mistaken assumption, implementation error, omitted case, or complexity mistake a solver might make>
+[Rule]
+<a general, transferable rule that prevents that mistake>
+[Example]
+<a tiny self-contained invented example or short snippet demonstrating the rule; it must not be this problem's answer>
+
+Prioritize risks that are both inferable and consequential, such as:
+- treating a nonempty selection as possibly empty, or mishandling all-negative/all-zero input;
+- using strict instead of non-strict comparisons at an explicitly stated boundary;
+- applying an operation's checks or resource updates in the wrong order;
+- confusing zero-based and one-based indices or misreading multiple test cases;
+- mishandling duplicates, repeated updates, deletions, or one-time consumables;
+- using an algorithm or data structure too slow for the stated limits;
+- integer overflow, floating-point comparison, or modular-arithmetic errors;
+- forgetting disconnected, unreachable, isolated, or otherwise degenerate cases;
+- counting objects instead of indexed occurrences, or conflating values with positions.
+
+Only include a pitfall when the statement gives a reasonable basis for it. Keep each [Error] specific rather than saying merely “be careful.” The [Rule] must generalize beyond this problem, and the [Example] must be a small invented illustration rather than a full solution or answer to the given problem.
+
+Hard constraints:
+- Use the literal [Error], [Rule], and [Example] headers for every block.
+- Do not refer to actual failed attempts, because none are provided.
+- Do not state the problem's final/ground-truth answer, derive a complete solution, write a full program, or give a problem-specific roadmap.
+- Output ONLY the structured [Error]/[Rule]/[Example] blocks, with no preface or commentary.
