@@ -1,0 +1,21 @@
+# --eval-config for the TAU2 domain, TELECOM SUBSET ONLY -- a leaner sibling
+# of eval_tau2.yaml (see that file's own header for the shared rationale)
+# for runs where retail/airline are already saturated (confirmed live: a
+# real ablation run's eval_0 hit airline=100%/retail=100% mean reward, with
+# only telecom sitting at ~48% -- see this domain's own higher tool-call
+# count per episode, ~13.4 avg vs ~7 for retail/airline, in this repo's own
+# tau2 diagnosis). Dropping retail/airline from eval cuts eval wall-clock
+# ~3x (720 episodes/eval -> 240) with zero loss of the signal that still
+# needs tracking -- telecom's own trend.
+eval:
+  defaults:
+    max_response_len: 8192
+    top_p: 1.0
+    metadata_key: metadata
+  datasets:
+    - name: tau2_telecom
+      path: /root/data/tau2_data/tau2_telecom_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        tau2_max_steps: ${oc.decode:${oc.env:SDPO_REACT_TAU2_EVAL_MAX_STEPS,100}}

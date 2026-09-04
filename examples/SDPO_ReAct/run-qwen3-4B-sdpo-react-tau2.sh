@@ -34,7 +34,8 @@
 # tools/tau2/agent_function.py.
 #
 # Env overrides (swap without editing the script):
-#   SDPO_REACT_TAU2_MAX_STEPS   (default 30)   tau2 orchestrator turn budget (BOTH train and eval -- see below)
+#   SDPO_REACT_TAU2_MAX_STEPS      (default 40)   tau2 orchestrator turn budget, TRAIN only -- see below
+#   SDPO_REACT_TAU2_EVAL_MAX_STEPS (default 100)  tau2 orchestrator turn budget, EVAL only -- see below
 #   SDPO_REACT_NUM_ROLLOUT      (default 300)  --num-rollout
 #   SDPO_REACT_EVAL_N_SAMPLES   (default 8)    eval samples/prompt (eval yaml)
 #   TAU_USER_MODEL_PROVIDER     (default openai)  litellm provider for the user simulator --
@@ -59,11 +60,41 @@ export SDPO_REACT_EVAL_N_SAMPLES="${SDPO_REACT_EVAL_N_SAMPLES:-8}"
 # tau2 has no separate train/eval turn budget the way webshop/alfworld do
 # (--generate-max-turns governs multi_turn.generate's OWN turn loop; tau2's
 # turn loop lives entirely inside the sidecar's Orchestrator, driven by
-# metadata["tau2_max_steps"] instead -- see agent_function.py). One knob for
-# both train and eval keeps this simple; override per-call via
-# data/eval_tau2.yaml's metadata_overrides if train/eval ever need to differ.
-SDPO_REACT_TAU2_MAX_STEPS="${SDPO_REACT_TAU2_MAX_STEPS:-30}"
+# metadata["tau2_max_steps"] instead -- see agent_function.py). TRAIN budget
+# (this env var) and EVAL budget (SDPO_REACT_TAU2_EVAL_MAX_STEPS, forwarded
+# below + read by data/eval_tau2.yaml's metadata_overrides) are DELIBERATELY
+# split, same pattern as every other SDPO_ReAct domain's SDPO_REACT_TRAIN_
+# MAX_TURNS/SDPO_REACT_EVAL_MAX_TURNS.
+#
+# Train default 40 (NOT the tau2-native 100, NOT 30): tau2-bench's own
+# Orchestrator.__init__ defaults to max_steps=100 and its CLI defaults to
+# DEFAULT_MAX_STEPS=200 (tau2/config.py) -- every message counts as one step
+# (agent turn, user turn, AND each individual tool call each +1, confirmed
+# by reading Orchestrator.step()), so a real multi-tool retail/airline task
+# (auth + several lookups + a modify + a confirmation, with the user
+# simulator's own turns interleaved) routinely needs 40-80+ steps. A too-
+# tight budget hits TerminationReason.MAX_STEPS, which tau2's own
+# evaluate_simulation() scores as a HARD reward=0 regardless of whether the
+# agent was about to get it right -- confirmed live on this exact 9B/tau2
+# training run (after the --sglang-tool-call-parser fix below): cap=30 hits
+# MAX_STEPS on 33% of episodes, cap=40 only 13% (concentrated in telecom,
+# which needs the most tool calls/episode), cap=50 just 4%, cap=100 0% --
+# but avg per-episode token cost is ~flat across all four (4275/4452/4412/
+# 4429), since most conversations finish well under 40 turns regardless.
+# 40 is the chosen train-time tradeoff: keeps most of cap=100's near-zero
+# truncation-noise benefit for GRPO/SDPO's group-relative advantage
+# (a real completion getting reward=0 purely from running out of turns
+# corrupts the whole group's advantage estimate) while capping the long
+# tail's contribution to "training is slow" (the original 30 turn cap
+# skewed too far toward speed at truncation-noise's expense; 100 is eval-
+# only precision paid for at 2.5x the train step count for near-zero
+# additional real completions).
+SDPO_REACT_TAU2_MAX_STEPS="${SDPO_REACT_TAU2_MAX_STEPS:-40}"
 export SDPO_REACT_TAU2_MAX_STEPS
+# Eval keeps the full tau2-recommended budget -- see data/eval_tau2.yaml's
+# own metadata_overrides comment for why eval and train diverge here.
+SDPO_REACT_TAU2_EVAL_MAX_STEPS="${SDPO_REACT_TAU2_EVAL_MAX_STEPS:-100}"
+export SDPO_REACT_TAU2_EVAL_MAX_STEPS
 # Same ablation-arm convention as run-qwen3-4B-sdpo-react-native.sh (see the
 # RM_ARGS/GRPO_ARGS case block below): 1 | 1.1 | 2 | 3 | 4 | 5 | 5.1.
 SDPO_REACT_ARM="${SDPO_REACT_ARM:-1.1}"
@@ -112,7 +143,15 @@ echo "SDPO_REACT_THINKING: ${SDPO_REACT_THINKING} | SDPO_REACT_PURE_DISTILL: ${S
 # --- 0b. data prep: tau2 (AReaL-tau2-data, retail+airline+telecom combined) --
 TAU2_DIR="/root/data/tau2_data"
 TRAIN_DATA="$TAU2_DIR/tau2_train.jsonl"
-EVAL_CFG="$SCRIPT_DIR/data/eval_tau2.yaml"
+# SDPO_REACT_TAU2_EVAL_CONFIG override: point at data/eval_tau2_
+# telecom_only.yaml (retail/airline dropped) once those two domains are
+# saturated -- confirmed live: a real ablation run hit airline=100%/
+# retail=100% mean reward at eval_0, only telecom sitting lower -- so
+# continuing to spend 2/3 of every eval's wall-clock on two domains
+# that already read 100% adds no signal. Default stays the full 3-
+# domain yaml (safe default: use this only once you have confirmed the
+# other two domains are actually saturated for THIS run).
+EVAL_CFG="${SDPO_REACT_TAU2_EVAL_CONFIG:-$SCRIPT_DIR/data/eval_tau2.yaml}"
 mkdir -p "$TAU2_DIR"
 [ -f "$TRAIN_DATA" ] || \
     (cd "$REPO_ROOT" && python -m examples.SDPO_ReAct.data.build_tau2_data \
@@ -456,7 +495,7 @@ if [ "${SDPO_REACT_SKIP_EVAL0:-0}" = "1" ]; then
 fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${SDPO_REACT_TP:-1}"
+   --tensor-model-parallel-size "${SDPO_REACT_TP:-2}"
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -485,9 +524,46 @@ WANDB_ARGS=(
    --wandb-key "${WANDB_API_KEY}"
 )
 
+# --sglang-tool-call-parser is NOT optional here, unlike the native/agentic
+# scripts (which drive multi_turn.generate's OWN text-parsing loop over
+# sglang's raw /generate endpoint via --generate-tool-call-parser). tau2
+# instead goes through agentic_tool_call.generate -> the session-server proxy
+# -> sglang's native /v1/chat/completions endpoint (see tools/tau2/agent_
+# function.py's module docstring) -- WITHOUT this flag, sglang never parses
+# <tool_call> tags out of the raw text at all, so message.tool_calls comes
+# back None for every turn. tau2's own LLMAgent (via litellm) only ever reads
+# that structured field, never falls back to text -- confirmed live against a
+# real training dump (sdpo-react-ablation-Qwen3.5-9B-tau2-grpo-a-think): 83%
+# of a 257-episode sample had ZERO tool/tool_calls messages, with the model
+# narrating fake tool results in plain text instead ("I already called
+# get_user_details... let me assume the response was..."), episodes running
+# to the turn cap with reward=0. This single missing flag is the primary
+# cause of eval success rates (33%/56%/4% retail/airline/telecom) landing far
+# below the Qwen tech report's 79.1/79.9 -- not a training/algorithm issue.
+#
+# --sglang-reasoning-parser is DELIBERATELY NOT set here (even with thinking
+# on), unlike the native/agentic scripts: it makes sglang split reasoning out
+# into a separate message.reasoning_content field, but tau2's own generate()
+# (tau2/utils/llm_utils.py) only ever reads response_choice.message.content
+# -- there is no reasoning_content field on tau2's AssistantMessage at all
+# (confirmed live: not in AssistantMessage.model_fields) -- so tau2 silently
+# drops it when relaying the assistant turn back through litellm. On the
+# NEXT turn the session-server compares the message it stored (content +
+# non-empty reasoning_content) against what tau2 sends back (content only,
+# no reasoning_content key) via message_matches() -- TEMPLATE_RELEVANT_KEYS
+# includes reasoning_content, so this mismatches, the append-only checkpoint
+# detector treats it as a brand-new appended message, and since role=
+# 'assistant' is not in --tito-allowed-append-roles (tool/user only) every
+# single turn after the first 400s. Confirmed live: a real run hit ~1740
+# such 400s in under 10 minutes (litellm's own num_retries=3 backoff on each
+# one is also a real contributor to "training is slow"). Leaving reasoning-
+# parser unset keeps <think>...</think> inline in content instead, which
+# survives the tau2 round-trip unchanged (the TITO jinja templates already
+# know how to strip/re-render inline <think> tags).
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION:-0.75}"
+   --sglang-tool-call-parser qwen25
 )
 
 MISC_ARGS=(
@@ -548,6 +624,7 @@ ray job submit --address="http://127.0.0.1:8265" \
         \"SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK\": \"1\",
         \"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR\": \"1\",
         \"SDPO_REACT_TAU2_MAX_STEPS\": \"${SDPO_REACT_TAU2_MAX_STEPS}\",
+        \"SDPO_REACT_TAU2_EVAL_MAX_STEPS\": \"${SDPO_REACT_TAU2_EVAL_MAX_STEPS}\",
         \"TAU_USER_MODEL_PROVIDER\": \"${TAU_USER_MODEL_PROVIDER:-openai}\",
         \"TAU_USER_MODEL\": \"${TAU_USER_MODEL:-gpt-5.6-luna}\",
         \"OPENAI_API_URL\": \"${OPENAI_API_URL:-}\",

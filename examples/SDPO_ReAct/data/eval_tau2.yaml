@@ -12,6 +12,19 @@
 # tool-spec mechanism) and prompt/label are placeholders (the real
 # conversation is driven entirely by tau2's Orchestrator, see
 # tools/tau2/agent_function.py's module docstring).
+#
+# metadata_overrides.tau2_max_steps: eval gets its OWN (larger) turn budget
+# than train, same split as every other SDPO_ReAct domain's generate_max_turns
+# (SDPO_REACT_TRAIN_MAX_TURNS/SDPO_REACT_EVAL_MAX_TURNS) -- agent_function.py's
+# run() reads metadata["tau2_max_steps"] first, falling back to the run
+# script's SDPO_REACT_TAU2_MAX_STEPS env var only when this is absent. Eval
+# runs are infrequent/small-sample and exist to report an honest benchmark
+# number, so it's worth spending the full tau2-recommended budget (100) to
+# avoid the SAME artificial MAX_STEPS=0-reward truncation that motivated
+# lowering the TRAIN budget in the first place -- see run-qwen3-4B-sdpo-
+# react-tau2.sh's SDPO_REACT_TAU2_MAX_STEPS comment for the train-side
+# tradeoff (40: confirmed live to cut the truncation rate from 33% at 30 to
+# 13% at 40, at roughly the same avg token cost, vs 0% at 100).
 eval:
   defaults:
     max_response_len: 8192
@@ -22,11 +35,17 @@ eval:
       path: /root/data/tau2_data/tau2_retail_eval.jsonl
       rm_type: null
       n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        tau2_max_steps: ${oc.decode:${oc.env:SDPO_REACT_TAU2_EVAL_MAX_STEPS,100}}
     - name: tau2_airline
       path: /root/data/tau2_data/tau2_airline_eval.jsonl
       rm_type: null
       n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        tau2_max_steps: ${oc.decode:${oc.env:SDPO_REACT_TAU2_EVAL_MAX_STEPS,100}}
     - name: tau2_telecom
       path: /root/data/tau2_data/tau2_telecom_eval.jsonl
       rm_type: null
       n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        tau2_max_steps: ${oc.decode:${oc.env:SDPO_REACT_TAU2_EVAL_MAX_STEPS,100}}

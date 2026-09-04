@@ -20,6 +20,16 @@
 # the multitask/search domains need them and the retriever needs its own GPU
 # reservation, which is a per-run decision, not a per-enroot-session one.
 #
+# The webshop/alfworld (SDPO_REACT_RUN_FAMILY=agentic) train/eval jsonl files
+# ARE built HERE, on the host, unlike search's -- because build_webshop_data.py
+# / build_alfworld_data.py MUST import gym / alfworld, which are deliberately
+# NOT installed in the training image (see tools/{webshop,alfworld}/docker/
+# Dockerfile), and the training session has no `docker` binary to shell out
+# to the sidecar with once it's inside enroot. So this launcher starts both
+# sidecars and `docker exec`s the builders into them before `enroot start`,
+# writing straight onto $DATA_DIR (the host path enroot mounts as /root/data)
+# -- the run script's own [-f ...] || python -m ...build_*_data then no-ops.
+#
 #   IMAGE   (default radixark/miles:latest-cu12)   docker image (driver 570 -> cu12)
 #   SQSH    (default $ENROOT_NVME/miles-cu12.sqsh)  imported squashfs image
 #   CONTAINER (default miles-sdpo-react-cu12)       enroot container name
@@ -87,6 +97,44 @@ mkdir -p "$ENROOT_NVME" "$ENROOT_CACHE_PATH" "$ASSETS" "$ASSETS/hf_cache" \
 # --- 0. sandbox sidecar on the HOST (before entering enroot) -----------------
 bash "$SCRIPT_DIR/tools/run_sandbox.sh"
 
+# --- 0b. webshop/alfworld data prep on the HOST (agentic family only) --------
+# build_webshop_data.py / build_alfworld_data.py MUST run inside their own
+# sidecar's container (gym / alfworld -- deliberately absent from the training
+# image, see tools/{webshop,alfworld}/docker/Dockerfile) -- but the training
+# session started below has no `docker` binary to shell out to the sidecar
+# with. So generate the jsonl files here, on the HOST, via `docker exec` into
+# the (idempotently-started) sidecar containers, straight onto $DATA_DIR --
+# the same host path the enroot session below mounts as /root/data -- BEFORE
+# entering enroot. Every run script's own [-f ...] || python -m ...
+# build_*_data invocation then finds the files already present and no-ops.
+if [ "${SDPO_REACT_RUN_FAMILY:-native}" = "agentic" ]; then
+    bash "$SCRIPT_DIR/tools/webshop/run_webshop_sidecar.sh"
+    bash "$SCRIPT_DIR/tools/alfworld/run_alfworld_sidecar.sh"
+    WEBSHOP_CONTAINER="${WEBSHOP_CONTAINER:-sdpo-react-webshop}"
+    ALFWORLD_CONTAINER="${ALFWORLD_CONTAINER:-sdpo-react-alfworld}"
+    mkdir -p "$DATA_DIR/webshop_data" "$DATA_DIR/alfworld_data"
+    if [ ! -f "$DATA_DIR/webshop_data/webshop_train.jsonl" ]; then
+        docker cp "$SCRIPT_DIR/data/build_webshop_data.py" "$WEBSHOP_CONTAINER:/tmp/build_webshop_data.py"
+        docker exec "$WEBSHOP_CONTAINER" mkdir -p /tmp/webshop_out
+        docker exec "$WEBSHOP_CONTAINER" python3 /tmp/build_webshop_data.py \
+            --out-dir /tmp/webshop_out \
+            --n-train "${SDPO_REACT_WEBSHOP_N_TRAIN:-400}" --n-eval "${SDPO_REACT_WEBSHOP_N_EVAL:-100}"
+        docker cp "$WEBSHOP_CONTAINER:/tmp/webshop_out/webshop_train.jsonl" "$DATA_DIR/webshop_data/webshop_train.jsonl"
+        docker cp "$WEBSHOP_CONTAINER:/tmp/webshop_out/webshop_eval.jsonl" "$DATA_DIR/webshop_data/webshop_eval.jsonl"
+    fi
+    if [ ! -f "$DATA_DIR/alfworld_data/alfworld_train.jsonl" ]; then
+        docker cp "$SCRIPT_DIR/data/build_alfworld_data.py" "$ALFWORLD_CONTAINER:/tmp/build_alfworld_data.py"
+        docker exec "$ALFWORLD_CONTAINER" mkdir -p /tmp/alfworld_out
+        docker exec "$ALFWORLD_CONTAINER" python3 /tmp/build_alfworld_data.py \
+            --out-dir /tmp/alfworld_out \
+            --n-train "${SDPO_REACT_ALFWORLD_N_TRAIN:-400}" \
+            --n-eval-id "${SDPO_REACT_ALFWORLD_N_EVAL_ID:-100}" --n-eval-ood "${SDPO_REACT_ALFWORLD_N_EVAL_OOD:-100}"
+        docker cp "$ALFWORLD_CONTAINER:/tmp/alfworld_out/alfworld_train.jsonl" "$DATA_DIR/alfworld_data/alfworld_train.jsonl"
+        docker cp "$ALFWORLD_CONTAINER:/tmp/alfworld_out/alfworld_eval_id.jsonl" "$DATA_DIR/alfworld_data/alfworld_eval_id.jsonl"
+        docker cp "$ALFWORLD_CONTAINER:/tmp/alfworld_out/alfworld_eval_ood.jsonl" "$DATA_DIR/alfworld_data/alfworld_eval_ood.jsonl"
+    fi
+fi
+
 # --- 1. import image -> squashfs on NVMe (skip if already imported) ----------
 if [ ! -f "$SQSH" ]; then
     enroot import -o "$SQSH" "docker://${IMAGE}"
@@ -118,6 +166,8 @@ enroot start --rw \
     --env SDPO_REACT_ALFWORLD_N_EVAL_OOD="${SDPO_REACT_ALFWORLD_N_EVAL_OOD:-}" \
     --env SDPO_REACT_TAU2_SIDECAR_URL="${SDPO_REACT_TAU2_SIDECAR_URL:-}" \
     --env SDPO_REACT_TAU2_MAX_STEPS="${SDPO_REACT_TAU2_MAX_STEPS:-}" \
+    --env SDPO_REACT_TAU2_EVAL_MAX_STEPS="${SDPO_REACT_TAU2_EVAL_MAX_STEPS:-}" \
+    --env SDPO_REACT_TAU2_EVAL_CONFIG="${SDPO_REACT_TAU2_EVAL_CONFIG:-}" \
     --env SDPO_REACT_TAU2_N_EVAL_PER_DOMAIN="${SDPO_REACT_TAU2_N_EVAL_PER_DOMAIN:-}" \
     --env TAU_USER_MODEL_PROVIDER="${TAU_USER_MODEL_PROVIDER:-}" \
     --env TAU_USER_MODEL="${TAU_USER_MODEL:-}" \
@@ -126,6 +176,8 @@ enroot start --rw \
     --env SDPO_REACT_ARM="${SDPO_REACT_ARM:-}" \
     --env SDPO_ABLATION_ALGO="${SDPO_ABLATION_ALGO:-}" \
     --env SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:-}" \
+    --env SDPO_ABLATION_SKILL_KD_MODE="${SDPO_ABLATION_SKILL_KD_MODE:-}" \
+    --env SDPO_ABLATION_SKILL_KD_COEF="${SDPO_ABLATION_SKILL_KD_COEF:-}" \
     --env SDPO_REACT_PROMPT="${SDPO_REACT_PROMPT:-}" \
     --env SDPO_REACT_NUM_ROLLOUT="${SDPO_REACT_NUM_ROLLOUT:-}" \
     --env SDPO_REACT_THINKING="${SDPO_REACT_THINKING:-}" \
@@ -135,6 +187,7 @@ enroot start --rw \
     --env SDPO_REACT_MIN_CORRECT="${SDPO_REACT_MIN_CORRECT:-}" \
     --env SDPO_REACT_DYNAMIC_SAMPLE="${SDPO_REACT_DYNAMIC_SAMPLE:-}" \
     --env SDPO_REACT_ROLLOUT_BATCH="${SDPO_REACT_ROLLOUT_BATCH:-}" \
+    --env SDPO_REACT_GLOBAL_BATCH="${SDPO_REACT_GLOBAL_BATCH:-}" \
     --env SDPO_REACT_TP="${SDPO_REACT_TP:-}" \
     --env SDPO_REACT_MAX_TOKENS_PER_GPU="${SDPO_REACT_MAX_TOKENS_PER_GPU:-}" \
     --env SDPO_ABLATION_MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-}" \
@@ -152,6 +205,10 @@ enroot start --rw \
     --env SDPO_REACT_NOTE="${SDPO_REACT_NOTE:-}" \
     --env SDPO_REACT_TRAIN_MAX_TURNS="${SDPO_REACT_TRAIN_MAX_TURNS:-}" \
     --env SDPO_REACT_EVAL_MAX_TURNS="${SDPO_REACT_EVAL_MAX_TURNS:-}" \
+    --env SDPO_REACT_EVAL_N_SAMPLES="${SDPO_REACT_EVAL_N_SAMPLES:-}" \
+    --env SDPO_REACT_EVAL_CONFIG="${SDPO_REACT_EVAL_CONFIG:-}" \
+    --env SDPO_REACT_MAX_RESPONSE_LEN="${SDPO_REACT_MAX_RESPONSE_LEN:-}" \
+    --env SDPO_REACT_TAG_SUFFIX="${SDPO_REACT_TAG_SUFFIX:-}" \
     --env HF_HOME=/root/hf_cache \
     --env TRITON_CACHE_DIR=/root/caches/triton \
     --env TORCHINDUCTOR_CACHE_DIR=/root/caches/inductor \
@@ -211,6 +268,22 @@ enroot start --rw \
                 # (see that script own header) -- no qwen3.5 variant yet.
                 TAU2_RUN_SH="$NATIVE_RUN_SH"
                 ;;
+            qwen3.5-4B-ablation)
+                # Qwen3.5-4B ablation matrix (examples/SDPO_ReAct/ablation/) --
+                # the two-axis SDPO_ABLATION_ALGO x SDPO_ABLATION_ARM scripts,
+                # not the older single-axis SDPO_REACT_ARM
+                # run-qwen3-4B-sdpo-react-{native,agentic}.sh used by the
+                # qwen3.5-native branch above. Same MODEL_DIR/HF_REPO/MODEL_SH
+                # as qwen3.5-native (same weights) -- only the RUN_SH targets
+                # differ, mirroring the qwen3.5-9B branch own ablation mapping
+                # below (same pattern as the mathcodesearch header uses).
+                MODEL_DIR=Qwen3.5-4B
+                HF_REPO=Qwen/Qwen3.5-4B
+                MODEL_SH=scripts/models/qwen3.5-4B.sh
+                NATIVE_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-4B-sdpo-react-ablation-mathcodesearch.sh
+                AGENTIC_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-4B-sdpo-react-ablation-alfworld-webshop.sh
+                TAU2_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-4B-sdpo-react-ablation-tau2.sh
+                ;;
             qwen3.5-27B)
                 # Qwen3.5-27B DENSE. Same native SDPO-ReAct arms as the 4B run,
                 # but the large-model launcher (TP=4, CPU-offloaded optimizer).
@@ -240,16 +313,38 @@ enroot start --rw \
                 AGENTIC_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-alfworld-webshop.sh
                 TAU2_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-9B-sdpo-react-ablation-tau2.sh
                 ;;
+            qwen3.6-27B)
+                # Qwen3.6-27B DENSE -- newest Qwen3.5-family checkpoint
+                # (same megatron spec, qwen3_5, confirmed via diffing
+                # scripts/models/qwen3.5-27B.sh against qwen3.6-27B.sh).
+                # Only the tau2 ablation script exists for this model so far
+                # (see examples/SDPO_ReAct/ablation/run-qwen3.6-27B-sdpo-
+                # react-ablation-tau2.sh header) -- NATIVE_RUN_SH/
+                # AGENTIC_RUN_SH fall back to the existing 27B/35B-A3B native
+                # script (same fallback pattern as e.g. qwen3.5-27B branch)
+                # until mathcodesearch/alfworld-webshop siblings are written
+                # for this model too.
+                MODEL_DIR=Qwen3.6-27B
+                HF_REPO=Qwen/Qwen3.6-27B
+                MODEL_SH=scripts/models/qwen3.6-27B.sh
+                NATIVE_RUN_SH=examples/SDPO_ReAct/run-qwen3.5-27B-35BA3B-sdpo-react-native.sh
+                AGENTIC_RUN_SH="$NATIVE_RUN_SH"
+                TAU2_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.6-27B-sdpo-react-ablation-tau2.sh
+                ;;
             qwen3.5-35B-A3B)
-                # Qwen3.5-35B-A3B MoE (256 experts, top-8, ~3B active). Same arms;
-                # the large-model launcher sets EP=8 + R3 rollout-routing-replay
-                # (train/inference router alignment). MODEL_SH drives the convert.
+                # Qwen3.5-35B-A3B MoE (256 experts, top-8, ~3B active) ablation
+                # matrix (examples/SDPO_ReAct/ablation/) -- same two-axis
+                # SDPO_ABLATION_ALGO x SDPO_ABLATION_ARM scripts as the 9B
+                # block above, not the older single-axis SDPO_REACT_ARM
+                # run-qwen3.5-27B-35BA3B-sdpo-react-native.sh. The large-model
+                # launcher sets EP=8 + R3 rollout-routing-replay (train/
+                # inference router alignment). MODEL_SH drives the convert.
                 MODEL_DIR=Qwen3.5-35B-A3B
                 HF_REPO=Qwen/Qwen3.5-35B-A3B
                 MODEL_SH=scripts/models/qwen3.5-35B-A3B.sh
-                NATIVE_RUN_SH=examples/SDPO_ReAct/run-qwen3.5-27B-35BA3B-sdpo-react-native.sh
-                AGENTIC_RUN_SH="$NATIVE_RUN_SH"
-                TAU2_RUN_SH="$NATIVE_RUN_SH"
+                NATIVE_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-35B-A3B-sdpo-react-ablation-mathcodesearch.sh
+                AGENTIC_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-35B-A3B-sdpo-react-ablation-alfworld-webshop.sh
+                TAU2_RUN_SH=examples/SDPO_ReAct/ablation/run-qwen3.5-35B-A3B-sdpo-react-ablation-tau2.sh
                 export SDPO_REACT_MODEL=qwen3.5-35B-A3B
                 ;;
             *)

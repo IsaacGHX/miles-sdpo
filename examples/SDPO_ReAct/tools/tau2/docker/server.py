@@ -79,11 +79,15 @@ Contract (see ../agent_function.py for the caller side):
     GET /health -> {"status": "ok"}
 """
 
+import asyncio
 import json
 import logging
-from asyncio import to_thread
+import os
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
+import httpx
+import litellm
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -99,10 +103,65 @@ from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
 from tau2.orchestrator.orchestrator import Orchestrator
 from tau2.user.user_simulator import UserSimulator
 
+# tau2.utils.llm_utils (imported transitively by every tau2.* import above)
+# sets litellm.client_session/aclient_session to a SINGLE process-wide
+# httpx.Client/AsyncClient at ITS OWN import time with max_connections=10,
+# max_keepalive_connections=5 (upstream's own hardcoded default -- sized for
+# a single-conversation CLI/notebook, not concurrent RL training). litellm's
+# OpenAIChatCompletion._get_sync_http_client() checks `if litellm.
+# client_session is not None: return litellm.client_session` BEFORE ever
+# consulting api_base/cache-key logic, so this ONE object is reused for
+# every agent AND user-simulator call across EVERY episode, regardless of
+# each episode's distinct api_base -- confirmed live via py-spy thread dump
+# against a real training run: 116 threads across ~85 concurrent episodes
+# all blocked in httpcore's wait_for_connection on the exact same
+# <ConnectionPool> object. This was the actual ceiling behind "GPU
+# utilization sits near-0 with only occasional single-GPU spikes" --
+# raising the to_thread executor to 256 (below) did nothing for THIS
+# bottleneck on its own, since the episodes it freed to run concurrently all
+# immediately queued back up on this global 10-connection cap. Must
+# overwrite AFTER the tau2 imports above (which is when llm_utils.py's
+# module-level assignment actually runs) or tau2's own import silently wins
+# and this override never takes effect.
+os.environ.setdefault("TAU2_HTTPX_MAX_CONNECTIONS", "256")
+_httpx_limits = httpx.Limits(
+    max_connections=int(os.environ["TAU2_HTTPX_MAX_CONNECTIONS"]),
+    max_keepalive_connections=int(os.environ["TAU2_HTTPX_MAX_CONNECTIONS"]),
+)
+litellm.client_session = httpx.Client(limits=_httpx_limits)
+litellm.aclient_session = httpx.AsyncClient(limits=_httpx_limits)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("tau2_sidecar")
 
 app = FastAPI()
+
+# asyncio.to_thread's own default executor caps at min(32, cpu_count()+4)
+# (concurrent.futures.ThreadPoolExecutor's own hardcoded default) REGARDLESS
+# of how many cores the container actually has -- confirmed live via py-spy
+# thread dump against a real training run: exactly 31-32 threads sitting
+# inside Orchestrator.run() at once, everything past that queued with zero
+# thread to run on, while host CPU sat ~88% idle (each episode's real work is
+# network-bound: waiting on OUR OWN sglang engine + the external user-
+# simulator gateway, not local computation -- confirmed via per-message
+# timestamp deltas in a real dump: environment.get_response() tool-execution
+# steps take ~50ms, but tool->assistant/user->assistant turns average 7+s).
+# That silent 32-episode ceiling meant most of an 8-GPU node's sglang engines
+# had nothing queued to run at any given moment, regardless of how large
+# --sglang-server-concurrency was set on the training side. 256 is a plain
+# thread-count increase, not a resource ask -- these threads spend nearly all
+# their time blocked on I/O, so raising the cap costs ~nothing on either CPU
+# or memory (each idle thread's stack is a few KB, not competing for cores).
+_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("TAU2_SIDECAR_MAX_WORKERS", "256")), thread_name_prefix="tau2-run"
+)
+
+
+async def to_thread(func, /, *args, **kwargs):
+    """``asyncio.to_thread`` against ``_EXECUTOR`` instead of the loop's
+    tiny (cpu_count-capped-at-32) default -- see ``_EXECUTOR``'s comment."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EXECUTOR, lambda: func(*args, **kwargs))
 
 # One (DB loader, env constructor) pair per domain. Loading the DB is kept
 # separate from constructing the Environment so the SAME loaded db object can
@@ -239,7 +298,17 @@ def _run_task_sync(req: RunRequest) -> RunResponse:
 
     return RunResponse(
         reward=float(reward_info.reward),
-        messages=[m.model_dump(mode="json") for m in (simulation.messages or [])],
+        # exclude={"raw_data"}: AssistantMessage/UserMessage both carry the
+        # COMPLETE raw litellm/OpenAI API response object in this field
+        # (ToolMessage has no such field -- pydantic's exclude is a no-op on
+        # a model that lacks the key, confirmed live). Confirmed live against
+        # a real training dump: one 31-message episode's raw_data fields
+        # alone totaled ~8MB (vs ~130KB of actual message content), and the
+        # cumulative agentic_traces dump for one training run reached 13GB
+        # uncompressed -- pure serialization/disk overhead with zero
+        # training value (nothing downstream reads raw_data: not the reward,
+        # not the dashboard, not _sample_to_agentic_trace_record).
+        messages=[m.model_dump(mode="json", exclude={"raw_data"}) for m in (simulation.messages or [])],
         termination_reason=str(simulation.termination_reason),
         task_id=task.id,
         reward_breakdown=reward_breakdown,
