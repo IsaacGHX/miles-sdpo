@@ -42,6 +42,7 @@ from examples.SDPO.reward import (
     _grade_one_tau2,
     _grade_one_webshop,
     _is_correct,
+    _llm_judge_correct,
     _sample_domain,
 )
 from examples.SDPO.sdpo import sdpo_eval_reward as _sdpo_eval_reward
@@ -313,6 +314,8 @@ async def sdpo_react_plain_grpo_reward(args: Namespace, sample: Sample, **kwargs
         ok = _grade_one_alfworld(sample, args)
     elif domain == "tau2":
         ok = _grade_one_tau2(sample, args)
+    elif sample.metadata.get("amo_use_judge") and getattr(args, "sdpo_judge", False) and (sample.response or "").strip():
+        ok = await _llm_judge_correct(args, sample)
     else:
         ok = _is_correct(sample, args)
     # Stamp so the trace dump below (and any other consumer expecting the
