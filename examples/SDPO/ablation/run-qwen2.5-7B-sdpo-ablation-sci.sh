@@ -56,39 +56,28 @@
 # NO --sdpo-remove-thinking-from-demonstration anywhere (no <think> block to
 # strip from a peer's response).
 #
-# A100-80G retune (NOT copied verbatim from the H200-141GB sci-colocate
-# scripts, which explicitly size for 141GB): MAX_TOKENS_PER_GPU default 8192
-# (vs H200's 24576), arms e/f (heaviest -- extra skill forward/backward) drop
-# further to 4096 (vs H200's 16384), matching the SAME per-arm memory-tuning
-# pattern the H200 sci scripts already established for their own heaviest
-# arm. --sglang-mem-fraction-static default 0.6 (vs H200's 0.75). TP=1 kept
-# (Qwen2.5-7B dense, ~14GB bf16 weights alone comfortably fits one A100; the
-# lower token cap buys back the activation/optimizer/KV headroom under
-# colocate that TP=2 would otherwise be needed for). --optimizer-cpu-offload
-# added (not in the H200 script) since 80G has much less slack than 141G.
-# THESE ARE STARTING POINTS, not validated against real A100 hardware (none
-# available in this session, confirmed via nvidia-smi showing H200s only) --
-# retune further on the first real OOM.
+# H200-141GB sizing (2026-08-10, running on confirmed 8xH200 hardware --
+# reverted from the earlier A100-80G-scoped defaults this script shipped
+# with, since this session's nvidia-smi has only ever shown H200s). Matches
+# ../run-qwen2.5-7B-sdpo-sci-colocate.sh's own H200 numbers: MAX_TOKENS_PER_GPU
+# default 24576, arms e/f (heaviest -- extra skill forward/backward) drop to
+# 16384. --sglang-mem-fraction-static default 0.75 (matching the sci-colocate
+# script's own Qwen2.5-7B number). TP=1 kept (Qwen2.5-7B dense, ~14GB bf16
+# weights alone comfortably fits one H200). --optimizer-cpu-offload kept even
+# though 141GB has more slack than 80G -- harmless at this token budget and
+# avoids re-deriving whether it's still needed.
 #
-# Real single-case verification (2026-08-08, on an 8xH200 node -- no A100
-# available, run against the Olmo3-7B sibling script since both share this
-# exact algo/arm/PERF_ARGS shape): GRPO+arm e ran end-to-end for 8 train
-# steps with no crash -- sdpo_skill_kd_loss/skill_kl_correct/skill_kl_pitfall
-# all nonzero and stable, confirming self-success + pitfall-condense both
-# actually fire under plain GRPO (--sdpo-logprob-mode sampled without
-# --sdpo-rlsd). Peak VRAM observed: ~94.5GB/143.7GB per GPU (steady across 8
-# steps, not still climbing). This is NOT a direct 80G-overflow signal:
-# --sglang-mem-fraction-static is a FRACTION of total card VRAM (0.6 ->
-# ~83GB reserved for SGLang on this H200, but only ~48GB on an 80G card), so
-# the rollout-engine share of that 94.5GB shrinks automatically on a smaller
-# card. What does NOT shrink automatically is the Megatron actor's own
-# footprint (weights + optimizer state + activations, sized by
-# --max-tokens-per-gpu / parallelism, not by total card size) -- this run
-# did not isolate that actor-only number from the combined peak, so whether
-# MAX_TOKENS_PER_GPU=4096 for arms e/f still fits an 80G card's post-mem-
-# fraction remainder is NOT yet confirmed. Left as-is pending a real A100
-# run; the actor-only VRAM breakdown is the next thing to measure before
-# trusting arm e/f's 4096 default on an actual 80G card.
+# Real single-case verification (2026-08-08, on an 8xH200 node, run against
+# the Olmo3-7B sibling script since both share this exact algo/arm/PERF_ARGS
+# shape): GRPO+arm e ran end-to-end for 8 train steps with no crash --
+# sdpo_skill_kd_loss/skill_kl_correct/skill_kl_pitfall all nonzero and
+# stable, confirming self-success + pitfall-condense both actually fire
+# under plain GRPO (--sdpo-logprob-mode sampled without --sdpo-rlsd). Peak
+# VRAM observed: ~94.5GB/143.7GB per GPU (steady across 8 steps, not still
+# climbing) at the OLD A100-scoped MAX_TOKENS_PER_GPU=4096/mem-fraction=0.6
+# for arm e -- so the new 16384/0.75 H200 numbers below are NOT yet
+# re-verified against a fresh OOM check; retune on the first real OOM under
+# these bumped defaults.
 #
 # Path parameterization (every local save/load path overridable from
 # outside, declared here at the top instead of hardcoded deep in the body):
@@ -102,8 +91,20 @@
 #   SDPO_ABLATION_ALGO           (required) grpo | sdpo | rlsd
 #   SDPO_ABLATION_ARM            (required) a | b | c | d | e | f
 #   SDPO_ABLATION_NUM_ROLLOUT    (default 201 -- per user request 2026-08-08, bumped from spec default 101)
-#   SDPO_ABLATION_MAX_TOKENS_PER_GPU  (default 8192, 4096 for arms e/f)
-#   SDPO_ABLATION_SGLANG_MEM_FRACTION (default 0.6)
+#   SDPO_ABLATION_MAX_TOKENS_PER_GPU  (default 24576, 16384 for arms e/f -- H200 sizing, see header)
+#   SDPO_ABLATION_SGLANG_MEM_FRACTION (default 0.75 -- H200 sizing, see header)
+#   SDPO_ABLATION_EVAL_SKILL_MODE (default off) off | correct | pitfall | all --
+#       EVAL-time skill augmentation (opt-in, does not change training): before
+#       each real eval rollout, self-predict the configured skill type(s) from
+#       the problem alone (blind, same self-predict prompts training's own
+#       blind-correct/pitfall-condense skill-gen uses) and splice into the
+#       eval prompt's user turn, so eval measures the model answering WITH its
+#       own self-predicted skill already in context. Wires
+#       --custom-generate-function-path examples.SDPO.sdpo.sdpo_eval_generate
+#       (miles/utils/arguments.py's validate_args requires this whenever the
+#       mode isn't "off", else it raises). Independent of training's own
+#       --sdpo-skill-kd-mode -- set manually to match, e.g. 'pitfall' for a
+#       run that only cares about pitfall-avoidance skill quality.
 #
 # usage:
 #   SDPO_ABLATION_ALGO=sdpo SDPO_ABLATION_ARM=d \
@@ -137,9 +138,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 MODEL_NAME=Qwen2.5-7B-Instruct
-MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-8192}"
+MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-24576}"
 if [ "$SDPO_ABLATION_ARM" = "e" ] || [ "$SDPO_ABLATION_ARM" = "f" ]; then
-    MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-4096}"
+    MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-16384}"
 fi
 echo "MODEL: ${MODEL_NAME} | max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}"
 source "$REPO_ROOT/scripts/models/qwen2.5-7B.sh"
@@ -333,6 +334,13 @@ EVAL_ARGS=(
    --eval-top-p 1
    --eval-custom-rm-path examples.SDPO.sdpo.sdpo_eval_reward
 )
+SDPO_ABLATION_EVAL_SKILL_MODE="${SDPO_ABLATION_EVAL_SKILL_MODE:-off}"
+if [ "$SDPO_ABLATION_EVAL_SKILL_MODE" != "off" ]; then
+    EVAL_ARGS+=(
+       --custom-generate-function-path examples.SDPO.sdpo.sdpo_eval_generate
+       --sdpo-eval-skill-mode "${SDPO_ABLATION_EVAL_SKILL_MODE}"
+    )
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size 1
@@ -369,7 +377,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static "${SDPO_ABLATION_SGLANG_MEM_FRACTION:-0.6}"
+   --sglang-mem-fraction-static "${SDPO_ABLATION_SGLANG_MEM_FRACTION:-0.75}"
    --sglang-router-policy round_robin
 )
 
