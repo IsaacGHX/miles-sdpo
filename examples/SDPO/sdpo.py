@@ -2123,6 +2123,19 @@ async def sdpo_eval_generate(input: Any) -> Any:
     return GenerateFnOutput(samples=sample)
 
 
+def _eval_judge_on(args: Namespace) -> bool:
+    """Whether the LLM judge is enabled on the EVAL path.
+
+    --sdpo-judge (unchanged) turns the judge on for BOTH training and eval.
+    --sdpo-eval-judge is an ADDITIONAL opt-in that turns it on for eval ONLY,
+    for a run that needs a judged eval set but must keep its own training
+    grader: on a pure-math training group, _grade_group routes every sample to
+    the judge and replaces --sdpo-grader dapo entirely. Grading semantics for
+    any existing flag combination are identical to before this switch existed.
+    """
+    return bool(getattr(args, "sdpo_judge", False) or getattr(args, "sdpo_eval_judge", False))
+
+
 async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> float:
     """Per-sample eval RM for SDPO (--eval-custom-rm-path).
 
@@ -2155,7 +2168,7 @@ async def sdpo_eval_reward(args: Namespace, sample: Sample, **kwargs: Any) -> fl
         # here (the tau2 sidecar itself already called the user-simulator
         # LLM during orchestration; that's outside this function's scope).
         ok = _grade_one_tau2(sample, args)
-    elif getattr(args, "sdpo_judge", False) and (sample.response or "").strip():
+    elif _eval_judge_on(args) and (sample.response or "").strip():
         # Eval fans out one sdpo_eval_reward coroutine per sample via asyncio.gather
         # upstream, so honor the SAME global concurrency cap to avoid flooding the
         # gateway during large evals.

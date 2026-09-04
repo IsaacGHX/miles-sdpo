@@ -199,6 +199,174 @@ def _judge_semaphore(args: Namespace) -> asyncio.Semaphore:
     return _JUDGE_SEM
 
 
+# --------------------------------------------------------------------------- #
+# judge transport: AWS Bedrock Converse (default) — see _judge_call_bedrock
+# --------------------------------------------------------------------------- #
+
+# Bedrock rejects maxTokens below 16 for some models (gpt-5.6-luna among them).
+_BEDROCK_MIN_MAX_TOKENS = 16
+# Many Bedrock models (all openai.* included) are not invocable on-demand by their
+# raw modelId and require a cross-region inference profile; the profile id is just
+# the modelId with a region-scope prefix. Try the raw id, then these.
+_BEDROCK_PROFILE_PREFIXES = ("us.", "global.")
+
+# Gateway-style judge names -> Bedrock modelIds. Every existing run script passes
+# the SFR-gateway name (--sdpo-judge-model gpt-5.6-luna), which is NOT a Bedrock id
+# (Bedrock namespaces by provider: openai.gpt-5.6-luna). Without this map, flipping
+# the default backend to bedrock would send those runs to a nonexistent model and
+# silently degrade every judged sample to the deterministic fallback.
+_BEDROCK_MODEL_ALIASES = {
+    "gpt-5.6-luna": "openai.gpt-5.6-luna",
+    "gpt-5.4-mini": "openai.gpt-5.4-mini",
+}
+
+# One boto3 client per (region) per process. botocore clients are thread-safe for
+# issuing calls, and creating one costs a session + endpoint resolution, so we must
+# NOT build one per judge request (thousands per rollout).
+_BEDROCK_CLIENTS: dict[str, object] = {}
+# modelId -> the id that actually worked, so the on-demand/inference-profile probe
+# runs once per process instead of on every call.
+_BEDROCK_RESOLVED_MODEL: dict[str, str] = {}
+
+
+# A reasoning judge that hits maxTokens returns reasoning only and no verdict; the
+# retry gets this much budget instead. 4x the default 2048 is far above the 7-327
+# output tokens a real judge prompt actually uses, so the retry is rare and cheap.
+_BEDROCK_RETRY_MAX_TOKENS = 8192
+
+
+def _bedrock_reply_text(resp: dict) -> str | None:
+    """The assistant's visible text from a Converse response, or None if there is none.
+
+    MUST NOT be content[0]["text"]. gpt-5.6-luna is a reasoning model, and on a
+    real judge prompt it returns TWO content blocks with the reasoning FIRST:
+    [{'reasoningContent': ...}, {'text': 'CORRECT'}]. Indexing block 0 raises
+    KeyError('text') -- observed as 491 consecutive
+    "LLM judge failed (KeyError('text'))" lines in a live run, i.e. EVERY judged
+    sample silently degrading to deterministic grading. Short prompts happen to
+    answer with a single text block, which is why a smoke test misses this.
+
+    Returns None when the model spent the whole budget reasoning and never emitted
+    a verdict (stopReason == 'max_tokens'). The reasoning is NOT a usable
+    substitute: luna returns it as reasoningContent.redactedContent, encrypted
+    bytes. The caller retries with a bigger budget.
+    """
+    blocks = resp.get("output", {}).get("message", {}).get("content", []) or []
+    text = "\n".join(b["text"] for b in blocks if isinstance(b, dict) and "text" in b).strip()
+    if text:
+        return text
+    # Plaintext reasoning (some models/settings) does carry the verdict -- use it.
+    reasoning = [
+        ((b.get("reasoningContent") or {}).get("reasoningText") or {}).get("text", "")
+        for b in blocks
+        if isinstance(b, dict) and "reasoningContent" in b
+    ]
+    joined = "\n".join(r for r in reasoning if r).strip()
+    return joined or None
+
+
+def _bedrock_client(region: str):
+    client = _BEDROCK_CLIENTS.get(region)
+    if client is None:
+        import boto3  # imported lazily: only the bedrock backend needs it
+
+        client = boto3.client("bedrock-runtime", region_name=region)
+        _BEDROCK_CLIENTS[region] = client
+    return client
+
+
+def _bedrock_converse_sync(region: str, model: str, system: str, user: str, max_tokens: int) -> str:
+    """Blocking Bedrock Converse call returning the reply text.
+
+    Runs in a worker thread (see _judge_call_bedrock) because boto3 is sync and
+    would otherwise stall the rollout event loop for the whole judge latency.
+    """
+    from botocore.exceptions import ClientError
+
+    rt = _bedrock_client(region)
+    kwargs = {
+        "messages": [{"role": "user", "content": [{"text": user}]}],
+        "system": [{"text": system}],
+        "inferenceConfig": {"maxTokens": max(max_tokens, _BEDROCK_MIN_MAX_TOKENS)},
+    }
+
+    candidates = [_BEDROCK_RESOLVED_MODEL.get(model, model)]
+    for prefix in _BEDROCK_PROFILE_PREFIXES:
+        cand = prefix + model
+        if not model.startswith(_BEDROCK_PROFILE_PREFIXES) and cand not in candidates:
+            candidates.append(cand)
+
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            resp = rt.converse(modelId=candidate, **kwargs)
+        except ClientError as e:
+            last_err = e
+            msg = e.response.get("Error", {}).get("Message", "")
+            # Only the "needs an inference profile" error is worth retrying under a
+            # different id; anything else (throttling, auth, bad request) is real.
+            if "on-demand throughput" in msg or "inference profile" in msg:
+                continue
+            raise
+        _BEDROCK_RESOLVED_MODEL[model] = candidate
+        text = _bedrock_reply_text(resp)
+        if text is not None:
+            return text
+        # Budget went entirely to (encrypted) reasoning, so there is no verdict to
+        # parse. Retry once with more room rather than failing into the deterministic
+        # fallback. Rare: 2 of ~1280 calls in a live eval.
+        logger.warning(
+            "Bedrock judge returned reasoning but no verdict (stopReason=%s, maxTokens=%d); "
+            "retrying with maxTokens=%d.",
+            resp.get("stopReason"),
+            kwargs["inferenceConfig"]["maxTokens"],
+            _BEDROCK_RETRY_MAX_TOKENS,
+        )
+        retry_kwargs = {**kwargs, "inferenceConfig": {"maxTokens": _BEDROCK_RETRY_MAX_TOKENS}}
+        text = _bedrock_reply_text(rt.converse(modelId=candidate, **retry_kwargs))
+        if text is not None:
+            return text
+        raise ValueError(
+            f"Bedrock Converse returned no verdict even at maxTokens={_BEDROCK_RETRY_MAX_TOKENS}"
+        )
+    raise last_err  # type: ignore[misc]
+
+
+async def _judge_call_bedrock(args: Namespace, system: str, user: str) -> str:
+    model = getattr(args, "sdpo_judge_model", "us.openai.gpt-5.6-luna")
+    model = _BEDROCK_MODEL_ALIASES.get(model, model)
+    region = getattr(args, "sdpo_judge_region", "us-west-2")
+    max_tokens = int(getattr(args, "sdpo_judge_max_tokens", 2048))
+    return await asyncio.to_thread(_bedrock_converse_sync, region, model, system, user, max_tokens)
+
+
+async def _judge_call_openai(args: Namespace, system: str, user: str) -> str:
+    """Legacy OpenAI-compatible HTTP judge (SFR gateway or api.openai.com)."""
+    base_url = getattr(args, "sdpo_judge_base_url", "https://api.openai.com/v1").rstrip("/")
+    model = getattr(args, "sdpo_judge_model", "gpt-5.4-mini")
+    api_key = os.environ.get(getattr(args, "sdpo_judge_api_key_env", "OPENAI_API_KEY"), "") or "EMPTY"
+    max_tokens = int(getattr(args, "sdpo_judge_max_tokens", 2048))
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_completion_tokens": max_tokens,
+    }
+    # gpt-5*/o-series are reasoning models: they reject an explicit temperature.
+    if not model.startswith(("gpt-5", "o1", "o3", "o4")):
+        payload["temperature"] = 0.0
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Low retry count: the judge is best-effort, fall back fast on failure.
+    out = await post(f"{base_url}/chat/completions", payload, max_retries=3, headers=headers)
+    return out["choices"][0]["message"].get("content") or ""
+
+
 def _parse_judge_verdict(text: str) -> bool:
     """Parse the judge's reply into a bool. Looks for the last CORRECT/INCORRECT."""
     if not text:
@@ -219,11 +387,15 @@ async def _llm_judge_correct(
     user: str | None = None,
     fallback: bool | None = None,
 ) -> bool:
-    """Grade one trace via the OpenAI-compatible LLM judge (SFR gateway).
+    """Grade one trace via the LLM judge.
+
+    Transport is picked by --sdpo-judge-backend: 'bedrock' (default) goes
+    straight to AWS Bedrock Converse via boto3 on the instance IAM role,
+    'openai' uses the legacy OpenAI-compatible HTTP gateway.
 
     system/user default to the science-exam prompt (_build_judge_prompt); pass
     both to use a different prompt (e.g. _build_search_judge_prompt) against
-    the SAME gateway/model/concurrency config.
+    the SAME backend/model/concurrency config.
 
     On any judge failure (bad response, timeout, etc.), returns `fallback` if
     given, else deterministic _is_correct(sample, args) -- so a flaky gateway
@@ -235,32 +407,13 @@ async def _llm_judge_correct(
     """
     if system is None or user is None:
         system, user = _build_judge_prompt(args, sample)
-    base_url = getattr(args, "sdpo_judge_base_url", "https://api.openai.com/v1").rstrip("/")
-    model = getattr(args, "sdpo_judge_model", "gpt-5.6-luna")
-    api_key = os.environ.get(getattr(args, "sdpo_judge_api_key_env", "OPENAI_API_KEY"), "") or "EMPTY"
-    max_tokens = int(getattr(args, "sdpo_judge_max_tokens", 2048))
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    # gpt-5*/o-series are reasoning models: use max_completion_tokens, ignore temperature.
-    if model.startswith(("gpt-5", "o1", "o3", "o4")):
-        payload["max_completion_tokens"] = max_tokens
-    else:
-        payload["max_completion_tokens"] = max_tokens
-        payload["temperature"] = 0.0
-    headers = {"Content-Type": "application/json"}
-    if api_key and api_key != "EMPTY":
-        headers["Authorization"] = f"Bearer {api_key}"
+    backend = getattr(args, "sdpo_judge_backend", "bedrock")
 
     try:
-        # Low retry count: the judge is best-effort, fall back fast on failure.
-        out = await post(f"{base_url}/chat/completions", payload, max_retries=3, headers=headers)
-        content = out["choices"][0]["message"].get("content") or ""
+        if backend == "bedrock":
+            content = await _judge_call_bedrock(args, system, user)
+        else:
+            content = await _judge_call_openai(args, system, user)
         return _parse_judge_verdict(content)
     except Exception as e:
         if fallback is not None:
@@ -282,6 +435,13 @@ def _sample_domain(sample: Sample) -> str:
     -> test-case execution, math -> dapo/boxed matching)."""
     md = sample.metadata if isinstance(sample.metadata, dict) else {}
     return (md.get("domain") or "math").strip().lower()
+
+
+def _sample_uses_judge(sample: Sample) -> bool:
+    """Whether this sample requires LLM-judge grading (e.g. AMO-Bench
+    description-type problems that can't be matched deterministically)."""
+    md = sample.metadata if isinstance(sample.metadata, dict) else {}
+    return bool(md.get("amo_use_judge"))
 
 
 def _code_candidate(sample: Sample, args: Namespace | None = None) -> str:

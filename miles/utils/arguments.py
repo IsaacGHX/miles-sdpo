@@ -1506,22 +1506,63 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sdpo-eval-judge",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable the LLM judge on the EVAL path only, leaving training grading "
+                    "untouched. Use this (not --sdpo-judge) when the eval set contains rows that "
+                    "deterministic matching cannot grade -- e.g. AMO-Bench's 11/50 "
+                    "answer_type='description' problems -- but training should keep its own "
+                    "grader (--sdpo-grader dapo). --sdpo-judge implies this."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-judge-backend",
+                type=str,
+                default="bedrock",
+                choices=["bedrock", "openai"],
+                help=(
+                    "Transport for the LLM judge. 'bedrock' (default) calls the AWS Bedrock "
+                    "Converse API with boto3, authenticating off the instance IAM role -- no API "
+                    "key and no shared gateway in the path. 'openai' is the legacy "
+                    "OpenAI-compatible HTTP path (--sdpo-judge-base-url/-api-key-env)."
+                ),
+            )
+            parser.add_argument(
                 "--sdpo-judge-base-url",
                 type=str,
                 default="https://api.openai.com/v1",
-                help="OpenAI-compatible base URL for the LLM judge (default: OpenAI API).",
+                help=(
+                    "OpenAI-compatible base URL for the LLM judge (default: OpenAI API). Only "
+                    "used when --sdpo-judge-backend=openai."
+                ),
             )
             parser.add_argument(
                 "--sdpo-judge-model",
                 type=str,
-                default="gpt-5.4-mini",
-                help="Judge model id served by --sdpo-judge-base-url (e.g. gpt-5.4-mini).",
+                default="us.openai.gpt-5.6-luna",
+                help=(
+                    "Judge model id. Under --sdpo-judge-backend=bedrock this is a Bedrock modelId; "
+                    "luna needs a cross-region inference profile, so use the 'us.'-prefixed id "
+                    "(bare 'openai.gpt-5.6-luna' is not on-demand invocable and is auto-upgraded). "
+                    "Under backend=openai it is the id served by --sdpo-judge-base-url."
+                ),
+            )
+            parser.add_argument(
+                "--sdpo-judge-region",
+                type=str,
+                default="us-west-2",
+                help="AWS region for --sdpo-judge-backend=bedrock.",
             )
             parser.add_argument(
                 "--sdpo-judge-api-key-env",
                 type=str,
                 default="OPENAI_API_KEY",
-                help="Env var holding the judge API key (may be unset/EMPTY for a keyless proxy).",
+                help=(
+                    "Env var holding the judge API key (may be unset/EMPTY for a keyless proxy). "
+                    "Only used when --sdpo-judge-backend=openai; Bedrock uses the IAM role."
+                ),
             )
             parser.add_argument(
                 "--sdpo-judge-max-concurrency",
