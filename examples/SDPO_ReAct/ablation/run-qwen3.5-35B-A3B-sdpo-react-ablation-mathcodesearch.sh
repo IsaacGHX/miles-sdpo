@@ -130,7 +130,7 @@ SDPO_REACT_NUM_ROLLOUT="${SDPO_REACT_NUM_ROLLOUT:-51}"
 
 SDPO_REACT_TRAIN_GPUS="${SDPO_REACT_TRAIN_GPUS:-8}"
 N_SAMPLES_PER_PROMPT=8
-SDPO_REACT_TP="${SDPO_REACT_TP:-1}"
+SDPO_REACT_TP="${SDPO_REACT_TP:-2}"
 DP_SIZE=$((SDPO_REACT_TRAIN_GPUS / SDPO_REACT_TP))
 ROLLOUT_BATCH_SIZE="${SDPO_REACT_ROLLOUT_BATCH:-$((DP_SIZE * 4))}"
 if [ $((ROLLOUT_BATCH_SIZE % DP_SIZE)) -ne 0 ]; then
@@ -471,7 +471,7 @@ if [ "${SDPO_REACT_SKIP_EVAL0:-0}" = "1" ]; then
 fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 1
+   --tensor-model-parallel-size "${SDPO_REACT_TP}"
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size "${SDPO_REACT_EP_SIZE}"
