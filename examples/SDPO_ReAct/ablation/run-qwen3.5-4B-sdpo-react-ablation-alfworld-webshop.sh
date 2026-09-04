@@ -35,18 +35,22 @@ SDPO_ABLATION_MEGATRON_PATH="${SDPO_ABLATION_MEGATRON_PATH:-/root/Megatron-LM}"
 export PYTHONBUFFERED=16
 export SDPO_REACT_EVAL_N_SAMPLES="${SDPO_REACT_EVAL_N_SAMPLES:-8}"
 SDPO_ABLATION_ALGO="${SDPO_ABLATION_ALGO:?Set SDPO_ABLATION_ALGO to one of: grpo sdpo rlsd}"
-SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:?Set SDPO_ABLATION_ARM to one of: a b c d e f}"
+SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:?Set SDPO_ABLATION_ARM to one of: a b c d e f z}"
 if [ "$SDPO_ABLATION_ALGO" = "grpo" ]; then
     case "$SDPO_ABLATION_ARM" in
-        a|e|f) ;;
-        *) echo "GRPO only supports arms a/e/f (got '${SDPO_ABLATION_ARM}')" >&2; exit 1 ;;
+        a|e|f|z) ;;
+        *) echo "GRPO only supports arms a/e/f/z (got '${SDPO_ABLATION_ARM}')" >&2; exit 1 ;;
     esac
+elif [ "$SDPO_ABLATION_ARM" = "z" ]; then
+    # z's whole point is that skill-KD is the ONLY loss term -- sdpo/rlsd would put a
+    # response-level target (KD loss / advantage reweighting) back on top of it.
+    echo "Arm z is GRPO-only (got SDPO_ABLATION_ALGO='${SDPO_ABLATION_ALGO}')" >&2; exit 1
 fi
 SDPO_REACT_NUM_ROLLOUT="${SDPO_REACT_NUM_ROLLOUT:-51}"
 
 SDPO_REACT_TRAIN_GPUS="${SDPO_REACT_TRAIN_GPUS:-8}"
 N_SAMPLES_PER_PROMPT=8
-SDPO_REACT_TP="${SDPO_REACT_TP:-1}"
+SDPO_REACT_TP="${SDPO_REACT_TP:-2}"
 DP_SIZE=$((SDPO_REACT_TRAIN_GPUS / SDPO_REACT_TP))
 ROLLOUT_BATCH_SIZE="${SDPO_REACT_ROLLOUT_BATCH:-$((DP_SIZE * 4))}"
 if [ $((ROLLOUT_BATCH_SIZE % DP_SIZE)) -ne 0 ]; then
@@ -68,8 +72,18 @@ MODEL_NAME=Qwen3.5-4B
 MODEL_ARG_SH=scripts/models/qwen3.5-4B.sh
 TOOL_PARSER=qwen3_coder
 TOOL_GRAMMAR=qwen3_coder
+# --dist-ckpt-optim-fully-reshardable + --distrib-optim-fully-reshardable-
+# mem-efficient: see the Qwen3.5-9B alfworld-webshop sibling script's own
+# comment for the full writeup -- without the first flag, a saved
+# optimizer checkpoint is only resumable on the exact DP/parallelism
+# layout it was saved under; without the second, the first flag's own
+# save-time all-gather holds a full copy of the gathered optimizer state
+# on every rank (root-caused as the trigger for repeated Ray OOM kills on
+# the 9B run of this same domain). Adding both up front here since this
+# is the first time checkpoint saving is enabled for this script.
+MODEL_EXTRA_ARGS=(--dist-ckpt-optim-fully-reshardable --distrib-optim-fully-reshardable-mem-efficient)
 MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-6144}"
-if [ "$SDPO_ABLATION_ARM" = "e" ] || [ "$SDPO_ABLATION_ARM" = "f" ]; then
+if [ "$SDPO_ABLATION_ARM" = "e" ] || [ "$SDPO_ABLATION_ARM" = "f" ] || [ "$SDPO_ABLATION_ARM" = "z" ]; then
     MAX_TOKENS_PER_GPU="${SDPO_ABLATION_MAX_TOKENS_PER_GPU:-3072}"
 fi
 echo "MODEL: ${MODEL_NAME} | tool-parser=${TOOL_PARSER} | max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}"
@@ -93,7 +107,16 @@ export SDPO_REACT_THINKING="${SDPO_REACT_THINKING:-true}"
 # --- AGENTIC data prep: webshop + alfworld combined (paths parameterized) ---
 MT_DIR="${SDPO_ABLATION_DATA_ROOT}/data/agentic"
 TRAIN_DATA="$MT_DIR/train.jsonl"
-EVAL_CFG="$REACT_DIR/data/eval_agentic.yaml"
+# Arms e/f train BOTH skill types (skill-source all) -- eval with the
+# skill-augmented dataset variants too (eval_agentic_skill.yaml's *_skill
+# entries, --sdpo-eval-skill-mode all below), so wandb shows the model's own
+# self-predicted-skill-augmented pass@1 alongside the normal one, per TTS
+# validation ask (see sdpo_react.py::sdpo_react_eval_generate_with_skill).
+if [ "$SDPO_ABLATION_ARM" = "e" ] || [ "$SDPO_ABLATION_ARM" = "f" ] || [ "$SDPO_ABLATION_ARM" = "z" ]; then
+    EVAL_CFG="$REACT_DIR/data/eval_agentic_skill.yaml"
+else
+    EVAL_CFG="$REACT_DIR/data/eval_agentic.yaml"
+fi
 mkdir -p "$MT_DIR" "${SDPO_ABLATION_DATA_ROOT}/data/webshop_data" "${SDPO_ABLATION_DATA_ROOT}/data/alfworld_data"
 [ -f "${SDPO_ABLATION_DATA_ROOT}/data/webshop_data/webshop_train.jsonl" ] || \
     (cd "$REPO_ROOT" && python -m examples.SDPO_ReAct.data.build_webshop_data \
@@ -144,7 +167,15 @@ if [ "$SDPO_REACT_THINKING" = "true" ]; then
 else
     REMOVE_THINKING_ARG=(--sdpo-remove-thinking-from-demonstration)
 fi
-CFG_TAG="${MODEL_NAME}-alfworld-webshop-${SDPO_ABLATION_ALGO}-${SDPO_ABLATION_ARM}-${_THINK}"
+# Arm z's skill-KD mode is selectable, and it MUST reach the tag. CFG_TAG decides
+# both the wandb group AND CKPT_DIR, and CKPT_DIR is passed as --load as well as
+# --save -- so a both-blind run reusing the plain `z` tag would silently RESUME
+# from the both-run's weights instead of starting from the base model.
+ARM_TAG="$SDPO_ABLATION_ARM"
+if [ "$SDPO_ABLATION_ARM" = "z" ] && [ "${SDPO_ABLATION_SKILL_KD_MODE:-both}" != "both" ]; then
+    ARM_TAG="z-${SDPO_ABLATION_SKILL_KD_MODE}"
+fi
+CFG_TAG="${MODEL_NAME}-alfworld-webshop-${SDPO_ABLATION_ALGO}-${ARM_TAG}-${_THINK}"
 
 SDPO_REACT_EXP="${SDPO_REACT_EXP:-sdpo-react-ablation-${CFG_TAG}_$(date +%Y%m%d_%H%M%S)}"
 DUMP_DIR="${SDPO_ABLATION_DUMP_ROOT}/${SDPO_REACT_EXP}"
@@ -197,7 +228,15 @@ ROLLOUT_ARGS=(
    --over-sampling-batch-size "${ROLLOUT_BATCH_SIZE}"
    # agentic -> preserve balanced per-batch domain mix (no --rollout-shuffle)
 )
-if [ "$SDPO_ABLATION_ARM" = "a" ] && [ "$SDPO_ABLATION_ALGO" = "grpo" ]; then
+if [ "$SDPO_ABLATION_ARM" = "z" ]; then
+    # arm z: NO dynamic sampling filter at all. all-wrong AND all-correct groups are
+    # kept and trained on the skill-SD target -- under GRPO they would be dead weight
+    # (std=0 -> zero advantage), but z has no advantage term to begin with. Safe
+    # because --sdpo-skill-source all sets pitfall_active in sdpo.py, which forces
+    # enable_kl=True even for 0-correct groups, so an all-wrong group still gets
+    # pitfall-only prefixes and skill samples instead of being silently skipped.
+    :
+elif [ "$SDPO_ABLATION_ARM" = "a" ] && [ "$SDPO_ABLATION_ALGO" = "grpo" ]; then
     ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std)
 else
     ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_sdpo_group_has_prefix)
@@ -263,7 +302,26 @@ else
                       --sdpo-pitfall-summary-backend self --sdpo-response-prefix skill --sdpo-env-feedback-max-chars 2000 \
                       --sdpo-skill-kd --sdpo-skill-kd-coef 0.01 --sdpo-skill-kd-mode both-blind)
             ;;
+        z)
+            # identical skill machinery to e; the difference is entirely in what the
+            # loss is made of (pure distill, see the ALGO block) and in the absent
+            # dynamic filter. skill-kd-coef defaults to 1.0, not e's 0.01, because
+            # there is no policy-gradient term left for it to stay small next to.
+            RM_ARGS+=(--sdpo-self-skill --sdpo-skill-source all --sdpo-skill-max-new-tokens 2048 \
+                      --sdpo-pitfall-summary-backend self --sdpo-response-prefix skill --sdpo-env-feedback-max-chars 2000 \
+                      --sdpo-skill-kd --sdpo-skill-kd-coef "${SDPO_ABLATION_SKILL_KD_COEF:-1.0}" \
+                      --sdpo-skill-kd-mode "${SDPO_ABLATION_SKILL_KD_MODE:-both}")
+            ;;
     esac
+fi
+
+# e/f train BOTH skill types (skill-source all, skill-kd-mode both/both-blind)
+# -> eval-skill-mode 'all' (self-predict + splice BOTH skill types before the
+# *_skill eval datasets' real rollout -- see EVAL_CFG's selection above and
+# sdpo_react.py::sdpo_react_eval_generate_with_skill).
+EVAL_SKILL_ARGS=()
+if [ "$SDPO_ABLATION_ARM" = "e" ] || [ "$SDPO_ABLATION_ARM" = "f" ] || [ "$SDPO_ABLATION_ARM" = "z" ]; then
+    EVAL_SKILL_ARGS+=(--sdpo-eval-skill-mode all)
 fi
 
 # ============================================================================ #
@@ -277,7 +335,13 @@ case "$SDPO_ABLATION_ALGO" in
                --entropy-coef 0.00
             )
         else
-            RM_ARGS+=(--no-sdpo-pure-distill)
+            # arm z leaves --sdpo-pure-distill ON (the arg's own default): the group RM
+            # then returns task reward 0 for every trace, so the GRPO advantage is
+            # identically 0 and sdpo_skill_kd_loss is the only nonzero loss term.
+            # Arms e/f keep the mixed GRPO(task reward) + skill-KD target.
+            if [ "$SDPO_ABLATION_ARM" != "z" ]; then
+                RM_ARGS+=(--no-sdpo-pure-distill)
+            fi
             GRPO_ARGS=(
                --advantage-estimator grpo
                --sdpo-teacher-backend megatron
@@ -346,7 +410,7 @@ if [ "${SDPO_REACT_SKIP_EVAL0:-0}" = "1" ]; then
 fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${SDPO_REACT_TP:-1}"
+   --tensor-model-parallel-size "${SDPO_REACT_TP:-2}"
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -381,7 +445,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static "${SDPO_ABLATION_SGLANG_MEM_FRACTION:-0.6}"
+   --sglang-mem-fraction-static "${SDPO_ABLATION_SGLANG_MEM_FRACTION:-0.75}"
 )
 
 MISC_ARGS=(
@@ -450,6 +514,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --colocate \
    --update-weights-interval 1 \
    ${MODEL_ARGS[@]} \
+   ${MODEL_EXTRA_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
    ${CUSTOM_GENERATE_ARGS[@]} \
@@ -458,6 +523,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
+   ${EVAL_SKILL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
    ${RM_ARGS[@]}
