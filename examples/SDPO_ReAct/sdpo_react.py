@@ -45,8 +45,20 @@ from examples.SDPO.reward import (
     _llm_judge_correct,
     _sample_domain,
 )
+from examples.SDPO.sdpo import _BLIND_PREDICT_SYSTEM
+from examples.SDPO.sdpo import _PITFALL_PREDICT_SYSTEM
+from examples.SDPO.sdpo import EVAL_SKILL_CORRECT_TEMPLATE
+from examples.SDPO.sdpo import EVAL_SKILL_INSTRUCTION
+from examples.SDPO.sdpo import EVAL_SKILL_PITFALL_TEMPLATE
+from examples.SDPO.sdpo import _blind_predict_user_prompt
+from examples.SDPO.sdpo import _gen_prompt_suffix
+from examples.SDPO.sdpo import _generate_skill_text
+from examples.SDPO.sdpo import _pitfall_predict_user_prompt
+from examples.SDPO.sdpo import _tokenizer
 from examples.SDPO.sdpo import sdpo_eval_reward as _sdpo_eval_reward
 from examples.SDPO.sdpo import sdpo_group_reward as _sdpo_group_reward
+from miles.rollout.base_types import GenerateFnOutput
+from miles.rollout.generate_hub.multi_turn import generate as _multi_turn_generate
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -324,3 +336,68 @@ async def sdpo_react_plain_grpo_reward(args: Namespace, sample: Sample, **kwargs
     sample.metadata["sdpo_correct"] = 1.0 if ok else 0.0
     _dump_agentic_trace_one(args, sample)
     return 1.0 if ok else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# EVAL-time skill augmentation for AGENTIC (tool-calling) domains.
+#
+# examples/SDPO/sdpo.py::sdpo_eval_generate already implements "self-predict a
+# blind skill from the problem alone, splice it into the prompt, then run the
+# real eval rollout" (--sdpo-eval-skill-mode) -- but it hardcodes the second
+# pass to miles.rollout.sglang_rollout.generate, a SINGLE-TURN generate with
+# no tool-calling loop. Wiring it directly to webshop/alfworld eval would
+# silently drop every webshop_step/alfworld_step call: the model would emit
+# one text completion and stop, never touching the sidecar, so reward would
+# never reflect a real episode. This function reuses sdpo.py's skill-gen/
+# splice logic VERBATIM (same self-predict prompts, same splice-before-
+# gen-suffix point) but dispatches the augmented prompt to
+# miles.rollout.generate_hub.multi_turn.generate instead, so the second pass
+# still runs the full multi-turn tool-calling loop.
+# --------------------------------------------------------------------------- #
+
+
+async def sdpo_react_eval_generate_with_skill(input: Any) -> Any:
+    """--custom-generate-function-path for an EVAL-only dataset entry (see
+    e.g. eval_agentic.yaml's *_skill datasets) that measures the model
+    answering WITH its own self-predicted skill already in context, on top of
+    the SAME multi-turn tool-calling loop normal eval uses. No-op during
+    TRAINING (evaluation=False) or when --sdpo-eval-skill-mode is 'off' --
+    falls straight through to multi_turn.generate. Mirrors
+    examples.SDPO.sdpo.sdpo_eval_generate; see that function's docstring for
+    the skill-splice mechanics this reuses."""
+    args = input.args
+    sample = input.sample
+    mode = getattr(args, "sdpo_eval_skill_mode", "off")
+
+    if not input.evaluation or mode == "off" or not isinstance(sample.prompt, str):
+        return await _multi_turn_generate(input)
+
+    try:
+        sections = []
+        if mode in ("correct", "all"):
+            skill = await _generate_skill_text(
+                args, _BLIND_PREDICT_SYSTEM, _blind_predict_user_prompt(sample.prompt), "self"
+            )
+            if skill.strip():
+                sections.append(EVAL_SKILL_CORRECT_TEMPLATE.format(skill=skill.strip()))
+        if mode in ("pitfall", "all"):
+            skill = await _generate_skill_text(
+                args, _PITFALL_PREDICT_SYSTEM, _pitfall_predict_user_prompt(sample.prompt), "self"
+            )
+            if skill.strip():
+                sections.append(EVAL_SKILL_PITFALL_TEMPLATE.format(skill=skill.strip()))
+
+        if sections:
+            tok = _tokenizer(args)
+            gen_suffix = _gen_prompt_suffix(tok, getattr(args, "apply_chat_template_kwargs", None))
+            section = "".join(sections) + EVAL_SKILL_INSTRUCTION
+            if gen_suffix and gen_suffix in sample.prompt:
+                idx = sample.prompt.rfind(gen_suffix)
+                sample.prompt = sample.prompt[:idx] + section + sample.prompt[idx:]
+            else:
+                sample.prompt = sample.prompt + section
+    except Exception as e:
+        logger.warning(f"eval skill augmentation failed ({e!r}); evaluating on the unaugmented prompt.")
+
+    output = await _multi_turn_generate(input)
+    return output if isinstance(output, GenerateFnOutput) else GenerateFnOutput(samples=output)
