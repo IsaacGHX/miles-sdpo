@@ -34,8 +34,33 @@ SDPO_ABLATION_MEGATRON_PATH="${SDPO_ABLATION_MEGATRON_PATH:-/root/Megatron-LM}"
 
 export PYTHONBUFFERED=16
 export SDPO_REACT_EVAL_N_SAMPLES="${SDPO_REACT_EVAL_N_SAMPLES:-8}"
-SDPO_REACT_TAU2_MAX_STEPS="${SDPO_REACT_TAU2_MAX_STEPS:-30}"
+# Default 100, not 30: tau2-bench's own Orchestrator defaults to
+# max_steps=100 (CLI defaults to 200, tau2/config.py's DEFAULT_MAX_STEPS) --
+# every message (agent turn, user turn, EACH tool call) counts as one step,
+# so a real multi-tool task often needs 40-80+ steps. A too-tight budget
+# hits TerminationReason.MAX_STEPS, which tau2's own evaluate_simulation()
+# scores as a hard reward=0 regardless of task competence (confirmed live:
+# 29% of a max_steps=30 ablation run's training episodes hit MAX_STEPS --
+# see run-qwen3-4B-sdpo-react-tau2.sh's matching comment for the full data).
+# TRAIN budget (this env var) vs EVAL budget (SDPO_REACT_TAU2_EVAL_MAX_STEPS,
+# forwarded below + read by data/eval_tau2.yaml's metadata_overrides) are
+# DELIBERATELY split, same pattern as every other SDPO_ReAct domain's
+# SDPO_REACT_TRAIN_MAX_TURNS/SDPO_REACT_EVAL_MAX_TURNS split. Train default
+# 40 (not tau2's own 100, not 30): confirmed live on this exact model/tau2
+# combo (after the --sglang-tool-call-parser fix below) that raising the
+# cap from 30->40 cuts the MAX_STEPS-truncation rate (a HARD reward=0
+# regardless of task competence, which corrupts GRPO/SDPO's group-relative
+# advantage) from 33% to 13% (mostly telecom, which needs the most tool
+# calls/episode) at essentially flat avg per-episode token cost (~4300-4450
+# across cap=30/40/50/100) -- most conversations finish well under 40 turns
+# regardless of the cap. 40 keeps most of cap=100's truncation-noise benefit
+# while capping the long tail's contribution to overall training speed;
+# eval keeps the full 100 since it's infrequent/low-sample and exists to
+# report an honest benchmark number.
+SDPO_REACT_TAU2_MAX_STEPS="${SDPO_REACT_TAU2_MAX_STEPS:-40}"
 export SDPO_REACT_TAU2_MAX_STEPS
+SDPO_REACT_TAU2_EVAL_MAX_STEPS="${SDPO_REACT_TAU2_EVAL_MAX_STEPS:-100}"
+export SDPO_REACT_TAU2_EVAL_MAX_STEPS
 SDPO_ABLATION_ALGO="${SDPO_ABLATION_ALGO:?Set SDPO_ABLATION_ALGO to one of: grpo sdpo rlsd}"
 SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:?Set SDPO_ABLATION_ARM to one of: a b c d e f}"
 if [ "$SDPO_ABLATION_ALGO" = "grpo" ]; then
@@ -48,14 +73,25 @@ SDPO_REACT_NUM_ROLLOUT="${SDPO_REACT_NUM_ROLLOUT:-51}"
 
 SDPO_REACT_TRAIN_GPUS="${SDPO_REACT_TRAIN_GPUS:-8}"
 N_SAMPLES_PER_PROMPT=8
-SDPO_REACT_TP="${SDPO_REACT_TP:-1}"
+SDPO_REACT_TP="${SDPO_REACT_TP:-2}"
 DP_SIZE=$((SDPO_REACT_TRAIN_GPUS / SDPO_REACT_TP))
 ROLLOUT_BATCH_SIZE="${SDPO_REACT_ROLLOUT_BATCH:-$((DP_SIZE * 4))}"
 if [ $((ROLLOUT_BATCH_SIZE % DP_SIZE)) -ne 0 ]; then
     ROLLOUT_BATCH_SIZE=$((DP_SIZE * 4))
     echo "WARN: rollout batch not divisible by dp=${DP_SIZE}; falling back to ${ROLLOUT_BATCH_SIZE}"
 fi
-GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+# SDPO_REACT_GLOBAL_BATCH decouples the GRADIENT batch size from
+# ROLLOUT_BATCH_SIZE (which ALSO sets the concurrent-episode ceiling via
+# rollout_batch_size * n_samples_per_prompt -- see SGLangEngine's
+# generate_fn_semaphore / tau2 sidecar sizing). Confirmed live: tau2's own
+# episodes spend ~42% of wall-clock time blocked on the external user-
+# simulator gateway, not the GPU, so a concurrency window sized EXACTLY at
+# global_batch_size leaves that fraction of GPUs idle at any instant (~50-
+# 60% utilization observed). Widening ROLLOUT_BATCH_SIZE alone (without this
+# override) also widens global_batch_size 1:1, silently changing the
+# gradient batch size when the actual intent was just "keep more episodes
+# in flight" -- this override lets the two vary independently.
+GLOBAL_BATCH_SIZE="${SDPO_REACT_GLOBAL_BATCH:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
 echo "BATCH: train_gpus=${SDPO_REACT_TRAIN_GPUS} tp=${SDPO_REACT_TP} dp=${DP_SIZE} rollout_batch=${ROLLOUT_BATCH_SIZE} global_batch=${GLOBAL_BATCH_SIZE}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,7 +120,15 @@ export SDPO_REACT_THINKING="${SDPO_REACT_THINKING:-true}"
 # --- data prep: tau2 (AReaL-tau2-data, retail+airline+telecom combined) ---
 TAU2_DIR="${SDPO_ABLATION_DATA_ROOT}/data/tau2_data"
 TRAIN_DATA="$TAU2_DIR/tau2_train.jsonl"
-EVAL_CFG="$REACT_DIR/data/eval_tau2.yaml"
+# SDPO_REACT_TAU2_EVAL_CONFIG override: point at data/eval_tau2_
+# telecom_only.yaml (retail/airline dropped) once those two domains are
+# saturated -- confirmed live: a real ablation run hit airline=100%/
+# retail=100% mean reward at eval_0, only telecom sitting lower -- so
+# continuing to spend 2/3 of every eval's wall-clock on two domains
+# that already read 100% adds no signal. Default stays the full 3-
+# domain yaml (safe default: use this only once you have confirmed the
+# other two domains are actually saturated for THIS run).
+EVAL_CFG="${SDPO_REACT_TAU2_EVAL_CONFIG:-$REACT_DIR/data/eval_tau2.yaml}"
 mkdir -p "$TAU2_DIR"
 [ -f "$TRAIN_DATA" ] || \
     (cd "$REPO_ROOT" && python -m examples.SDPO_ReAct.data.build_tau2_data \
@@ -156,7 +200,19 @@ ROLLOUT_ARGS=(
    --balance-data
    --over-sampling-batch-size "${ROLLOUT_BATCH_SIZE}"
 )
-if [ "$SDPO_ABLATION_ARM" = "a" ] && [ "$SDPO_ABLATION_ALGO" = "grpo" ]; then
+# SDPO_REACT_DYNAMIC_SAMPLE=0 disables dynamic sampling entirely (--dynamic-
+# sampling-filter-path left unset -> miles's own default None -> no filter
+# runs, every rollout group is kept as-is) -- e.g. to measure pass@k WITHOUT
+# check_reward_nonzero_std's all-correct/all-wrong group drop, confirmed live
+# on a real run to drop 110-139 all-1.0 groups + 18 all-0.0 groups PER
+# rollout step on arm a (airline/retail are saturated at 100%, so most
+# groups sampled from those two domains are all-correct and get filtered
+# out, leaving the surviving batch skewed toward telecom / partial-credit
+# groups). Default (unset) keeps dynamic sampling ON, matching every prior
+# ablation run.
+if [ "${SDPO_REACT_DYNAMIC_SAMPLE:-1}" = "0" ]; then
+    : # no --dynamic-sampling-filter-path -> filter disabled, keep every group
+elif [ "$SDPO_ABLATION_ARM" = "a" ] && [ "$SDPO_ABLATION_ALGO" = "grpo" ]; then
     ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std)
 else
     ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_sdpo_group_has_prefix)
@@ -301,7 +357,7 @@ if [ "${SDPO_REACT_SKIP_EVAL0:-0}" = "1" ]; then
 fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${SDPO_REACT_TP:-1}"
+   --tensor-model-parallel-size "${SDPO_REACT_TP:-2}"
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -334,9 +390,41 @@ WANDB_ARGS=(
    --wandb-key "${WANDB_API_KEY}"
 )
 
+# --sglang-tool-call-parser is NOT optional here: tau2 goes through
+# agentic_tool_call.generate -> session-server proxy -> sglang's native
+# /v1/chat/completions (see tools/tau2/agent_function.py's module docstring),
+# NOT multi_turn.generate's own text-parsing loop over /generate. Without
+# this flag sglang never parses <function=..> tags out of the raw text, so
+# message.tool_calls comes back None every turn and tau2's LLMAgent (via
+# litellm) has no text fallback -- confirmed live against a real training
+# dump: 83% of a 257-episode sample had ZERO tool/tool_calls messages, model
+# narrating fake tool results in plain text instead, episodes running to the
+# turn cap at reward=0. This single missing flag is the primary cause of
+# eval success landing far below the Qwen tech report's reference numbers.
+#
+# --sglang-reasoning-parser is DELIBERATELY NOT set here (even with thinking
+# on): it makes sglang split reasoning into a separate message.reasoning_
+# content field, but tau2's own generate() (tau2/utils/llm_utils.py) only
+# reads response_choice.message.content -- there is no reasoning_content
+# field on tau2's AssistantMessage at all (confirmed live: not in
+# AssistantMessage.model_fields) -- so tau2 silently drops it when relaying
+# the assistant turn back through litellm. On the NEXT turn the session-
+# server compares the stored message (content + non-empty reasoning_
+# content) against what tau2 sends back (content only) via message_
+# matches() -- reasoning_content is one of the TEMPLATE_RELEVANT_KEYS
+# compared, so this mismatches, the append-only checkpoint detector treats
+# it as a brand-new appended message, and role='assistant' is not in
+# --tito-allowed-append-roles (tool/user only) -- every turn after the
+# first 400s. Confirmed live: ~1740 such 400s in under 10 minutes on one
+# run (litellm's own num_retries backoff on each is also a real contributor
+# to "training is slow"). Leaving reasoning-parser unset keeps
+# <think>...</think> inline in content instead, which survives the tau2
+# round-trip unchanged (the TITO jinja templates already know how to
+# strip/re-render inline <think> tags).
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static "${SDPO_ABLATION_SGLANG_MEM_FRACTION:-0.6}"
+   --sglang-mem-fraction-static "${SDPO_ABLATION_SGLANG_MEM_FRACTION:-0.75}"
+   --sglang-tool-call-parser qwen3_coder
    # Confirmed live (2026-08-09, 8xH200, 9B sibling script): the default 60s
    # flush_cache timeout (RolloutManager.offload -> SGLangEngine.release_
    # memory_occupation -> flush_cache) can fire while a genuinely still-
@@ -404,6 +492,7 @@ ray job submit --address="http://127.0.0.1:8265" \
         \"SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK\": \"1\",
         \"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR\": \"1\",
         \"SDPO_REACT_TAU2_MAX_STEPS\": \"${SDPO_REACT_TAU2_MAX_STEPS}\",
+        \"SDPO_REACT_TAU2_EVAL_MAX_STEPS\": \"${SDPO_REACT_TAU2_EVAL_MAX_STEPS}\",
         \"TAU_USER_MODEL_PROVIDER\": \"${TAU_USER_MODEL_PROVIDER:-openai}\",
         \"TAU_USER_MODEL\": \"${TAU_USER_MODEL:-gpt-5.6-luna}\",
         \"OPENAI_API_URL\": \"${OPENAI_API_URL:-}\",
