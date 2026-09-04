@@ -74,6 +74,7 @@ enroot start --rw \
     --env SDPO_MODEL="${SDPO_MODEL:-olmo3-math-colocate}" \
     --env SDPO_ABLATION_ARM="${SDPO_ABLATION_ARM:-}" \
     --env SDPO_ABLATION_ALGO="${SDPO_ABLATION_ALGO:-}" \
+    --env SDPO_ABLATION_EVAL_SKILL_MODE="${SDPO_ABLATION_EVAL_SKILL_MODE:-}" \
     --env MILES_NEMOTRONH_KEEP_MTP="${MILES_NEMOTRONH_KEEP_MTP:-}" \
     --env HF_HOME=/root/hf_cache \
     --env TRITON_CACHE_DIR=/root/caches/triton \
@@ -184,6 +185,20 @@ enroot start --rw \
                 HF_REPO=Qwen/Qwen2.5-7B-Instruct
                 MODEL_SH=scripts/models/qwen2.5-7B.sh
                 RUN_SH=examples/SDPO/run-qwen2.5-7B-sdpo-sci-rl-colocate.sh
+                DATA_KIND=sci
+                ;;
+            qwen25-7b-sci-ablation-matrix)
+                # Qwen2.5-7B-Instruct sibling of olmo3-sci-ablation: the new
+                # two-axis SDPO_ABLATION_ALGO x SDPO_ABLATION_ARM matrix script
+                # under examples/SDPO/ablation/ (grpo|sdpo|rlsd x a|b|c|d|e|f),
+                # distinct from the older single-axis qwen25-7b-sci-ablation/
+                # qwen25-7b-sci-rl-ablation entries above. Requires
+                # $SDPO_ABLATION_ALGO (grpo|sdpo|rlsd) and $SDPO_ABLATION_ARM
+                # (a|b|c|d|e|f).
+                MODEL_DIR=Qwen2.5-7B-Instruct
+                HF_REPO=Qwen/Qwen2.5-7B-Instruct
+                MODEL_SH=scripts/models/qwen2.5-7B.sh
+                RUN_SH=examples/SDPO/ablation/run-qwen2.5-7B-sdpo-ablation-sci.sh
                 DATA_KIND=sci
                 ;;
             qwen3-4b-math-rl-ablation)
