@@ -19,9 +19,12 @@ rather than `subprocess.run` in a sync endpoint -- a sync `def` route makes
 FastAPI hand it to Starlette's default thread pool (bounded, historically
 ~40 threads), which caps real parallelism well below what a --cpus=32 (see
 run_sandbox.sh) container can actually execute concurrently. The async
-version lets uvicorn's single event loop dispatch as many concurrent
-subprocesses as the container's CPU/memory budget allows, with no artificial
-thread-pool ceiling in between.
+version lets uvicorn's single event loop dispatch concurrent subprocesses with
+no artificial thread-pool ceiling in between. It is bounded instead by an
+explicit CPU-fairness semaphore (MAX_CONCURRENCY / SANDBOX_MAX_CONCURRENCY):
+every timeout here is wall clock, so running more submissions than the
+container has cores turns correct-but-slow programs into timeouts rather than
+just making them finish later. See MAX_CONCURRENCY for the measurement.
 
 Contract (see tool_client.py for the caller side):
     POST /execute {"code": str, "timeout": float | None}
@@ -38,6 +41,7 @@ Contract (see tool_client.py for the caller side):
 import ast
 import asyncio
 import logging
+import os
 import sys
 import time
 from collections import deque
@@ -53,6 +57,27 @@ app = FastAPI()
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_TIMEOUT_SECONDS = 60.0
 MAX_OUTPUT_CHARS = 4000
+
+# How many submissions may RUN at once. "As many as the CPU budget allows" (see
+# the Concurrency note above) turned out to be the wrong policy: every timeout
+# in here is WALL CLOCK, so oversubscribing the container's cores does not slow
+# things down gracefully -- it silently converts correct-but-CPU-bound programs
+# into timeouts. An eval fans out n_prompts x n_samples generations at once and
+# every one of them grades at the end (each grading = a harness running up to 9
+# test cases at 6s wall clock each), so several hundred submissions can be in
+# flight against --cpus=32; each then gets ~0.1 core and blows its budget.
+# Measured on OJBench easy+medium (Qwen3.5-9B base, identical candidates and
+# tests): 5.6% solved when graded in-run under that fan-out, 18.5% when the SAME
+# judge harness runs uncontended. That 3.3x was pure scheduling noise, and it
+# hit CPU-heavy competitive-programming tests hardest -- i.e. exactly the
+# benchmark it was flooring.
+# Queueing here is safe: callers use httpx with timeout=None (see
+# miles/utils/http_utils.py) and the per-call budget starts only once a slot is
+# acquired, so waiting for a slot can never look like a timeout.
+MAX_CONCURRENCY = int(os.environ.get("SANDBOX_MAX_CONCURRENCY", "32"))
+_SLOTS: asyncio.Semaphore | None = None  # created on the running loop, see startup
+_QUEUE_DEPTH = 0
+_MAX_QUEUE_DEPTH = 0
 
 # A call logged individually as "slow" (with a code preview) above this
 # threshold -- well under the 10s timeout, so we see the buildup before a call
@@ -92,6 +117,9 @@ class StatsResponse(BaseModel):
     count: int
     timed_out_count: int
     error_count: int
+    max_concurrency: int
+    queue_depth: int
+    max_queue_depth: int
     min_seconds: float | None
     p50_seconds: float | None
     p95_seconds: float | None
@@ -167,6 +195,9 @@ def stats() -> StatsResponse:
             count=_TOTAL_COUNT,
             timed_out_count=_TIMED_OUT_COUNT,
             error_count=_ERROR_COUNT,
+            max_concurrency=MAX_CONCURRENCY,
+            queue_depth=_QUEUE_DEPTH,
+            max_queue_depth=_MAX_QUEUE_DEPTH,
             min_seconds=None,
             p50_seconds=None,
             p95_seconds=None,
@@ -177,6 +208,9 @@ def stats() -> StatsResponse:
         count=_TOTAL_COUNT,
         timed_out_count=_TIMED_OUT_COUNT,
         error_count=_ERROR_COUNT,
+        max_concurrency=MAX_CONCURRENCY,
+        queue_depth=_QUEUE_DEPTH,
+        max_queue_depth=_MAX_QUEUE_DEPTH,
         min_seconds=values[0],
         p50_seconds=_percentile(values, 0.50),
         p95_seconds=_percentile(values, 0.95),
@@ -185,8 +219,32 @@ def stats() -> StatsResponse:
     )
 
 
+@app.on_event("startup")
+async def _init_slots() -> None:
+    # Built here, not at import time: a Semaphore binds to the running loop.
+    global _SLOTS
+    _SLOTS = asyncio.Semaphore(MAX_CONCURRENCY)
+    logger.info("sandbox ready: max_concurrency=%d", MAX_CONCURRENCY)
+
+
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute(req: ExecuteRequest) -> ExecuteResponse:
+    global _TIMED_OUT_COUNT, _ERROR_COUNT, _TOTAL_COUNT, _QUEUE_DEPTH, _MAX_QUEUE_DEPTH
+
+    _QUEUE_DEPTH += 1
+    _MAX_QUEUE_DEPTH = max(_MAX_QUEUE_DEPTH, _QUEUE_DEPTH)
+    try:
+        if _SLOTS is None:  # pragma: no cover -- startup hook always runs first
+            return await _execute_now(req)
+        async with _SLOTS:
+            return await _execute_now(req)
+    finally:
+        _QUEUE_DEPTH -= 1
+
+
+async def _execute_now(req: ExecuteRequest) -> ExecuteResponse:
+    """Run one submission. The caller already holds a concurrency slot, so the
+    timeout below measures the program, not the queue."""
     global _TIMED_OUT_COUNT, _ERROR_COUNT, _TOTAL_COUNT
 
     timeout = min(req.timeout, MAX_TIMEOUT_SECONDS) if req.timeout else DEFAULT_TIMEOUT_SECONDS
