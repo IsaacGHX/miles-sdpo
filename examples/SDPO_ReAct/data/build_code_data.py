@@ -74,20 +74,118 @@ CODE_SYSTEM_PROMPT = (
 )
 
 
-def _normalize_tests(row: dict) -> list[dict]:
-    """Extract stdin/stdout test cases from a LiveCodeBench-style row into
-    [{"input","output"}]. LiveCodeBench stores public_test_cases /
-    private_test_cases as JSON strings of [{input, output, testtype}]. Be
-    tolerant of a few shapes so this survives minor dataset schema drift."""
+# Same shape as CODE_SYSTEM_PROMPT, but for FUNCTIONAL (leetcode-style)
+# problems, whose graded artifact is a CLASS + METHOD, not a stdin/stdout
+# program: judge.py's functional harness execs the candidate and calls
+# Solution().<func_name>(*args) directly (no stdin at all). The two things this
+# must get right, mirroring the stdin prompt's two observed failure modes:
+#   1. The final class/method signature must match the starter code EXACTLY
+#      (the harness looks the method up by the dataset's func_name).
+#   2. The graded code is still the LAST code RUN through code_interpreter
+#      (--sdpo-code-require-tool), so the class definition must be present in
+#      that call -- a driver `print(Solution().f(...))` alongside it is fine
+#      (the harness discards the candidate's own stdout), but a call that only
+#      contains the test driver and imports the class from nowhere is not.
+FUNCTIONAL_SYSTEM_PROMPT = (
+    MINIMAL_SYSTEM_PROMPT
+    + (
+        "\n\nFor programming problems given as a function signature (a `class Solution` "
+        "starter), your solution is graded by importing the LAST code you pass to "
+        "code_interpreter and CALLING the required method directly with the test "
+        "arguments -- code you only write in text but never run does not count, and "
+        "nothing is read from stdin. Requirements: (a) define `class Solution` with the "
+        "method name and parameter order EXACTLY as given in the starter code, (b) "
+        "RETURN the answer from that method (do not print it), (c) make sure that same "
+        "code_interpreter call contains the full class definition. Break the problem "
+        "into steps, and before submitting, VERIFY your solution by calling it on the "
+        "example inputs inside the same code_interpreter call and printing the result "
+        "(extra prints are ignored at grading time)."
+    )
+    + (
+        "\n\nExample:\n"
+        "User: Given a list of integers nums and an integer target, return the indices "
+        "of the two numbers that add up to target.\n"
+        "```python\nclass Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:\n"
+        "        \n```\n"
+        "Assistant: Step 1: one pass, keep a value -> index map. Step 2: for each value, "
+        "check whether target - value was already seen. Let me verify on the example "
+        "before finalizing.\n"
+        '<tool_call>code_interpreter(code="class Solution:\\n    def twoSum(self, nums: '
+        "List[int], target: int) -> List[int]:\\n        seen = {}\\n        for i, v in "
+        "enumerate(nums):\\n            if target - v in seen:\\n                return "
+        "[seen[target - v], i]\\n            seen[v] = i\\n        return []\\n\\n"
+        'print(Solution().twoSum([2, 7, 11, 15], 9))")</tool_call>\n'
+        "Tool result: [0, 1]\n"
+        "Assistant: Verified -- indices [0, 1] give 2 + 7 = 9. This is my final solution.\n"
+        "<answer>class Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:\n"
+        "        seen = {}\n        for i, v in enumerate(nums):\n"
+        "            if target - v in seen:\n                return [seen[target - v], i]\n"
+        "            seen[v] = i\n        return []</answer>"
+    )
+)
+
+
+def _decode_private_tests(val) -> list:
+    """LiveCodeBench's private_test_cases: either a plain JSON string (older
+    files) or base64(zlib(pickle(json_string))) (current files) -- the same
+    two-shape decode LiveCodeBench's own loader does. [] on anything else."""
+    if isinstance(val, list):
+        return val
+    if not isinstance(val, str) or not val:
+        return []
+    try:
+        return json.loads(val)
+    except Exception:
+        pass
+    try:
+        import base64
+        import pickle
+        import zlib
+
+        return json.loads(pickle.loads(zlib.decompress(base64.b64decode(val.encode("utf-8")))))
+    except Exception:
+        return []
+
+
+def _normalize_tests(row: dict, include_private: bool = False, max_test_chars: int = 0) -> list[dict]:
+    """Extract test cases from a LiveCodeBench-style row into
+    [{"input","output","testtype"[,"fn_name"]}]. LiveCodeBench stores
+    public_test_cases / private_test_cases as JSON strings of
+    [{input, output, testtype}]. Be tolerant of a few shapes so this survives
+    minor dataset schema drift.
+
+    include_private (default OFF, so every existing build reproduces byte-for-
+    byte): also pull private_test_cases. Public tests alone were enough for the
+    initial stdin validation, but leetcode/functional problems ship only ~2
+    public tests -- far too few to call a hard problem solved -- while private
+    adds ~40. Public tests come FIRST so a later --max-tests cap keeps them.
+
+    max_test_chars (0 = no limit): drop test cases whose input+output exceeds
+    it. Needed once private tests are in: a few have multi-MB inputs, and the
+    judge embeds the tests in the harness SOURCE, which the sandbox runs via
+    `python3 -c` (ARG_MAX ~2MB) -- one such test would fail the whole problem.
+    """
     tests: list[dict] = []
-    # public_test_cases is a plain JSON string of [{input,output,testtype}].
-    # private_test_cases is compressed/encoded in LiveCodeBench (skip it) --
-    # public tests are enough for the initial single-domain validation.
-    for key in ("public_test_cases", "test_cases", "tests"):
+    keys = ("public_test_cases", "test_cases", "tests")
+    if include_private:
+        keys = keys + ("private_test_cases",)
+    # LeetCode-style rows carry the graded entrypoint in metadata.func_name;
+    # stamp it on each test case so judge.py's functional harness can find the
+    # method (test_cases is the only thing the reward path passes it).
+    md = row.get("metadata")
+    if isinstance(md, str):
+        try:
+            md = json.loads(md)
+        except Exception:
+            md = {}
+    fn_name = str((md or {}).get("func_name") or "") if isinstance(md, dict) else ""
+    for key in keys:
         val = row.get(key)
         if not val:
             continue
-        if isinstance(val, str):
+        if key == "private_test_cases":
+            val = _decode_private_tests(val)
+        elif isinstance(val, str):
             try:
                 val = json.loads(val)
             except Exception:
@@ -95,12 +193,16 @@ def _normalize_tests(row: dict) -> list[dict]:
         if isinstance(val, list):
             for t in val:
                 if isinstance(t, dict) and "input" in t and "output" in t:
+                    inp, out = str(t["input"]), str(t["output"])
+                    if max_test_chars and len(inp) + len(out) > max_test_chars:
+                        continue
                     # Keep testtype (stdin | functional) -- code_judge grades the
                     # two differently (stdin/stdout harness vs LeetCode function
                     # call). Default stdin for older rows without the field.
-                    tests.append(
-                        {"input": str(t["input"]), "output": str(t["output"]), "testtype": t.get("testtype", "stdin")}
-                    )
+                    tc = {"input": inp, "output": out, "testtype": t.get("testtype", "stdin")}
+                    if tc["testtype"] == "functional" and fn_name:
+                        tc["fn_name"] = fn_name
+                    tests.append(tc)
     # dedup while preserving order
     seen = set()
     uniq = []
@@ -116,14 +218,25 @@ def _question(row: dict) -> str:
     for key in ("question_content", "question", "problem", "prompt", "content"):
         v = row.get(key)
         if isinstance(v, str) and v.strip():
-            return v.strip()
+            q = v.strip()
+            # Functional (leetcode) problems are only answerable against the
+            # exact signature the judge calls -- append the dataset's starter
+            # code, as LiveCodeBench's own prompt does.
+            starter = row.get("starter_code")
+            if isinstance(starter, str) and starter.strip():
+                q += (
+                    "\n\nComplete the following starter code (keep the class and method "
+                    "signature exactly as given, and RETURN the answer):\n"
+                    f"```python\n{starter.rstrip()}\n```"
+                )
+            return q
     return ""
 
 
-def _build_row(question: str, tests: list[dict]) -> dict:
+def _build_row(question: str, tests: list[dict], system_prompt: str = CODE_SYSTEM_PROMPT) -> dict:
     return {
         "prompt": [
-            {"role": "system", "content": CODE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ],
         "label": "",  # code correctness is from test_cases, not a label string
@@ -146,6 +259,21 @@ def main() -> None:
     ap.add_argument("--n-train", type=int, default=2000)
     ap.add_argument("--n-eval", type=int, default=100)
     ap.add_argument("--max-tests", type=int, default=15, help="cap test cases kept per problem")
+    ap.add_argument(
+        "--include-private-tests",
+        action="store_true",
+        help="also use LiveCodeBench's private_test_cases (base64+zlib+pickle-encoded). OFF by "
+        "default so existing builds reproduce exactly. Turn ON for functional/leetcode problems: "
+        "they ship only ~2 public tests (vs ~40 private), too few to call a hard problem solved.",
+    )
+    ap.add_argument(
+        "--max-test-chars",
+        type=int,
+        default=0,
+        help="drop test cases whose input+output exceeds this many chars (0 = no limit). Use with "
+        "--include-private-tests: the judge embeds tests in the harness source, which the sandbox "
+        "runs via `python3 -c` (ARG_MAX ~2MB), and a handful of private tests have multi-MB inputs.",
+    )
     ap.add_argument(
         "--testtype",
         default="stdin",
@@ -199,7 +327,7 @@ def main() -> None:
     kept_diff = {}
     for row in ds:
         q = _question(row)
-        tests = _normalize_tests(row)
+        tests = _normalize_tests(row, include_private=args.include_private_tests, max_test_chars=args.max_test_chars)
         if not (q and tests):
             continue
         ttype = tests[0].get("testtype", "stdin")
@@ -212,9 +340,19 @@ def main() -> None:
             continue
         kept_type[ttype] = kept_type.get(ttype, 0) + 1
         kept_diff[diff] = kept_diff.get(diff, 0) + 1
+        # functional rows are graded by a function CALL, not stdin/stdout -> the
+        # grading contract in the system prompt has to match (see
+        # FUNCTIONAL_SYSTEM_PROMPT). 'both' mode mixes the two per row.
+        prompt = FUNCTIONAL_SYSTEM_PROMPT if ttype == "functional" else CODE_SYSTEM_PROMPT
         # carry difficulty in metadata for later analysis / stratified eval
-        r = _build_row(q, tests[: args.max_tests])
+        r = _build_row(q, tests[: args.max_tests], system_prompt=prompt)
         r["metadata"]["difficulty"] = diff
+        # provenance, so a future contamination check can join eval rows back to
+        # the upstream problem without re-deriving them from the question text
+        r["metadata"]["testtype"] = ttype
+        for k in ("question_id", "platform", "contest_date"):
+            if row.get(k):
+                r["metadata"][k] = str(row[k])
         rows.append(r)
     print(f"kept {len(rows)} problems (testtype={args.testtype}, difficulty={sorted(keep_diff)}): types={kept_type} diffs={kept_diff}")
 

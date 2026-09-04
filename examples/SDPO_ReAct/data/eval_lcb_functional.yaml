@@ -1,0 +1,43 @@
+# --eval-config for the FUNCTIONAL (leetcode-style) LiveCodeBench slice.
+#
+# Sibling of eval_code.yaml, which covers the stdin/stdout slice. Two reasons
+# this is a separate eval set rather than more rows in eval_code.yaml:
+#
+#   1. Grading path. These rows carry test cases with testtype="functional" +
+#      fn_name, which judge.py routes to its functional harness (exec the
+#      candidate, call Solution().<fn_name>(*args), compare the RETURN value)
+#      instead of the stdin/stdout harness. The system prompt baked into the
+#      rows states that contract (build_code_data.py::FUNCTIONAL_SYSTEM_PROMPT).
+#   2. Contamination. Every LiveCodeBench train set built so far was built with
+#      --testtype stdin, so the functional pool (444 problems overall, 63 in v6,
+#      20 of them hard) has never appeared in ANY training mix -- unlike the
+#      stdin v6 eval set, 54-77% of whose problems leaked into the code training
+#      pool (no upper contest_date bound on the train build). This is currently
+#      the only genuinely held-out LiveCodeBench slice we have.
+#
+# Built by (see ablation/eval-lcb-functional.sh, which does this for you):
+#   python -m examples.SDPO_ReAct.data.build_code_data \
+#     --out-dir $LCB_FUNC_DATA_DIR --jsonl-files test6.jsonl \
+#     --testtype functional --difficulty easy,medium,hard \
+#     --include-private-tests --max-test-chars 20000 --n-train 0 --n-eval 100
+eval:
+  defaults:
+    # PER-TURN generation budget (generate_endpoint_utils.compute_request_payload
+    # turns it into max_new_tokens for each turn, clamped by
+    # --rollout-max-context-len). At 16384 a thinking model hits the cap INSIDE
+    # its first reasoning block on hard problems and the sample dies TRUNCATED
+    # with zero tool calls -- measured 35% truncated / 36% zero-tool-call for
+    # Qwen3.5-9B base on v6 functional/hard, all of which score 0 under
+    # tool-mandatory grading. Raise it (32768 fits the 81920 context) when the
+    # point is to measure the model rather than the budget.
+    max_response_len: ${oc.decode:${oc.env:LCB_FUNC_MAX_RESPONSE_LEN,16384}}
+    top_p: 1.0
+    tool_key: tools
+    metadata_key: metadata
+  datasets:
+    - name: livecodebench_v6_functional
+      path: ${oc.env:LCB_FUNC_DATA_DIR,/root/data/code_data_v6func_all}/livecodebench_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
