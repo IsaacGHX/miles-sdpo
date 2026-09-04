@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -81,6 +83,16 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
             log_dict |= dict_add_prefix(pr_all, "eval/all-")
 
     logger.info(f"eval {rollout_id}: {log_dict}")
+
+    # Eval-only sidecar dump of the SAME log_dict that goes to wandb, for the
+    # batch eval harnesses (examples/SDPO_ReAct/ablation/eval-*.sh) that read a
+    # benchmark number out of a one-shot eval job instead of a wandb run.
+    metrics_file = os.environ.get("MILES_EVAL_METRICS_FILE")
+    if metrics_file:
+        os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
+        with open(metrics_file, "w") as f:
+            json.dump(log_dict, f, indent=2)
+        logger.info(f"eval metrics written to {metrics_file}")
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["eval/step"] = step
