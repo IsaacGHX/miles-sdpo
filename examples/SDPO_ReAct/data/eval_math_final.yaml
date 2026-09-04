@@ -1,0 +1,52 @@
+# --eval-config for the FINAL held-out MATH report of a trained checkpoint:
+# AIME-2024 + AIME-2025 + AMO-Bench in ONE eval, so one sglang boot covers all
+# three instead of three jobs paying container+weight-load again.
+#
+#   aime24     30 problems   (zhuzilin/aime-2024, native tool-calling build)
+#   aime25     30 problems   (zhuzilin/aime-2025, native tool-calling build)
+#   amo_bench  50 problems   (meituan-longcat/AMO-Bench, IMO level)
+#                            39 DAPO-graded + 11 answer_type='description'
+#                            that need --sdpo-judge (eval-amo-bench.sh passes it)
+#
+# Run it with ablation/eval-amo-bench.sh (SDPO_EVAL_CONFIG=eval_math_final.yaml):
+# that script is the only one of the standalone eval trio that passes
+# --sdpo-judge, which the 11 description-type AMO problems need. In a TRAINING
+# run --sdpo-judge would also reroute every math training sample through the
+# Bedrock judge, which is why eval_multitask_v2.yaml deliberately leaves
+# amo_bench out; here there is no training step, so it is free.
+#
+# The aime24/25 files are the NATIVE tool-calling builds (system prompt + tools
+# field identical to training), NOT data/eval_aime24.yaml's /root/math_eval/
+# aime24.jsonl, which is the plain-text-tag variant with no tools -- mixing the
+# two makes the numbers incomparable to the training curves. Build them with:
+#   SDPO_REACT_PROMPT=minimal python -m examples.SDPO_ReAct.data.build_native_eval \
+#       --out-dir /root/data/math_eval/native-minimal
+# SDPO_REACT_PROMPT must match the trained arm's prompt (minimal for every
+# ablation arm here), because build_native_eval bakes the system prompt in.
+#
+# Paths are CONTAINER paths (/root/data == the enroot mount of /fsx/data/$USER).
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 1.0
+    tool_key: tools
+    metadata_key: metadata
+  datasets:
+    - name: aime24
+      path: ${oc.env:SDPO_REACT_EVAL_DIR,/root/data/math_eval/native-minimal}/aime24_native.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: aime25
+      path: ${oc.env:SDPO_REACT_EVAL_DIR,/root/data/math_eval/native-minimal}/aime25_native.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: amo_bench
+      path: ${oc.env:AMO_BENCH_DATA_DIR,/root/data/amo_bench}/amo_bench_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}

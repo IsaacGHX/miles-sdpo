@@ -1,0 +1,71 @@
+# --eval-config for the MULTITASK domain -- v2, LIGHT monitoring set.
+#
+# Purpose: a cheap in-training progress signal, one dataset per domain (plus the
+# second search set, which is nearly free). It is NOT the reporting set -- final
+# numbers come from the standalone scripts run on the SAVED checkpoint
+# (ablation/eval-lcb-functional.sh, eval-ojbench.sh, eval-amo-bench.sh,
+# eval-aime26 via eval_math_combined.yaml).
+#
+#   math:   aime26                        (30)
+#   code:   livecodebench_v6_FUNCTIONAL   (63)
+#   search: hotpotqa + 2wikimultihopqa    (100 + 100)
+#                                         = 293 prompts
+#
+# Why these and not eval_multitask.yaml's five:
+#   - aime26 instead of aime24/25: 2026 problems postdate every model and every
+#     training build here, so it is the only AIME slice with no contamination
+#     story at all.
+#   - v6 FUNCTIONAL instead of v6 stdin: the stdin eval set is CONTAMINATED --
+#     54-77% of its problems leaked into the code training pool (the train build
+#     has no upper contest_date bound). Every train build used --testtype stdin,
+#     so the functional slice never appeared in any train mix. It is the only
+#     genuinely held-out LiveCodeBench slice we have.
+#   - search unchanged.
+#
+# DELIBERATELY NOT HERE (both were in an earlier 7-dataset draft of this file):
+#   - amo_bench: 11 of its 50 problems are answer_type='description' and need
+#     LLM-judge grading, which sdpo_react_eval_reward only does under
+#     --sdpo-judge (sdpo_react.py:329) -- and --sdpo-judge ALSO re-routes every
+#     math TRAINING sample through the Bedrock judge (reward.py::_grade_group),
+#     which is both a different reward and 400x8x51 gateway calls. So in a
+#     training run those 11 score a hard 0: a constant offset, trend-usable but
+#     wrong as an absolute. Use eval-amo-bench.sh, which does pass --sdpo-judge.
+#   - ojbench: NOI/ICPC difficulty, and its cheapest useful slice is still 77
+#     problems of mostly-unsolved generation -- the slowest tokens/signal ratio
+#     of anything here. Use eval-ojbench.sh on the checkpoint.
+#
+# Paths are CONTAINER paths (/root/data == the enroot mount of /fsx/data/$USER).
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 1.0
+    tool_key: tools
+    metadata_key: metadata
+  datasets:
+    # --- math ---
+    - name: aime26
+      path: ${oc.env:AIME26_DATA_DIR,/root/data/home-static/data/aime26}/aime26_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    # --- code ---
+    - name: livecodebench_v6_functional
+      path: ${oc.env:LCB_FUNC_DATA_DIR,/root/data/code_data_v6func_all}/livecodebench_eval.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    # --- search (unchanged from eval_multitask.yaml) ---
+    - name: hotpotqa
+      path: /root/data/search_data/hotpotqa_val.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
+    - name: 2wikimultihopqa
+      path: /root/data/search_data/2wikimultihopqa_val.jsonl
+      rm_type: null
+      n_samples_per_eval_prompt: ${oc.decode:${oc.env:SDPO_REACT_EVAL_N_SAMPLES,8}}
+      metadata_overrides:
+        generate_max_turns: ${oc.decode:${oc.env:SDPO_REACT_EVAL_MAX_TURNS,20}}
